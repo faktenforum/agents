@@ -377,12 +377,12 @@ export interface AgentInputs {
    * Maps tool name to LCTool definition.
    */
   toolRegistry?: Map<string, LCTool>;
+  /** Whether this agent supports vision capabilities (image processing) */
+  vision?: boolean;
   /**
    * Serializable tool definitions for event-driven execution.
    * When provided, ToolNode operates in event-driven mode, dispatching
    * ON_TOOL_EXECUTE events instead of invoking tools directly.
    */
   toolDefinitions?: LCTool[];
-  /** Whether this agent supports vision capabilities (image processing) */
-  vision?: boolean;
 }
