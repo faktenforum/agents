@@ -95,8 +95,6 @@ export const ProgrammaticToolCallingSchema = {
   required: ['code'],
 } as const;
 
-export const ProgrammaticToolCallingName = Constants.PROGRAMMATIC_TOOL_CALLING;
-
 export const ProgrammaticToolCallingDescription = `
 Run tools via Python code. Auto-wrapped in async context—just use \`await\` directly.
 
@@ -111,7 +109,7 @@ ${EXAMPLES}
 `.trim();
 
 export const ProgrammaticToolCallingDefinition = {
-  name: ProgrammaticToolCallingName,
+  name: Constants.PROGRAMMATIC_TOOL_CALLING,
   description: ProgrammaticToolCallingDescription,
   schema: ProgrammaticToolCallingSchema,
 } as const;
@@ -764,7 +762,7 @@ export function createProgrammaticToolCallingTool(
       }
     },
     {
-      name: ProgrammaticToolCallingName,
+      name: Constants.PROGRAMMATIC_TOOL_CALLING,
       description: ProgrammaticToolCallingDescription,
       schema: ProgrammaticToolCallingSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
