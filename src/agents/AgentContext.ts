@@ -75,6 +75,7 @@ export class AgentContext {
       agentContext.initializeSystemRunnable();
 
       const tokenMap = indexTokenCountMap || {};
+      agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
       agentContext.tokenCalculationPromise = agentContext
         .calculateInstructionTokens(tokenCounter)
@@ -86,6 +87,7 @@ export class AgentContext {
           console.error('Error calculating instruction tokens:', err);
         });
     } else if (indexTokenCountMap) {
+      agentContext.baseIndexTokenCountMap = { ...indexTokenCountMap };
       agentContext.indexTokenCountMap = indexTokenCountMap;
     }
 
@@ -102,6 +104,8 @@ export class AgentContext {
   clientOptions?: t.ClientOptions;
   /** Token count map indexed by message position */
   indexTokenCountMap: Record<string, number | undefined> = {};
+  /** Canonical pre-run token map used to restore token accounting on reset */
+  baseIndexTokenCountMap: Record<string, number> = {};
   /** Maximum context tokens for this agent */
   maxContextTokens?: number;
   /** Current usage metadata for this agent */
@@ -469,7 +473,7 @@ export class AgentContext {
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
-    this.indexTokenCountMap = {};
+    this.indexTokenCountMap = { ...this.baseIndexTokenCountMap };
     this.currentUsage = undefined;
     this.pruneMessages = undefined;
     this.lastStreamCall = undefined;
@@ -478,6 +482,23 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
+
+    if (this.tokenCounter) {
+      this.initializeSystemRunnable();
+      const baseTokenMap = { ...this.baseIndexTokenCountMap };
+      this.indexTokenCountMap = baseTokenMap;
+      this.tokenCalculationPromise = this.calculateInstructionTokens(
+        this.tokenCounter
+      )
+        .then(() => {
+          this.updateTokenMapWithInstructions(baseTokenMap);
+        })
+        .catch((err) => {
+          console.error('Error calculating instruction tokens:', err);
+        });
+    } else {
+      this.tokenCalculationPromise = undefined;
+    }
   }
 
   /**
