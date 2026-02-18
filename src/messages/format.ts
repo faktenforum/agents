@@ -954,6 +954,29 @@ export const formatAgentMessages = (
     }
   }
 
+  /**
+   * Safety guard for legacy conversations:
+   * If the final message in the sequence is a ToolMessage, insert a synthetic
+   * AIMessage before returning. This prevents downstream chat APIs from
+   * rejecting the history with "Unexpected role 'user' after role 'tool'"
+   * when a new user turn is appended.
+   */
+  if (messages.length > 0) {
+    const last = messages[messages.length - 1];
+    const isTool =
+      last instanceof ToolMessage ||
+      (typeof (last as any).getType === 'function' &&
+        (last as any).getType() === 'tool');
+
+    if (isTool) {
+      messages.push(
+        new AIMessage(
+          '[Processed previous tool results; ready to continue the conversation.]'
+        )
+      );
+    }
+  }
+
   return {
     messages,
     indexTokenCountMap: indexTokenCountMap
