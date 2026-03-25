@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.1.55",
+  "version": "3.1.62",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -112,13 +112,13 @@
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
-    "fast-xml-parser": "5.3.8",
+    "fast-xml-parser": "5.5.7",
     "ajv": "6.14.0",
     "minimatch": "3.1.4"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.73.0",
-    "@aws-sdk/client-bedrock-runtime": "^3.980.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1013.0",
     "@langchain/anthropic": "^0.3.26",
     "@langchain/aws": "^0.1.15",
     "@langchain/core": "^0.3.80",
@@ -135,6 +135,7 @@
     "@langfuse/tracing": "^4.3.0",
     "@opentelemetry/sdk-node": "^0.207.0",
     "@scarf/scarf": "^1.4.0",
+    "ai-tokenizer": "^1.0.6",
     "axios": "^1.13.5",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",

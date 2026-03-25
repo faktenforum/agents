@@ -6,7 +6,6 @@ import {
   BaseMessage,
   HumanMessage,
   SystemMessage,
-  getBufferString,
 } from '@langchain/core/messages';
 import type { MessageContentImageUrl } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
@@ -14,11 +13,14 @@ import type {
   ExtendedMessageContent,
   MessageContentComplex,
   ReasoningContentText,
+  SummaryContentBlock,
   ToolCallContent,
   ToolCallPart,
   TPayload,
   TMessage,
 } from '@/types';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import { emitAgentLog } from '@/utils/events';
 import { Providers, ContentTypes, Constants } from '@/common';
 
 interface MediaMessageParams {
@@ -381,7 +383,8 @@ function formatAssistantMessage(
         continue;
       } else if (
         part.type === ContentTypes.ERROR ||
-        part.type === ContentTypes.AGENT_UPDATE
+        part.type === ContentTypes.AGENT_UPDATE ||
+        part.type === ContentTypes.SUMMARY
       ) {
         continue;
       } else {
@@ -414,6 +417,17 @@ function formatAssistantMessage(
   }
 
   return formattedMessages;
+}
+
+function getSourceMessageId(message: Partial<TMessage>): string | undefined {
+  const candidate =
+    (message as { messageId?: string }).messageId ??
+    (message as { id?: string }).id;
+  if (typeof candidate !== 'string') {
+    return undefined;
+  }
+  const normalized = candidate.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 /**
@@ -678,6 +692,111 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
+type SummaryBoundary = {
+  messageIndex: number;
+  contentIndex: number;
+  text: string;
+  tokenCount: number;
+};
+
+function getLatestSummaryBoundary(
+  payload: TPayload
+): SummaryBoundary | undefined {
+  let summaryBoundary: SummaryBoundary | undefined;
+
+  for (let i = 0; i < payload.length; i++) {
+    const message = payload[i];
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+
+    for (let j = 0; j < message.content.length; j++) {
+      const part = message.content[j] as MessageContentComplex | undefined;
+      if (part == null || part.type !== ContentTypes.SUMMARY) {
+        continue;
+      }
+
+      const summaryPart = part as Partial<SummaryContentBlock> & {
+        text?: string;
+      };
+
+      // Try content array first (new format), then direct text (legacy format)
+      let summaryText = (summaryPart.content ?? [])
+        .map((block) =>
+          'text' in block ? (block as { text: string }).text : ''
+        )
+        .join('')
+        .trim();
+
+      // Fallback: legacy format where text was a direct field on the block
+      if (summaryText.length === 0 && typeof summaryPart.text === 'string') {
+        summaryText = summaryPart.text.trim();
+      }
+
+      if (summaryText.length === 0) {
+        continue;
+      }
+
+      summaryBoundary = {
+        messageIndex: i,
+        contentIndex: j,
+        text: summaryText,
+        tokenCount:
+          typeof summaryPart.tokenCount === 'number' &&
+          Number.isFinite(summaryPart.tokenCount)
+            ? summaryPart.tokenCount
+            : 0,
+      };
+    }
+  }
+
+  return summaryBoundary;
+}
+
+function applySummaryBoundary(
+  message: Partial<TMessage>,
+  messageIndex: number,
+  summaryBoundary?: SummaryBoundary
+): Partial<TMessage> | null {
+  if (!summaryBoundary) {
+    return message;
+  }
+
+  if (messageIndex < summaryBoundary.messageIndex) {
+    return null;
+  }
+
+  if (
+    messageIndex !== summaryBoundary.messageIndex ||
+    !Array.isArray(message.content)
+  ) {
+    return message;
+  }
+
+  return {
+    ...message,
+    content: message.content.slice(summaryBoundary.contentIndex + 1),
+  };
+}
+
+function contentPartCharLength(part: MessageContentComplex): number {
+  const record = part as Record<string, unknown>;
+  let len = 0;
+  if (typeof record.text === 'string') {
+    len += record.text.length;
+  }
+  if (typeof record.thinking === 'string') {
+    len += record.thinking.length;
+  }
+  const { input } = record;
+  if (typeof input === 'string') {
+    len += input.length;
+  } else if (input != null && typeof input === 'object') {
+    len += JSON.stringify(input).length;
+  }
+  return len;
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -693,14 +812,39 @@ export const formatAgentMessages = (
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
   indexTokenCountMap?: Record<number, number>;
+  /** Cross-run summary extracted from the payload. Should be forwarded to the
+   *  agent run so it can be included in the system message via AgentContext. */
+  summary?: { text: string; tokenCount: number };
+  /** When a summary boundary sliced content from a message, the token count
+   *  was proportionally reduced. Returned so the caller can log it. */
+  boundaryTokenAdjustment?: {
+    original: number;
+    adjusted: number;
+    remainingChars: number;
+    totalChars: number;
+  };
 } => {
   const messages: Array<
     HumanMessage | AIMessage | SystemMessage | ToolMessage
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
+  let boundaryTokenAdjustment:
+    | {
+        original: number;
+        adjusted: number;
+        remainingChars: number;
+        totalChars: number;
+      }
+    | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
+  const summaryBoundary = getLatestSummaryBoundary(payload);
+
+  // Summary metadata is returned to the caller so it can be forwarded to the
+  // agent run and included in the single system message via AgentContext.
+  // We intentionally do NOT create a SystemMessage here — that would conflict
+  // with the agent's own system message (instructions + summary combined).
 
   /**
    * Create a mutable copy of the tools set that can be expanded dynamically.
@@ -711,21 +855,37 @@ export const formatAgentMessages = (
 
   // Process messages with tool conversion if tools set is provided
   for (let i = 0; i < payload.length; i++) {
-    const message = payload[i];
+    const rawMessage = payload[i];
+    const sourceMessageId = getSourceMessageId(rawMessage);
+    let message = applySummaryBoundary(rawMessage, i, summaryBoundary);
+    if (!message) {
+      indexMapping[i] = [];
+      continue;
+    }
+
     // Q: Store the current length of messages to track where this payload message starts in the result?
     // const startIndex = messages.length;
     if (typeof message.content === 'string') {
-      message.content = [
-        { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
-      ];
+      message = {
+        ...message,
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
+        ],
+      };
+    } else if (Array.isArray(message.content) && message.content.length === 0) {
+      indexMapping[i] = [];
+      continue;
     }
+
     if (message.role !== 'assistant') {
-      messages.push(
-        formatMessage({
-          message: message as MessageInput,
-          langChain: true,
-        }) as HumanMessage | AIMessage | SystemMessage
-      );
+      const formattedMessage = formatMessage({
+        message: message as MessageInput,
+        langChain: true,
+      }) as HumanMessage | AIMessage | SystemMessage;
+      if (sourceMessageId != null && sourceMessageId !== '') {
+        formattedMessage.id = sourceMessageId;
+      }
+      messages.push(formattedMessage);
 
       // Update the index mapping for this message
       indexMapping[i] = [messages.length - 1];
@@ -744,7 +904,7 @@ export const formatAgentMessages = (
     let processedMessage = message;
     if (discoveredTools) {
       const content = message.content;
-      if (content && Array.isArray(content)) {
+      if (content != null && Array.isArray(content)) {
         const filteredContent: typeof content = [];
         const invalidToolCallIds = new Set<string>();
         const invalidToolStrings: string[] = [];
@@ -867,8 +1027,12 @@ export const formatAgentMessages = (
       }
     }
 
-    // Process the assistant message using the helper function
     const formattedMessages = formatAssistantMessage(processedMessage);
+    if (sourceMessageId != null && sourceMessageId !== '') {
+      for (const formattedMessage of formattedMessages) {
+        formattedMessage.id = sourceMessageId;
+      }
+    }
     messages.push(...formattedMessages);
 
     // Update the index mapping for this assistant message
@@ -888,10 +1052,44 @@ export const formatAgentMessages = (
       originalIndex++
     ) {
       const resultIndices = indexMapping[originalIndex] || [];
-      const tokenCount = indexTokenCountMap[originalIndex];
+      let tokenCount = indexTokenCountMap[originalIndex];
 
       if (tokenCount === undefined) {
         continue;
+      }
+
+      if (
+        summaryBoundary &&
+        originalIndex === summaryBoundary.messageIndex &&
+        Array.isArray(payload[originalIndex].content)
+      ) {
+        const content = payload[originalIndex]
+          .content as MessageContentComplex[];
+        const { contentIndex } = summaryBoundary;
+        if (contentIndex >= 0 && contentIndex < content.length - 1) {
+          let totalCharLen = 0;
+          let remainingCharLen = 0;
+          for (let p = 0; p < content.length; p++) {
+            const charLen = contentPartCharLength(content[p]);
+            totalCharLen += charLen;
+            if (p > contentIndex) {
+              remainingCharLen += charLen;
+            }
+          }
+          if (totalCharLen > 0) {
+            const original = tokenCount;
+            tokenCount = Math.max(
+              1,
+              Math.round(tokenCount * (remainingCharLen / totalCharLen))
+            );
+            boundaryTokenAdjustment = {
+              original,
+              adjusted: tokenCount,
+              remainingChars: remainingCharLen,
+              totalChars: totalCharLen,
+            };
+          }
+        }
       }
 
       const msgCount = resultIndices.length;
@@ -993,6 +1191,10 @@ export const formatAgentMessages = (
     indexTokenCountMap: indexTokenCountMap
       ? updatedIndexTokenCountMap
       : undefined,
+    summary: summaryBoundary
+      ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
+      : undefined,
+    boundaryTokenAdjustment,
   };
 };
 
@@ -1021,6 +1223,113 @@ export function shiftIndexTokenCountMap(
   return shiftedMap;
 }
 
+/** Block types that contain binary image data and must be preserved structurally. */
+const IMAGE_BLOCK_TYPES = new Set(['image_url', 'image']);
+
+/** Checks whether a BaseMessage is a tool-role message. */
+const isToolMessage = (m: BaseMessage): boolean =>
+  m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
+
+/** Flushes accumulated text chunks into `parts` as a single text block. */
+function flushTextChunks(
+  textChunks: string[],
+  parts: MessageContentComplex[]
+): void {
+  if (textChunks.length === 0) {
+    return;
+  }
+  parts.push({
+    type: ContentTypes.TEXT,
+    text: textChunks.join('\n'),
+  } as MessageContentComplex);
+  textChunks.length = 0;
+}
+
+/**
+ * Appends a single message's content to the running `textChunks` / `parts`
+ * accumulators.  Image blocks are shallow-copied into `parts` as-is so that
+ * binary data (base64 images) never becomes text tokens.  All other block
+ * types are serialized to text — unrecognized types are JSON-serialized
+ * rather than silently dropped.
+ *
+ * When `content` is an array containing tool_use blocks, `tool_calls` is NOT
+ * additionally serialized (avoiding double output).  `tool_calls` is used as
+ * a fallback when `content` is a plain string or an array with no tool_use.
+ */
+function appendMessageContent(
+  msg: BaseMessage,
+  role: string,
+  textChunks: string[],
+  parts: MessageContentComplex[]
+): void {
+  const { content } = msg;
+
+  if (typeof content === 'string') {
+    if (content) {
+      textChunks.push(`${role}: ${content}`);
+    }
+    appendToolCalls(msg, role, textChunks);
+    return;
+  }
+
+  if (!Array.isArray(content)) {
+    appendToolCalls(msg, role, textChunks);
+    return;
+  }
+
+  let hasToolUseBlock = false;
+
+  for (const block of content as ExtendedMessageContent[]) {
+    if (IMAGE_BLOCK_TYPES.has(block.type ?? '')) {
+      flushTextChunks(textChunks, parts);
+      parts.push({ ...block } as MessageContentComplex);
+      continue;
+    }
+
+    if (block.type === 'tool_use') {
+      hasToolUseBlock = true;
+      textChunks.push(
+        `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
+      );
+      continue;
+    }
+
+    const text = block.text ?? block.input;
+    if (typeof text === 'string' && text) {
+      textChunks.push(`${role}: ${text}`);
+      continue;
+    }
+
+    // Fallback: serialize unrecognized block types to preserve context
+    if (block.type != null && block.type !== '') {
+      textChunks.push(`${role}: [${block.type}] ${JSON.stringify(block)}`);
+    }
+  }
+
+  // If content array had no tool_use blocks, fall back to tool_calls metadata
+  // (handles edge case: empty content array with tool_calls populated)
+  if (!hasToolUseBlock) {
+    appendToolCalls(msg, role, textChunks);
+  }
+}
+
+function appendToolCalls(
+  msg: BaseMessage,
+  role: string,
+  textChunks: string[]
+): void {
+  if (role !== 'AI') {
+    return;
+  }
+  const aiMsg = msg as AIMessage;
+  if (!aiMsg.tool_calls || aiMsg.tool_calls.length === 0) {
+    return;
+  }
+  for (const tc of aiMsg.tool_calls) {
+    textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+  }
+}
+
 /**
  * Ensures compatibility when switching from a non-thinking agent to a thinking-enabled agent.
  * Converts AI messages with tool calls (that lack thinking/reasoning blocks) into buffer strings,
@@ -1034,29 +1343,39 @@ export function shiftIndexTokenCountMap(
  *
  * @param messages - Array of messages to process
  * @param provider - The provider being used (unused but kept for future compatibility)
+ * @param config - Optional RunnableConfig for structured agent logging
  * @returns The messages array with tool sequences converted to buffer strings if necessary
  */
 export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
-  _provider: Providers
+  _provider: Providers,
+  config?: RunnableConfig
 ): BaseMessage[] {
   if (messages.length === 0) {
     return messages;
   }
 
-  // If the last message is already a HumanMessage, there is no trailing tool
-  // sequence to convert — return early to preserve prompt caching and avoid
-  // redundant token overhead from re-processing the entire history.
-  const lastMsg = messages[messages.length - 1];
-  const lastIsHuman =
-    lastMsg instanceof HumanMessage ||
-    ('role' in lastMsg && (lastMsg as any).role === 'user');
-  if (lastIsHuman) {
+  // Find the last HumanMessage. Only the trailing sequence after it needs
+  // validation — earlier messages are history already accepted by the provider.
+  let lastHumanIndex = -1;
+  for (let k = messages.length - 1; k >= 0; k--) {
+    const m = messages[k];
+    if (
+      m instanceof HumanMessage ||
+      ('role' in m && (m as any).role === 'user')
+    ) {
+      lastHumanIndex = k;
+      break;
+    }
+  }
+
+  if (lastHumanIndex === messages.length - 1) {
     return messages;
   }
 
-  const result: BaseMessage[] = [];
-  let i = 0;
+  const result: BaseMessage[] =
+    lastHumanIndex >= 0 ? messages.slice(0, lastHumanIndex + 1) : [];
+  let i = lastHumanIndex + 1;
 
   while (i < messages.length) {
     const msg = messages[i];
@@ -1082,21 +1401,24 @@ export function ensureThinkingBlockInMessages(
     let hasThinkingBlock = false;
 
     if (contentIsArray && aiMsg.content.length > 0) {
-      const content = aiMsg.content as ExtendedMessageContent[];
-      hasToolUse =
-        hasToolUse ||
-        content.some((c) => typeof c === 'object' && c.type === 'tool_use');
-      // Check ALL content blocks for thinking/reasoning, not just [0].
-      // Bedrock may emit a whitespace text chunk before the thinking block,
-      // pushing the reasoning_content to index 1+.
-      hasThinkingBlock = content.some(
-        (c) =>
-          typeof c === 'object' &&
-          (c.type === ContentTypes.THINKING ||
-            c.type === ContentTypes.REASONING_CONTENT ||
-            c.type === ContentTypes.REASONING ||
-            c.type === 'redacted_thinking')
-      );
+      for (const c of aiMsg.content as ExtendedMessageContent[]) {
+        if (typeof c !== 'object') {
+          continue;
+        }
+        if (c.type === 'tool_use') {
+          hasToolUse = true;
+        } else if (
+          c.type === ContentTypes.THINKING ||
+          c.type === ContentTypes.REASONING_CONTENT ||
+          c.type === ContentTypes.REASONING ||
+          c.type === 'redacted_thinking'
+        ) {
+          hasThinkingBlock = true;
+        }
+        if (hasToolUse && hasThinkingBlock) {
+          break;
+        }
+      }
     }
 
     // Bedrock also stores reasoning in additional_kwargs (may not be in content array)
@@ -1123,28 +1445,29 @@ export function ensureThinkingBlockInMessages(
         continue;
       }
 
-      // Collect the AI message and any following tool messages
-      const toolSequence: BaseMessage[] = [msg];
-      let j = i + 1;
+      // Build structured content in a single pass over the AI + following
+      // ToolMessages — preserves image blocks as-is to avoid serializing
+      // binary data as text (which caused 174× token amplification).
+      const parts: MessageContentComplex[] = [];
+      const textChunks: string[] = ['[Previous agent context]'];
 
-      // Look ahead for tool messages that belong to this AI message
-      const isToolMsg = (m: BaseMessage): boolean =>
-        m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
-      while (j < messages.length && isToolMsg(messages[j])) {
-        toolSequence.push(messages[j]);
+      appendMessageContent(msg, 'AI', textChunks, parts);
+
+      let j = i + 1;
+      while (j < messages.length && isToolMessage(messages[j])) {
+        appendMessageContent(messages[j], 'Tool', textChunks, parts);
         j++;
       }
 
-      // Convert the sequence to a buffer string and wrap in a HumanMessage
-      // This avoids the thinking block requirement which only applies to AI messages
-      const bufferString = getBufferString(toolSequence);
-      result.push(
-        new HumanMessage({
-          content: `[Previous agent context]\n${bufferString}`,
-        })
+      flushTextChunks(textChunks, parts);
+      emitAgentLog(
+        config,
+        'warn',
+        'format',
+        'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
+          ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
       );
-
-      // Skip the messages we've processed
+      result.push(new HumanMessage({ content: parts }));
       i = j;
     } else {
       // Keep the message as is

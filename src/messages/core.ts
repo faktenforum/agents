@@ -1,10 +1,10 @@
 // src/messages.ts
 import {
-  AIMessageChunk,
-  HumanMessage,
-  ToolMessage,
   AIMessage,
   BaseMessage,
+  ToolMessage,
+  HumanMessage,
+  AIMessageChunk,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
@@ -54,10 +54,10 @@ const modifyContent = ({
   provider: Providers;
   messageType: string;
   content: t.ExtendedMessageContent[];
-}): t.ExtendedMessageContent[] => {
+}): (t.ExtendedMessageContent | null)[] => {
   const allowedTypes =
     allowedTypesByProvider[provider] ?? allowedTypesByProvider.default;
-  return content.map((item) => {
+  return content.map((item: t.ExtendedMessageContent | null) => {
     if (
       typeof item === 'object' &&
       item !== null &&
@@ -152,7 +152,7 @@ export function modifyDeltaProperties(
       provider,
       messageType,
       content: obj.content,
-    });
+    }) as t.MessageContentComplex[];
   }
   if (
     (obj as Partial<AIMessageChunk>).lc_kwargs &&
@@ -364,39 +364,30 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
 
   if (latestAIParentIndex === -1) return;
 
-  // Check if any tool message after the AI message has array artifact content
-  const hasArtifactContent = messages.some((msg, i) => {
-    if (i <= latestAIParentIndex || !(msg instanceof ToolMessage)) return false;
-    const artifact = (msg as ToolMessage & { artifact?: t.MCPArtifact })
-      .artifact;
-    return artifact != null && Array.isArray(artifact.content);
-  });
-
-  if (!hasArtifactContent) return;
-
+  // Build tool call ID set and merge artifact content in a single forward pass.
   const message = messages[latestAIParentIndex] as AIMessageChunk;
-  const toolCallIds = message.tool_calls?.map((tc) => tc.id) ?? [];
+  const toolCallIdSet = new Set<string>();
+  if (message.tool_calls) {
+    for (const tc of message.tool_calls) {
+      if (tc.id != null) {
+        toolCallIdSet.add(tc.id);
+      }
+    }
+  }
 
   for (let j = latestAIParentIndex + 1; j < messages.length; j++) {
     const msg = messages[j];
     if (
-      !(msg instanceof ToolMessage) ||
-      !toolCallIds.includes(msg.tool_call_id)
+      msg instanceof ToolMessage &&
+      toolCallIdSet.has(msg.tool_call_id) &&
+      msg.artifact != null &&
+      Array.isArray(msg.artifact?.content)
     ) {
-      continue;
+      const base = Array.isArray(msg.content)
+        ? msg.content
+        : [{ type: 'text' as const, text: String(msg.content ?? '') }];
+      msg.content = base.concat(msg.artifact.content);
     }
-
-    const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
-    const artifact = toolMsg.artifact;
-    if (
-      artifact == null ||
-      !Array.isArray(artifact.content) ||
-      !Array.isArray(msg.content)
-    ) {
-      continue;
-    }
-
-    msg.content = msg.content.concat(artifact.content);
   }
 }
 
