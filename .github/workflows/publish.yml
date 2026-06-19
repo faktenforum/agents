@@ -7,168 +7,39 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write  # Required for OIDC trusted publishing
+  id-token: write # Required for OIDC trusted publishing
   contents: read
 
 jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+    secrets: inherit
+
   publish:
+    needs: validate
     runs-on: ubuntu-latest
-    environment: publish  # Must match npm trusted publisher config
+    environment: publish # Must match npm trusted publisher config
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: '24.x'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Update npm for OIDC support
-        run: npm install -g npm@latest  # Must be 11.5.1+ for provenance
+        run: npm install -g npm@latest # Must be 11.5.1+ for provenance
 
       - name: Install dependencies
         run: npm ci
-
-      - name: ESLint
-        run: npx eslint "src/**/*.ts"
-
-      - name: TypeScript type-check
-        run: npx tsc --noEmit
 
       - name: Build
         run: npm run build
         env:
           NODE_ENV: production
-
-      - name: Run tests
-        run: npx jest --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts
-        env:
-          NODE_OPTIONS: '--experimental-vm-modules'
-          NODE_ENV: test
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          AZURE_MODEL_NAME: ${{ secrets.AZURE_MODEL_NAME }}
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
-          AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
-          AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          BEDROCK_AWS_ACCESS_KEY_ID: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
-          BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
-          
-      - name: Check for Google LLM changes
-        id: google_changes
-        run: |
-          # Find the previous version commit (skip=1 because HEAD is the current version commit)
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/google/"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Google LLM tests (flaky - timeouts allowed)
-        if: steps.google_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        continue-on-error: true
-        run: npx jest src/llm/google/llm.spec.ts
-        env:
-          NODE_ENV: test
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-
-      - name: Check for Anthropic LLM changes
-        id: anthropic_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/anthropic/"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Anthropic LLM tests (flaky - timeouts allowed)
-        if: steps.anthropic_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        continue-on-error: true
-        run: npx jest src/llm/anthropic/llm.spec.ts
-        env:
-          NODE_ENV: test
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
-      - name: Check for PTC changes
-        id: ptc_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run PTC unit tests
-        if: steps.ptc_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ProgrammaticToolCalling.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Run PTC integration tests (manual dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ProgrammaticToolCalling.integration.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Check for Tool Search changes
-        id: tool_search_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ToolSearch\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Tool Search unit tests
-        if: steps.tool_search_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ToolSearch.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Run Tool Search integration tests (manual dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ToolSearch.integration.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
       - name: Prune development dependencies
         run: npm prune --production
@@ -190,8 +61,82 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: npm pack
 
+      - name: Determine publish tag
+        if: steps.check.outputs.skip != 'true'
+        id: publish_tag
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if echo "$PACKAGE_VERSION" | grep -q "-"; then
+            echo "tag=dev" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+
       - name: Publish
         if: steps.check.outputs.skip != 'true'
-        run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance
+        run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance --tag ${{ steps.publish_tag.outputs.tag }}
         env:
           NODE_ENV: production
+
+  release:
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+
+      - name: Detect version commit
+        id: version
+        run: |
+          VERSION=$(git log -1 --pretty=%s "$GITHUB_SHA")
+          if echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "is_version=true" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "is_version=false" >> "$GITHUB_OUTPUT"
+          echo "Head commit subject '$VERSION' is not a release commit; skipping."
+
+      - name: Validate package version
+        if: steps.version.outputs.is_version == 'true'
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          VERSION="${{ steps.version.outputs.version }}"
+          if [ "v$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "::error title=Version mismatch::Commit subject is $VERSION, but package.json version is $PACKAGE_VERSION."
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        if: steps.version.outputs.is_version == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
+            TAG_SHA=$(git rev-list -n 1 "$VERSION")
+            if [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+              echo "::error title=Tag points at a different commit::Tag $VERSION points to $TAG_SHA, expected $GITHUB_SHA."
+              exit 1
+            fi
+          fi
+
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; skipping."
+            exit 0
+          fi
+
+          gh release create "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes

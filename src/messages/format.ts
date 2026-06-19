@@ -7,21 +7,29 @@ import {
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
-import type { MessageContentImageUrl } from '@langchain/core/messages';
+import type {
+  MessageContent,
+  MessageContentImageUrl,
+} from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  BedrockReasoningContentText,
   ExtendedMessageContent,
+  GoogleReasoningContentText,
   MessageContentComplex,
   ReasoningContentText,
   SummaryContentBlock,
+  ThinkingContentText,
   ToolCallContent,
   ToolCallPart,
   TPayload,
   TMessage,
 } from '@/types';
-import type { RunnableConfig } from '@langchain/core/runnables';
-import { emitAgentLog } from '@/utils/events';
+import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
+import { toLangChainContent, toLangChainMessageFields } from './langchain';
 import { Providers, ContentTypes, Constants } from '@/common';
+import { emitAgentLog } from '@/utils/events';
 
 interface MediaMessageParams {
   message: {
@@ -99,6 +107,29 @@ interface FormatMessageParams {
   langChain?: boolean;
 }
 
+export type LangChainMessageRole = 'system' | 'user' | 'assistant' | 'tool';
+
+export type RoleBearingMessage<T extends BaseMessage = BaseMessage> = T & {
+  role: LangChainMessageRole;
+};
+
+export function withMessageRole<T extends BaseMessage>(
+  message: T,
+  role: LangChainMessageRole
+): RoleBearingMessage<T> {
+  const roleMessage = message as T & { role?: LangChainMessageRole };
+  if (roleMessage.role === role) {
+    return roleMessage as RoleBearingMessage<T>;
+  }
+  Object.defineProperty(roleMessage, 'role', {
+    value: role,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return roleMessage as RoleBearingMessage<T>;
+}
+
 interface FormattedMessage {
   role: string;
   content: string | MessageContentComplex[];
@@ -120,9 +151,9 @@ export const formatMessage = ({
   langChain = false,
 }: FormatMessageParams):
   | FormattedMessage
-  | HumanMessage
-  | AIMessage
-  | SystemMessage => {
+  | RoleBearingMessage<HumanMessage>
+  | RoleBearingMessage<AIMessage>
+  | RoleBearingMessage<SystemMessage> => {
   // eslint-disable-next-line prefer-const
   let { role: _role, _name, sender, text, content: _content, lc_id } = message;
   if (lc_id && lc_id[2] && !langChain) {
@@ -210,7 +241,10 @@ export const formatMessage = ({
       return mediaMessage;
     }
 
-    return new HumanMessage(mediaMessage);
+    return withMessageRole(
+      new HumanMessage(toLangChainMessageFields(mediaMessage)),
+      'user'
+    );
   }
 
   if (!langChain) {
@@ -218,11 +252,20 @@ export const formatMessage = ({
   }
 
   if (role === 'user') {
-    return new HumanMessage(formattedMessage);
+    return withMessageRole(
+      new HumanMessage(toLangChainMessageFields(formattedMessage)),
+      'user'
+    );
   } else if (role === 'assistant') {
-    return new AIMessage(formattedMessage);
+    return withMessageRole(
+      new AIMessage(toLangChainMessageFields(formattedMessage)),
+      'assistant'
+    );
   } else {
-    return new SystemMessage(formattedMessage);
+    return withMessageRole(
+      new SystemMessage(toLangChainMessageFields(formattedMessage)),
+      'system'
+    );
   }
 };
 
@@ -236,14 +279,21 @@ export const formatMessage = ({
 export const formatLangChainMessages = (
   messages: Array<MessageInput>,
   formatOptions: Omit<FormatMessageParams, 'message' | 'langChain'>
-): Array<HumanMessage | AIMessage | SystemMessage> => {
+): Array<
+  | RoleBearingMessage<HumanMessage>
+  | RoleBearingMessage<AIMessage>
+  | RoleBearingMessage<SystemMessage>
+> => {
   return messages.map((msg) => {
     const formatted = formatMessage({
       ...formatOptions,
       message: msg,
       langChain: true,
     });
-    return formatted as HumanMessage | AIMessage | SystemMessage;
+    return formatted as
+      | RoleBearingMessage<HumanMessage>
+      | RoleBearingMessage<AIMessage>
+      | RoleBearingMessage<SystemMessage>;
   });
 };
 
@@ -276,25 +326,254 @@ export const formatFromLangChain = (
   };
 };
 
+interface FormatAssistantMessageOptions {
+  preserveUnpairedServerToolUses?: boolean;
+  preserveReasoningContent?: boolean;
+  provider?: Providers;
+}
+
+interface FormatAgentMessagesOptions {
+  provider?: Providers;
+  /** Skill names already primed fresh this turn (manual/always-apply). Their
+   *  historical `skill` tool_calls are not reconstructed into a HumanMessage,
+   *  so the same SKILL.md body is not injected twice in one request. */
+  skipSkillBodyNames?: Set<string>;
+}
+
+function extractReasoningContent(
+  part: MessageContentComplex | undefined | null
+): string {
+  if (part == null || typeof part !== 'object') {
+    return '';
+  }
+  if (part.type === ContentTypes.THINK) {
+    const think = (part as ReasoningContentText).think;
+    return typeof think === 'string' ? think : '';
+  }
+  if (part.type === ContentTypes.THINKING) {
+    const thinking = (part as ThinkingContentText).thinking;
+    return typeof thinking === 'string' ? thinking : '';
+  }
+  if (part.type === ContentTypes.REASONING) {
+    const reasoning = (part as GoogleReasoningContentText).reasoning;
+    return typeof reasoning === 'string' ? reasoning : '';
+  }
+  if (part.type === ContentTypes.REASONING_CONTENT) {
+    const reasoningText = (part as BedrockReasoningContentText).reasoningText;
+    return typeof reasoningText.text === 'string' ? reasoningText.text : '';
+  }
+  return '';
+}
+
+type ServerToolInput = Exclude<NonNullable<ToolCallPart['args']>, string>;
+
+function parseServerToolInput(args: ToolCallPart['args']): ServerToolInput {
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args) as unknown;
+      return parsed != null &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed)
+        ? (parsed as ServerToolInput)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+  return args != null && typeof args === 'object' ? args : {};
+}
+
+function getTextContent(part: MessageContentComplex): string {
+  const { text } = part as { text?: unknown };
+  return typeof text === 'string' ? text : '';
+}
+
+function hasMeaningfulAssistantContent(part: MessageContentComplex): boolean {
+  if (part.type === ContentTypes.TEXT) {
+    return getTextContent(part).trim().length > 0;
+  }
+  if (
+    part.type === ContentTypes.TOOL_CALL ||
+    part.type === ContentTypes.ERROR ||
+    part.type === ContentTypes.AGENT_UPDATE ||
+    part.type === ContentTypes.SUMMARY
+  ) {
+    return false;
+  }
+  if (
+    part.type === ContentTypes.THINK ||
+    part.type === ContentTypes.THINKING ||
+    part.type === ContentTypes.REASONING ||
+    part.type === ContentTypes.REASONING_CONTENT ||
+    part.type === 'redacted_thinking'
+  ) {
+    return extractReasoningContent(part).trim().length > 0;
+  }
+  return part.type != null && part.type !== '';
+}
+
+function getToolUseId(part: MessageContentComplex): string | undefined {
+  if (!('tool_use_id' in part) || typeof part.tool_use_id !== 'string') {
+    return undefined;
+  }
+  return part.tool_use_id;
+}
+
+function isValidServerToolResult(part: MessageContentComplex): boolean {
+  const toolUseId = getToolUseId(part);
+  if (
+    toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) !== true ||
+    !('content' in part)
+  ) {
+    return false;
+  }
+  const { content } = part as { content?: unknown };
+  return (
+    Array.isArray(content) ||
+    (content != null &&
+      typeof content === 'object' &&
+      'type' in content &&
+      (content as { type?: unknown }).type === 'web_search_tool_result_error')
+  );
+}
+
+function getToolCallId(part: MessageContentComplex): string | undefined {
+  if (part.type !== ContentTypes.TOOL_CALL) {
+    return undefined;
+  }
+  const id = part.tool_call?.id;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
+function hasToolCallOutput(part: MessageContentComplex): boolean {
+  if (part.type !== ContentTypes.TOOL_CALL) {
+    return false;
+  }
+  const output = part.tool_call?.output;
+  return output != null && output !== '';
+}
+
 /**
  * Helper function to format an assistant message
  * @param message The message to format
+ * @param options Optional formatting options
  * @returns Array of formatted messages
  */
 function formatAssistantMessage(
-  message: Partial<TMessage>
-): Array<AIMessage | ToolMessage> {
-  const formattedMessages: Array<AIMessage | ToolMessage> = [];
+  message: Partial<TMessage>,
+  options?: FormatAssistantMessageOptions
+): Array<RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>> {
+  const formattedMessages: Array<
+    RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>
+  > = [];
   let currentContent: MessageContentComplex[] = [];
-  let lastAIMessage: AIMessage | null = null;
+  let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
   let hasReasoning = false;
+  let pendingReasoningContent = '';
+  const emittedServerToolUseIds = new Set<string>();
+  const pendingServerToolUses = new Map<string, MessageContentComplex>();
+  const shouldPreserveReasoningContent =
+    options?.preserveReasoningContent === true;
+  const serverToolResultIds = new Set<string>();
+  const preferredToolCallParts = new Map<string, MessageContentComplex>();
+
+  const takePendingReasoningContent = (): string | undefined => {
+    if (!shouldPreserveReasoningContent || !pendingReasoningContent) {
+      return undefined;
+    }
+    const reasoningContent = pendingReasoningContent;
+    pendingReasoningContent = '';
+    return reasoningContent;
+  };
+
+  const createAIMessage = (
+    content: MessageContent
+  ): RoleBearingMessage<AIMessage> => {
+    const reasoningContent = takePendingReasoningContent();
+    return withMessageRole(
+      new AIMessage({
+        content,
+        ...(reasoningContent != null && {
+          additional_kwargs: { reasoning_content: reasoningContent },
+        }),
+      }),
+      'assistant'
+    );
+  };
+
+  const attachPendingReasoningContent = (aiMessage: AIMessage): void => {
+    const reasoningContent = takePendingReasoningContent();
+    if (reasoningContent == null) {
+      return;
+    }
+    aiMessage.additional_kwargs.reasoning_content =
+      typeof aiMessage.additional_kwargs.reasoning_content === 'string'
+        ? `${aiMessage.additional_kwargs.reasoning_content}${reasoningContent}`
+        : reasoningContent;
+  };
+
+  const flushPendingServerToolUse = (toolUseId: string): void => {
+    for (const [id, content] of pendingServerToolUses) {
+      pendingServerToolUses.delete(id);
+      if (id === toolUseId) {
+        currentContent.push(content);
+        emittedServerToolUseIds.add(id);
+        return;
+      }
+    }
+  };
 
   if (Array.isArray(message.content)) {
-    for (const part of message.content as Array<
+    const contentParts = message.content as Array<
       MessageContentComplex | undefined | null
-    >) {
+    >;
+
+    for (const part of contentParts) {
       if (part == null) {
         continue;
+      }
+      if (isValidServerToolResult(part)) {
+        serverToolResultIds.add(getToolUseId(part) ?? '');
+      }
+      if (options?.provider === Providers.ANTHROPIC) {
+        const toolCallId = getToolCallId(part);
+        if (toolCallId == null) {
+          continue;
+        }
+        const preferredPart = preferredToolCallParts.get(toolCallId);
+        if (
+          preferredPart == null ||
+          (!hasToolCallOutput(preferredPart) && hasToolCallOutput(part))
+        ) {
+          preferredToolCallParts.set(toolCallId, part);
+        }
+      }
+    }
+
+    for (const part of contentParts) {
+      if (part == null) {
+        continue;
+      }
+      const toolUseId = getToolUseId(part);
+      if (toolUseId != null) {
+        const isServerToolResult = isValidServerToolResult(part);
+        if (
+          toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
+          !isServerToolResult
+        ) {
+          continue;
+        }
+        flushPendingServerToolUse(toolUseId);
+        if (isServerToolResult) {
+          currentContent.push(part);
+          continue;
+        }
+      } else if (hasMeaningfulAssistantContent(part)) {
+        for (const id of pendingServerToolUses.keys()) {
+          if (!serverToolResultIds.has(id)) {
+            pendingServerToolUses.delete(id);
+          }
+        }
       }
       if (part.type === ContentTypes.TEXT && part.tool_call_ids) {
         /*
@@ -302,27 +581,41 @@ function formatAssistantMessage(
         For Anthropic models, the "tool_calls" field on a message is only respected if content is a string.
         */
         if (currentContent.length > 0) {
+          if (
+            currentContent.some((content) => content.type !== ContentTypes.TEXT)
+          ) {
+            currentContent.push(part);
+            lastAIMessage = createAIMessage(toLangChainContent(currentContent));
+            formattedMessages.push(lastAIMessage);
+            currentContent = [];
+            continue;
+          }
           let content = currentContent.reduce((acc, curr) => {
             if (curr.type === ContentTypes.TEXT) {
-              return `${acc}${String(curr[ContentTypes.TEXT] ?? '')}\n`;
+              return `${acc}${getTextContent(curr)}\n`;
             }
             return acc;
           }, '');
-          content =
-            `${content}\n${part[ContentTypes.TEXT] ?? part.text ?? ''}`.trim();
-          lastAIMessage = new AIMessage({ content });
+          content = `${content}\n${getTextContent(part)}`.trim();
+          lastAIMessage = createAIMessage(content);
           formattedMessages.push(lastAIMessage);
           currentContent = [];
           continue;
         }
         // Create a new AIMessage with this text and prepare for tool calls
-        lastAIMessage = new AIMessage({
-          content: part.text != null ? part.text : '',
-        });
+        lastAIMessage = createAIMessage(getTextContent(part));
         formattedMessages.push(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
         // Skip malformed tool call entries without tool_call property
         if (part.tool_call == null) {
+          continue;
+        }
+        const toolCallId = getToolCallId(part);
+        if (
+          options?.provider === Providers.ANTHROPIC &&
+          toolCallId != null &&
+          preferredToolCallParts.get(toolCallId) !== part
+        ) {
           continue;
         }
 
@@ -341,10 +634,38 @@ function formatAssistantMessage(
           continue;
         }
 
+        if (
+          options?.provider === Providers.ANTHROPIC &&
+          typeof _tool_call.id === 'string' &&
+          _tool_call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        ) {
+          if (
+            !serverToolResultIds.has(_tool_call.id) &&
+            options.preserveUnpairedServerToolUses !== true
+          ) {
+            continue;
+          }
+          if (
+            emittedServerToolUseIds.has(_tool_call.id) ||
+            pendingServerToolUses.has(_tool_call.id)
+          ) {
+            continue;
+          }
+          pendingServerToolUses.set(_tool_call.id, {
+            type: 'server_tool_use',
+            id: _tool_call.id,
+            name: _tool_call.name,
+            input: parseServerToolInput(_args),
+          } as MessageContentComplex);
+          continue;
+        }
+
         if (!lastAIMessage) {
           // "Heal" the payload by creating an AIMessage to precede the tool call
-          lastAIMessage = new AIMessage({ content: '' });
+          lastAIMessage = createAIMessage('');
           formattedMessages.push(lastAIMessage);
+        } else {
+          attachPendingReasoningContent(lastAIMessage);
         }
 
         const tool_call: ToolCallPart = _tool_call;
@@ -361,25 +682,44 @@ function formatAssistantMessage(
         }
 
         tool_call.args = args;
-        if (!lastAIMessage.tool_calls) {
-          lastAIMessage.tool_calls = [];
+        if (
+          options?.provider === Providers.ANTHROPIC &&
+          Array.isArray(lastAIMessage.content)
+        ) {
+          const content = lastAIMessage.content as MessageContentComplex[];
+          content.push({
+            type: 'tool_use',
+            id: normalizeAnthropicToolCallId(tool_call.id ?? ''),
+            name: tool_call.name,
+            input: args,
+          } as MessageContentComplex);
+          lastAIMessage.content = content as MessageContent;
+        } else {
+          if (!lastAIMessage.tool_calls) {
+            lastAIMessage.tool_calls = [];
+          }
+          lastAIMessage.tool_calls.push(tool_call as ToolCall);
         }
-        lastAIMessage.tool_calls.push(tool_call as ToolCall);
 
         formattedMessages.push(
-          new ToolMessage({
-            tool_call_id: tool_call.id ?? '',
-            name: tool_call.name,
-            content: output != null ? output : '',
-          })
+          withMessageRole(
+            new ToolMessage({
+              tool_call_id: tool_call.id ?? '',
+              name: tool_call.name,
+              content: output != null ? output : '',
+            }),
+            'tool'
+          )
         );
       } else if (
         part.type === ContentTypes.THINK ||
         part.type === ContentTypes.THINKING ||
+        part.type === ContentTypes.REASONING ||
         part.type === ContentTypes.REASONING_CONTENT ||
         part.type === 'redacted_thinking'
       ) {
         hasReasoning = true;
+        pendingReasoningContent += extractReasoningContent(part);
         continue;
       } else if (
         part.type === ContentTypes.ERROR ||
@@ -388,32 +728,35 @@ function formatAssistantMessage(
       ) {
         continue;
       } else {
-        if (
-          part.type === ContentTypes.TEXT &&
-          !String(part.text ?? '').trim()
-        ) {
+        if (part.type === ContentTypes.TEXT && !getTextContent(part).trim()) {
           continue;
         }
         currentContent.push(part);
       }
     }
+    for (const content of pendingServerToolUses.values()) {
+      currentContent.push(content);
+    }
   }
 
   if (hasReasoning && currentContent.length > 0) {
-    const content = currentContent
-      .reduce((acc, curr) => {
-        if (curr.type === ContentTypes.TEXT) {
-          return `${acc}${String(curr[ContentTypes.TEXT] ?? '')}\n`;
-        }
-        return acc;
-      }, '')
-      .trim();
+    let content = '';
+    for (const part of currentContent) {
+      if (part.type !== ContentTypes.TEXT) {
+        formattedMessages.push(
+          createAIMessage(toLangChainContent(currentContent))
+        );
+        return formattedMessages;
+      }
+      content += `${getTextContent(part)}\n`;
+    }
+    content = content.trim();
 
     if (content) {
-      formattedMessages.push(new AIMessage({ content }));
+      formattedMessages.push(createAIMessage(content));
     }
   } else if (currentContent.length > 0) {
-    formattedMessages.push(new AIMessage({ content: currentContent }));
+    formattedMessages.push(createAIMessage(toLangChainContent(currentContent)));
   }
 
   return formattedMessages;
@@ -797,20 +1140,48 @@ function contentPartCharLength(part: MessageContentComplex): number {
   return len;
 }
 
+/** Extracts the skillName from a skill tool_call's args (string or object). */
+function extractSkillName(args: unknown): string | undefined {
+  let parsed: Record<string, unknown> | undefined;
+  if (typeof args === 'string') {
+    try {
+      parsed = JSON.parse(args) as Record<string, unknown>;
+    } catch {
+      /* malformed args — skip */
+    }
+  } else {
+    parsed = args as Record<string, unknown> | undefined;
+  }
+  const name = parsed?.skillName;
+  return typeof name === 'string' && name !== '' ? name : undefined;
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
  * @param payload - The array of messages to format.
  * @param indexTokenCountMap - Optional map of message indices to token counts.
  * @param tools - Optional set of tool names that are allowed in the request.
+ * @param skills - Optional map of skill name to body for reconstructing skill HumanMessages.
+ * @param options - Optional formatting options (provider, skipSkillBodyNames).
  * @returns - Object containing formatted messages and updated indexTokenCountMap if provided.
  */
 export const formatAgentMessages = (
   payload: TPayload,
   indexTokenCountMap?: Record<number, number | undefined>,
-  tools?: Set<string>
+  tools?: Set<string>,
+  /** Pre-resolved skill bodies keyed by skill name. When present, HumanMessages
+   *  are reconstructed after skill ToolMessages to restore skill instructions
+   *  that were only in LangGraph state during the original run. */
+  skills?: Map<string, string>,
+  options?: FormatAgentMessagesOptions
 ): {
-  messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
+  messages: Array<
+    | RoleBearingMessage<HumanMessage>
+    | RoleBearingMessage<AIMessage>
+    | RoleBearingMessage<SystemMessage>
+    | RoleBearingMessage<ToolMessage>
+  >;
   indexTokenCountMap?: Record<number, number>;
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
@@ -825,7 +1196,10 @@ export const formatAgentMessages = (
   };
 } => {
   const messages: Array<
-    HumanMessage | AIMessage | SystemMessage | ToolMessage
+    | RoleBearingMessage<HumanMessage>
+    | RoleBearingMessage<AIMessage>
+    | RoleBearingMessage<SystemMessage>
+    | RoleBearingMessage<ToolMessage>
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
@@ -881,7 +1255,10 @@ export const formatAgentMessages = (
       const formattedMessage = formatMessage({
         message: message as MessageInput,
         langChain: true,
-      }) as HumanMessage | AIMessage | SystemMessage;
+      }) as
+        | RoleBearingMessage<HumanMessage>
+        | RoleBearingMessage<AIMessage>
+        | RoleBearingMessage<SystemMessage>;
       if (sourceMessageId != null && sourceMessageId !== '') {
         formattedMessage.id = sourceMessageId;
       }
@@ -902,6 +1279,7 @@ export const formatAgentMessages = (
      * - Dynamically expand the set when tool_search results are encountered
      */
     let processedMessage = message;
+    let pendingSkillNames: Set<string> | undefined;
     if (discoveredTools) {
       const content = message.content;
       if (content != null && Array.isArray(content)) {
@@ -950,8 +1328,17 @@ export const formatAgentMessages = (
           }
 
           if (discoveredTools.has(toolName)) {
-            /** Valid tool - keep it */
             filteredContent.push(part);
+            if (
+              toolName === Constants.SKILL_TOOL &&
+              skills?.size != null &&
+              skills.size > 0
+            ) {
+              const skillName = extractSkillName(part.tool_call.args) ?? '';
+              if (skillName) {
+                (pendingSkillNames ??= new Set()).add(skillName);
+              }
+            }
           } else {
             /** Invalid tool - convert to string for context preservation */
             if (
@@ -1027,7 +1414,30 @@ export const formatAgentMessages = (
       }
     }
 
-    const formattedMessages = formatAssistantMessage(processedMessage);
+    /** When tools filtering is off, still detect skill tool_calls for body reconstruction */
+    if (!discoveredTools && skills?.size != null && skills.size > 0) {
+      const content = processedMessage.content;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (
+            part.type !== ContentTypes.TOOL_CALL ||
+            part.tool_call?.name !== Constants.SKILL_TOOL
+          ) {
+            continue;
+          }
+          const skillName = extractSkillName(part.tool_call.args) ?? '';
+          if (skillName) {
+            (pendingSkillNames ??= new Set()).add(skillName);
+          }
+        }
+      }
+    }
+
+    const formattedMessages = formatAssistantMessage(processedMessage, {
+      preserveUnpairedServerToolUses: i === payload.length - 1,
+      preserveReasoningContent: options?.provider === Providers.DEEPSEEK,
+      provider: options?.provider,
+    });
     if (sourceMessageId != null && sourceMessageId !== '') {
       for (const formattedMessage of formattedMessages) {
         formattedMessage.id = sourceMessageId;
@@ -1035,9 +1445,36 @@ export const formatAgentMessages = (
     }
     messages.push(...formattedMessages);
 
-    // Update the index mapping for this assistant message
-    // Store all indices that were created from this original message
+    // Capture index range BEFORE skill body injection so injected
+    // HumanMessages are excluded from the assistant's token distribution.
     const endMessageIndex = messages.length;
+
+    if (pendingSkillNames?.size != null && pendingSkillNames.size > 0) {
+      const skipSkillBodyNames = options?.skipSkillBodyNames;
+      for (const skillName of pendingSkillNames) {
+        if (skipSkillBodyNames != null && skipSkillBodyNames.has(skillName)) {
+          continue;
+        }
+        const body = skills?.get(skillName) ?? '';
+        if (body) {
+          messages.push(
+            withMessageRole(
+              new HumanMessage({
+                content: body,
+                additional_kwargs: {
+                  role: 'user',
+                  isMeta: true,
+                  source: 'skill',
+                  skillName,
+                },
+              }),
+              'user'
+            )
+          );
+        }
+      }
+    }
+
     const resultIndices = [];
     for (let j = startMessageIndex; j < endMessageIndex; j++) {
       resultIndices.push(j);
@@ -1160,29 +1597,6 @@ export const formatAgentMessages = (
         updatedIndexTokenCountMap[resultIndices[lastIdx]] =
           tokenCount - distributed;
       }
-    }
-  }
-
-  /**
-   * Safety guard for legacy conversations:
-   * If the final message in the sequence is a ToolMessage, insert a synthetic
-   * AIMessage before returning. This prevents downstream chat APIs from
-   * rejecting the history with "Unexpected role 'user' after role 'tool'"
-   * when a new user turn is appended.
-   */
-  if (messages.length > 0) {
-    const last = messages[messages.length - 1];
-    const isTool =
-      last instanceof ToolMessage ||
-      (typeof (last as any).getType === 'function' &&
-        (last as any).getType() === 'tool');
-
-    if (isTool) {
-      messages.push(
-        new AIMessage(
-          '[Processed previous tool results; ready to continue the conversation.]'
-        )
-      );
     }
   }
 
@@ -1344,12 +1758,23 @@ function appendToolCalls(
  * @param messages - Array of messages to process
  * @param provider - The provider being used (unused but kept for future compatibility)
  * @param config - Optional RunnableConfig for structured agent logging
+ * @param runStartIndex - Index in `messages` where the CURRENT run's own
+ *   appended AI/Tool messages begin (i.e. anything at this index or later
+ *   was just produced by this run's own iterations, not historical
+ *   context). When provided, AI messages at or after this index are
+ *   never converted to `[Previous agent context]` placeholders — Claude
+ *   can validly skip a thinking block before a tool_use (cf. PR #116),
+ *   so the agent's own in-run iterations must not be misclassified as
+ *   foreign history. Without the signal the function falls back to its
+ *   prior heuristic (`chainHasThinkingBlock`), preserving backward
+ *   compatibility for callers that don't yet pass the boundary.
  * @returns The messages array with tool sequences converted to buffer strings if necessary
  */
 export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
   _provider: Providers,
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  runStartIndex?: number
 ): BaseMessage[] {
   if (messages.length === 0) {
     return messages;
@@ -1436,6 +1861,23 @@ export function ensureThinkingBlockInMessages(
     // but follow-ups have content: "" with only tool_calls. These are the
     // same agent's turn and must NOT be converted to HumanMessages.
     if (hasToolUse && !hasThinkingBlock) {
+      // Current-run boundary check: anything at or after `runStartIndex`
+      // is the current run's own work — preserve it. Claude is allowed
+      // to skip a thinking block before a tool_use (cf. PR #116 in the
+      // agents repo), so the agent's own first-iteration AI message can
+      // legitimately have tool_calls without reasoning. Converting it to
+      // a `[Previous agent context]` placeholder pollutes the next
+      // iteration's prompt — the LLM sees the placeholder, treats it as
+      // suspicious injected content, ignores its own real prior tool
+      // result, and re-runs the tool to verify (which then often fails
+      // because subsequent calls land in fresh sandboxes without the
+      // file). Skip the conversion when we know this is in-run.
+      if (runStartIndex !== undefined && i >= runStartIndex) {
+        result.push(msg);
+        i++;
+        continue;
+      }
+
       // Walk backwards — if an earlier AI message in the same chain (before
       // the nearest HumanMessage) has a thinking/reasoning block, this is a
       // continuation of a thinking-enabled turn, not a non-thinking handoff.
@@ -1467,7 +1909,12 @@ export function ensureThinkingBlockInMessages(
         'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
           ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
       );
-      result.push(new HumanMessage({ content: parts }));
+      result.push(
+        withMessageRole(
+          new HumanMessage({ content: toLangChainContent(parts) }),
+          'user'
+        )
+      );
       i = j;
     } else {
       // Keep the message as is

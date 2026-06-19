@@ -9,8 +9,8 @@ import type {
   MessageContentComplex,
   ReasoningContentText,
 } from '@/types/stream';
-import type { TokenCounter } from '@/types/run';
 import type { ContextPruningConfig } from '@/types/graph';
+import type { TokenCounter } from '@/types/run';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
@@ -19,6 +19,7 @@ import {
 import { resolveContextPruningSettings } from './contextPruningSettings';
 import { ContentTypes, Providers, Constants } from '@/common';
 import { applyContextPruning } from './contextPruning';
+import { toLangChainContent } from './langchain';
 
 function sumTokenCounts(
   tokenMap: Record<string, number | undefined>,
@@ -49,7 +50,33 @@ const PRESSURE_BANDS: [number, number][] = [
 const MASKED_RESULT_MAX_CHARS = 300;
 
 /** Hard cap for the originalToolContent store (~2 MB estimated from char length). */
-const ORIGINAL_CONTENT_MAX_CHARS = 2_000_000;
+export const ORIGINAL_CONTENT_MAX_CHARS = 2_000_000;
+
+/**
+ * Evicts oldest entries from `map` (in Map-iteration / insertion order) until
+ * the cumulative char length of remaining values fits within
+ * `ORIGINAL_CONTENT_MAX_CHARS`.  Used by the recency-window carry-over merge
+ * path in Graph.ts to bound long-running session memory: the pruner enforces
+ * the cap inside its own `originalToolContent` map, but a key-wise union with
+ * recency carry-over bypasses that cap unless re-applied here.
+ */
+export function enforceOriginalContentCap(map: Map<number, string>): void {
+  let total = 0;
+  for (const v of map.values()) {
+    total += v.length;
+  }
+  while (total > ORIGINAL_CONTENT_MAX_CHARS && map.size > 0) {
+    const oldest = map.keys().next();
+    if (oldest.done === true) {
+      break;
+    }
+    const removed = map.get(oldest.value);
+    if (removed != null) {
+      total -= removed.length;
+    }
+    map.delete(oldest.value);
+  }
+}
 
 /** Minimum cumulative calibration ratio — provider can't count fewer tokens
  *  than our raw estimate (within reason). Prevents divide-by-zero edge cases. */
@@ -343,7 +370,7 @@ function stripOrphanToolUseBlocks(
 
   return new AIMessage({
     ...message,
-    content: keptContent,
+    content: toLangChainContent(keptContent),
     tool_calls: keptToolCalls.length > 0 ? keptToolCalls : undefined,
   });
 }
@@ -536,13 +563,13 @@ function addThinkingBlock(
       },
     ];
   /** Edge case, the message already has the thinking block */
-  if (content[0].type === thinkingBlock.type) {
+  if (content[0]?.type === thinkingBlock.type) {
     return message;
   }
   content.unshift(thinkingBlock);
   return new AIMessage({
     ...message,
-    content,
+    content: toLangChainContent(content),
   });
 }
 
@@ -580,6 +607,33 @@ export type PruningResult = {
   messagesToRefine: BaseMessage[];
   thinkingStartIndex?: number;
 };
+
+/**
+ * Locates a reasoning block in assistant content. Reasoning blocks carry
+ * provider-specific `type` tags: Anthropic emits `thinking`, while Bedrock and
+ * OpenAI-compatible reasoning providers (DeepSeek-R1, DashScope/Qwen-thinking)
+ * emit `reasoning_content`. DeepSeek/Qwen route through the `THINKING` default
+ * even though their blocks are `reasoning_content` and aren't normalized
+ * upstream, so for the `THINKING` case we also accept `reasoning_content` — this
+ * is what fixes issue #191.
+ *
+ * The broadening is intentionally one-directional. A Bedrock run
+ * (`REASONING_CONTENT`) must NOT match an Anthropic `thinking` block: the
+ * Bedrock input converter rejects `thinking` blocks outright
+ * (`src/llm/bedrock/utils/message_inputs.ts`), so reattaching one to a
+ * surviving message would make the request fail before it is sent.
+ */
+function findReasoningBlock(
+  content: MessageContentComplex[],
+  reasoningType: ContentTypes
+): ThinkingContentText | ReasoningContentText | undefined {
+  return content.find(
+    (part) =>
+      part.type === reasoningType ||
+      (reasoningType === ContentTypes.THINKING &&
+        part.type === ContentTypes.REASONING_CONTENT)
+  ) as ThinkingContentText | ReasoningContentText | undefined;
+}
 
 /**
  * Processes an array of messages and returns a context of messages that fit within a specified token limit.
@@ -643,9 +697,7 @@ export function getMessagesWithinTokenLimit({
   if (_thinkingStartIndex > -1) {
     const thinkingMessageContent = messages[_thinkingStartIndex]?.content;
     if (Array.isArray(thinkingMessageContent)) {
-      thinkingBlock = thinkingMessageContent.find(
-        (content) => content.type === reasoningType
-      ) as ThinkingContentText | undefined;
+      thinkingBlock = findReasoningBlock(thinkingMessageContent, reasoningType);
     }
   }
 
@@ -678,15 +730,23 @@ export function getMessagesWithinTokenLimit({
         messageType === 'ai' &&
         Array.isArray(poppedMessage.content)
       ) {
-        thinkingBlock = poppedMessage.content.find(
-          (content) => content.type === reasoningType
-        ) as ThinkingContentText | undefined;
+        thinkingBlock = findReasoningBlock(
+          poppedMessage.content,
+          reasoningType
+        );
         thinkingStartIndex = thinkingBlock != null ? currentIndex : -1;
       }
-      /** False start, the latest message was not part of a multi-assistant/tool sequence of messages */
+      /**
+       * Exited the trailing assistant/tool sequence without finding a
+       * thinking block. Anthropic does not require Claude to emit a
+       * thinking block before every tool call, so the absence of one is
+       * a valid sequence — clear thinkingEndIndex so the pruner does not
+       * treat it as malformed.
+       */
       if (
         thinkingEndIndex > -1 &&
-        currentIndex === thinkingEndIndex - 1 &&
+        thinkingStartIndex < 0 &&
+        !thinkingBlock &&
         messageType !== 'ai' &&
         messageType !== 'tool'
       ) {
@@ -777,16 +837,28 @@ export function getMessagesWithinTokenLimit({
     return result;
   }
 
-  if (thinkingEndIndex > -1 && thinkingStartIndex < 0) {
-    throw new Error(
-      'The payload is malformed. There is a thinking sequence but no "AI" messages with thinking blocks.'
-    );
-  }
-
-  if (!thinkingBlock) {
-    throw new Error(
-      'The payload is malformed. There is a thinking sequence but no thinking block found.'
-    );
+  /**
+   * A trailing reasoning sequence was detected but its block could not be
+   * located in the surviving context. Rather than throw — which permanently
+   * bricks the conversation, re-firing on every retry of the same thread (see
+   * issue #191) — return the partially-pruned context and let the provider
+   * surface a real, recoverable error if the payload is genuinely malformed.
+   * Strict providers (Anthropic) reject it cleanly; lenient ones (DeepSeek,
+   * Qwen) proceed. The pruner cannot know which applies, so it must not be the
+   * one to make the failure fatal.
+   */
+  if ((thinkingEndIndex > -1 && thinkingStartIndex < 0) || !thinkingBlock) {
+    /**
+     * No block was located, so any `thinkingStartIndex` set above came from a
+     * stale carried-over index pointing at a block-less message. Drop it:
+     * `createPruneMessages` persists the returned index as
+     * `runThinkingStartIndex`, and a stale value would suppress the trailing
+     * scan (`thinkingStartIndex < 0`) on later turns, causing a real reasoning
+     * block to be missed and never reattached.
+     */
+    delete result.thinkingStartIndex;
+    result.context = context.reverse() as BaseMessage[];
+    return result;
   }
 
   let assistantIndex = -1;
@@ -810,7 +882,7 @@ export function getMessagesWithinTokenLimit({
 
   thinkingStartIndex = originalLength - 1 - assistantIndex;
   const thinkingTokenCount = tokenCounter(
-    new AIMessage({ content: [thinkingBlock] })
+    new AIMessage({ content: toLangChainContent([thinkingBlock]) })
   );
   const newRemainingCount = remainingContextTokens - thinkingTokenCount;
   const newMessage = addThinkingBlock(
@@ -849,7 +921,7 @@ export function getMessagesWithinTokenLimit({
     }
   }
 
-  const firstMessage: AIMessage = newContext[newContext.length - 1];
+  const firstMessage = newContext[newContext.length - 1];
   const firstMessageType = newContext[newContext.length - 1].getType();
   if (firstMessageType === 'tool') {
     startType = ['ai', 'human'];
@@ -880,7 +952,10 @@ export function getMessagesWithinTokenLimit({
   }
 
   if (firstMessageType === 'ai') {
-    const newMessage = addThinkingBlock(firstMessage, thinkingBlock);
+    const newMessage = addThinkingBlock(
+      firstMessage as AIMessage,
+      thinkingBlock
+    );
     newContext[newContext.length - 1] = newMessage;
   } else {
     newContext.push(thinkingMessage);
@@ -1171,7 +1246,7 @@ export function preFlightTruncateToolCallInputs(params: {
 
     messages[i] = new AIMessage({
       ...aiMsg,
-      content: newContent,
+      content: toLangChainContent(newContent),
       tool_calls: newToolCalls.length > 0 ? newToolCalls : undefined,
     });
     indexTokenCountMap[i] = tokenCounter(messages[i]);
@@ -1237,16 +1312,36 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     originalToolContent?: Map<number, string>;
     calibrationRatio?: number;
     resolvedInstructionOverhead?: number;
+    /** Usable budget this call: maxTokens minus output reserve */
+    contextBudget?: number;
+    /** Calibrated instruction overhead actually applied this call */
+    effectiveInstructionTokens?: number;
   } {
     if (params.messages.length === 0) {
+      /** Post-compaction calls still invoke the model — report the same
+       *  reserve-adjusted budget fields as the populated paths */
+      const emptyInstructionTokens =
+        factoryParams.getInstructionTokens?.() ?? 0;
+      const emptyReserveRatio =
+        factoryParams.reserveRatio ?? DEFAULT_RESERVE_RATIO;
+      const emptyBudget =
+        factoryParams.maxTokens -
+        (emptyReserveRatio > 0 && emptyReserveRatio < 1
+          ? Math.round(factoryParams.maxTokens * emptyReserveRatio)
+          : 0);
       return {
         context: [],
         indexTokenCountMap,
         messagesToRefine: [],
         prePruneContextTokens: 0,
-        remainingContextTokens: factoryParams.maxTokens,
+        remainingContextTokens: Math.max(
+          0,
+          emptyBudget - emptyInstructionTokens
+        ),
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
+        contextBudget: emptyBudget,
+        effectiveInstructionTokens: emptyInstructionTokens,
       };
     }
 
@@ -1283,7 +1378,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
           params.messages[i] = new AIMessage({
             ...message,
-            content: [thinkingBlock],
+            content: toLangChainContent([thinkingBlock]),
             additional_kwargs: {
               ...message.additional_kwargs,
               reasoning_content: undefined,
@@ -1474,6 +1569,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
+        contextBudget: pruningBudget,
+        effectiveInstructionTokens: currentInstructionTokens,
       };
     }
 
@@ -1677,6 +1774,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           originalToolContent.size > 0 ? originalToolContent : undefined,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
+        contextBudget: pruningBudget,
+        effectiveInstructionTokens: currentInstructionTokens,
       };
     }
 
@@ -1959,7 +2058,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               });
               emergencyMessages[i] = new AIMessage({
                 ...aiMsg,
-                content: newContent,
+                content: toLangChainContent(newContent),
                 tool_calls: newToolCalls.length > 0 ? newToolCalls : undefined,
               });
               indexTokenCountMap[i] = factoryParams.tokenCounter(
@@ -2024,9 +2123,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     }
 
+    /** Scale raw-space remaining back to calibrated/provider units so it is
+     *  directly comparable with pruningBudget and prePruneContextTokens */
+    const rawRemaining = Math.max(
+      0,
+      initialRemainingContextTokens + reclaimedTokens
+    );
     const remainingContextTokens = Math.max(
       0,
-      Math.min(pruningBudget, initialRemainingContextTokens + reclaimedTokens)
+      Math.min(
+        pruningBudget,
+        calibrationRatio > 0
+          ? Math.round(rawRemaining * calibrationRatio)
+          : rawRemaining
+      )
     );
 
     runThinkingStartIndex = thinkingStartIndex ?? -1;
@@ -2048,6 +2158,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         originalToolContent.size > 0 ? originalToolContent : undefined,
       calibrationRatio,
       resolvedInstructionOverhead: bestInstructionOverhead,
+      contextBudget: pruningBudget,
+      effectiveInstructionTokens: currentInstructionTokens,
     };
   };
 }

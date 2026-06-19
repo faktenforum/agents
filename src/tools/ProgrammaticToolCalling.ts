@@ -2,31 +2,33 @@
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
-import { imageExtRegex, getCodeBaseURL } from './CodeExecutor';
-import { EnvVar, Constants } from '@/common';
+import {
+  CODE_ARTIFACT_PATH_GUIDANCE,
+  appendCodeSessionFileSummary,
+  appendFailedExecutionFileReminder,
+  buildCodeApiHttpErrorMessage,
+  emptyOutputMessage,
+  getCodeBaseURL,
+  appendTmpScratchReminder,
+  resolveCodeApiAuthHeaders,
+} from './CodeExecutor';
+import {
+  clampCodeApiRunTimeoutMs,
+  createCodeApiRunTimeoutSchema,
+  resolveCodeApiRunTimeoutMs,
+} from './ptcTimeout';
+import { Constants } from '@/common';
 
 config();
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const imageMessage = 'Image is already displayed to the user';
-const otherMessage = 'File is already downloaded by the user';
-const accessMessage =
-  'Note: Files from previous executions are automatically available and can be modified.';
-const emptyOutputMessage =
-  'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
 /** Default max round-trips to prevent infinite loops */
 const DEFAULT_MAX_ROUND_TRIPS = 20;
 
-/** Default execution timeout in milliseconds */
-const DEFAULT_TIMEOUT = 60000;
+const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
 
 // ============================================================================
 // Description Components (Single Source of Truth)
@@ -38,14 +40,17 @@ You MUST complete your entire workflow in ONE code block: query → process → 
 DO NOT split work across multiple calls expecting to reuse variables.`;
 
 const CORE_RULES = `Rules:
-- EVERYTHING in one call—no state persists between executions
-- Just write code with await—auto-wrapped in async context
-- DO NOT define async def main() or call asyncio.run()
+- One call: state does not persist
+- Auto-wrapped async; use await, no main()/asyncio.run()
 - Tools are pre-defined—DO NOT write function definitions
-- Only print() output returns to the model`;
+- Call tools with keyword args only (await tool(arg=value), never pass a dict)
+- Tool results are decoded Python values (dict/list/str)
+- Only print() output returns to the model
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
+- timeout caps one sandbox run/replay iteration, not the total multi-round-trip workflow`;
 
-const ADDITIONAL_RULES = `- Generated files are automatically available in /mnt/data/ for subsequent executions
-- Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix`;
+const ADDITIONAL_RULES =
+  '- Tool names normalized: hyphens→underscores, keywords get `_tool` suffix';
 
 const EXAMPLES = `Example (Complete workflow in one call):
   # Query data
@@ -75,25 +80,32 @@ ${EXAMPLES}
 
 ${CORE_RULES}`;
 
-export const ProgrammaticToolCallingSchema = {
-  type: 'object',
-  properties: {
-    code: {
-      type: 'string',
-      minLength: 1,
-      description: CODE_PARAM_DESCRIPTION,
+export function createProgrammaticToolCallingSchema(
+  maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
+): ProgrammaticToolCallingJsonSchema {
+  return {
+    type: 'object',
+    properties: {
+      code: {
+        type: 'string',
+        minLength: 1,
+        description: CODE_PARAM_DESCRIPTION,
+      },
+      timeout: createCodeApiRunTimeoutSchema(maxRunTimeoutMs),
     },
-    timeout: {
-      type: 'integer',
-      minimum: 1000,
-      maximum: 300000,
-      default: DEFAULT_TIMEOUT,
-      description:
-        'Maximum execution time in milliseconds. Default: 60 seconds. Max: 5 minutes.',
-    },
-  },
-  required: ['code'],
-} as const;
+    required: ['code'],
+  } as const;
+}
+
+export const ProgrammaticToolCallingSchema =
+  createProgrammaticToolCallingSchema();
+
+/**
+ * Canonical name of the programmatic tool-calling tool. Kept as a named export
+ * because upstream's Local/Cloudflare programmatic tool variants import it; our
+ * own code uses Constants.PROGRAMMATIC_TOOL_CALLING directly.
+ */
+export const ProgrammaticToolCallingName = Constants.PROGRAMMATIC_TOOL_CALLING;
 
 export const ProgrammaticToolCallingDescription = `
 Run tools via Python code. Auto-wrapped in async context—just use \`await\` directly.
@@ -156,6 +168,113 @@ const PYTHON_KEYWORDS = new Set([
   'with',
   'yield',
 ]);
+
+export type FetchSessionFilesScope =
+  | { kind: 'skill'; id: string; version: number }
+  | { kind: 'agent' | 'user'; id: string; version?: never };
+
+type CodeApiSessionFileWire = {
+  id?: unknown;
+  name?: unknown;
+  metadata?: unknown;
+  resource_id?: unknown;
+  storage_session_id?: unknown;
+};
+
+type CodeApiSessionFileMetadata = {
+  'original-filename'?: unknown;
+};
+
+function isFetchSessionFilesScope(
+  value: unknown
+): value is FetchSessionFilesScope {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const scope = value as { kind?: unknown; id?: unknown; version?: unknown };
+  if (
+    (scope.kind === 'agent' || scope.kind === 'user') &&
+    typeof scope.id === 'string'
+  ) {
+    return true;
+  }
+  return (
+    scope.kind === 'skill' &&
+    typeof scope.id === 'string' &&
+    typeof scope.version === 'number'
+  );
+}
+
+function isCodeApiAuthHeaders(
+  value: string | t.CodeApiAuthHeaders | undefined
+): value is t.CodeApiAuthHeaders {
+  return value != null && typeof value !== 'string';
+}
+
+function isCodeApiSessionFileWire(
+  value: unknown
+): value is CodeApiSessionFileWire {
+  return value != null && typeof value === 'object';
+}
+
+function isCodeApiSessionFileMetadata(
+  value: unknown
+): value is CodeApiSessionFileMetadata {
+  return value != null && typeof value === 'object';
+}
+
+function normalizeSessionFile(
+  file: CodeApiSessionFileWire,
+  sessionId: string,
+  scope?: FetchSessionFilesScope
+): t.CodeEnvFile {
+  const metadata = isCodeApiSessionFileMetadata(file.metadata)
+    ? file.metadata
+    : undefined;
+  const rawName = typeof file.name === 'string' ? file.name : '';
+  const nameParts = rawName.split('/');
+  const fallbackId = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
+  const id =
+    typeof file.id === 'string' && file.id !== '' ? file.id : fallbackId;
+  const originalFilename = metadata?.['original-filename'];
+  const name =
+    typeof originalFilename === 'string' ? originalFilename : rawName;
+  const storage_session_id =
+    typeof file.storage_session_id === 'string'
+      ? file.storage_session_id
+      : sessionId;
+  const resource_id =
+    typeof file.resource_id === 'string' && file.resource_id !== ''
+      ? file.resource_id
+      : (scope?.id ?? id);
+
+  if (scope?.kind === 'skill') {
+    return {
+      storage_session_id,
+      kind: 'skill',
+      id,
+      resource_id,
+      name,
+      version: scope.version,
+    };
+  }
+  if (scope != null) {
+    return {
+      storage_session_id,
+      kind: scope.kind,
+      id,
+      resource_id,
+      name,
+    };
+  }
+  return {
+    storage_session_id,
+    kind: 'user',
+    id,
+    resource_id: id,
+    name,
+  };
+}
 
 /**
  * Normalizes a tool name to Python identifier format.
@@ -259,24 +378,63 @@ export function filterToolsByUsage(
  * Fetches files from a previous session to make them available for the current execution.
  * Files are returned as CodeEnvFile references to be included in the request.
  * @param baseUrl - The base URL for the Code API
- * @param apiKey - The API key for authentication
  * @param sessionId - The session ID to fetch files from
+ * @param scope - Resource scope used by CodeAPI to authorize the session
  * @param proxy - Optional HTTP proxy URL
  * @returns Array of CodeEnvFile references, or empty array if fetch fails
  */
 export async function fetchSessionFiles(
   baseUrl: string,
-  apiKey: string,
   sessionId: string,
-  proxy?: string
+  proxy?: string,
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeEnvFile[]>;
+export async function fetchSessionFiles(
+  baseUrl: string,
+  sessionId: string,
+  scope: FetchSessionFilesScope,
+  proxyOrAuthHeaders?: string | t.CodeApiAuthHeaders,
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeEnvFile[]>;
+export async function fetchSessionFiles(
+  baseUrl: string,
+  sessionId: string,
+  scopeOrProxy?: FetchSessionFilesScope | string,
+  proxyOrAuthHeaders?: string | t.CodeApiAuthHeaders,
+  scopedAuthHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeEnvFile[]> {
   try {
-    const filesEndpoint = `${baseUrl}/files/${sessionId}?detail=full`;
+    const scope = isFetchSessionFilesScope(scopeOrProxy)
+      ? scopeOrProxy
+      : undefined;
+    let proxy: string | undefined;
+    let authHeaders: t.CodeApiAuthHeaders | undefined;
+    if (scope == null) {
+      proxy = typeof scopeOrProxy === 'string' ? scopeOrProxy : undefined;
+      authHeaders = isCodeApiAuthHeaders(proxyOrAuthHeaders)
+        ? proxyOrAuthHeaders
+        : undefined;
+    } else if (typeof proxyOrAuthHeaders === 'string') {
+      proxy = proxyOrAuthHeaders;
+      authHeaders = scopedAuthHeaders;
+    } else {
+      authHeaders = proxyOrAuthHeaders ?? scopedAuthHeaders;
+    }
+    const query = new URLSearchParams({ detail: 'full' });
+    if (scope != null) {
+      query.set('kind', scope.kind);
+      query.set('id', scope.id);
+      if (scope.kind === 'skill') {
+        query.set('version', String(scope.version));
+      }
+    }
+    const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
     const fetchOptions: RequestInit = {
       method: 'GET',
       headers: {
         'User-Agent': 'LibreChat/1.0',
-        'X-API-Key': apiKey,
+        ...resolvedAuthHeaders,
       },
     };
 
@@ -286,7 +444,9 @@ export async function fetchSessionFiles(
 
     const response = await fetch(filesEndpoint, fetchOptions);
     if (!response.ok) {
-      throw new Error(`Failed to fetch files for session: ${response.status}`);
+      throw new Error(
+        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response)
+      );
     }
 
     const files = await response.json();
@@ -294,19 +454,9 @@ export async function fetchSessionFiles(
       return [];
     }
 
-    return files.map((file: Record<string, unknown>) => {
-      // Extract the ID from the file name (part after session ID prefix and before extension)
-      const nameParts = (file.name as string).split('/');
-      const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
-
-      return {
-        session_id: sessionId,
-        id,
-        name: (file.metadata as Record<string, unknown>)[
-          'original-filename'
-        ] as string,
-      };
-    });
+    return files
+      .filter(isCodeApiSessionFileWire)
+      .map((file) => normalizeSessionFile(file, sessionId, scope));
   } catch (error) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -319,23 +469,23 @@ export async function fetchSessionFiles(
 /**
  * Makes an HTTP request to the Code API.
  * @param endpoint - The API endpoint URL
- * @param apiKey - The API key for authentication
  * @param body - The request body
  * @param proxy - Optional HTTP proxy URL
  * @returns The parsed API response
  */
 export async function makeRequest(
   endpoint: string,
-  apiKey: string,
   body: Record<string, unknown>,
-  proxy?: string
+  proxy?: string,
+  authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.ProgrammaticExecutionResponse> {
+  const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
   const fetchOptions: RequestInit = {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': 'LibreChat/1.0',
-      'X-API-Key': apiKey,
+      ...resolvedAuthHeaders,
     },
     body: JSON.stringify(body),
   };
@@ -347,9 +497,8 @@ export async function makeRequest(
   const response = await fetch(endpoint, fetchOptions);
 
   if (!response.ok) {
-    const errorText = await response.text();
     throw new Error(
-      `HTTP error! status: ${response.status}, body: ${errorText}`
+      await buildCodeApiHttpErrorMessage('POST', endpoint, response)
     );
   }
 
@@ -486,6 +635,122 @@ export function unwrapToolResponse(
   return result;
 }
 
+type ToolInputSchemaKind = {
+  object: boolean;
+  string: boolean;
+};
+
+function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
+  const kind: ToolInputSchemaKind = { object: false, string: false };
+
+  if (!schema || typeof schema !== 'object') {
+    return kind;
+  }
+
+  const jsonSchemaType = (schema as { type?: unknown }).type;
+  if (jsonSchemaType === 'object') {
+    kind.object = true;
+  } else if (jsonSchemaType === 'string') {
+    kind.string = true;
+  } else if (Array.isArray(jsonSchemaType)) {
+    kind.object = jsonSchemaType.includes('object');
+    kind.string = jsonSchemaType.includes('string');
+  }
+
+  const zodDef = (schema as { _def?: unknown })._def;
+  if (!zodDef || typeof zodDef !== 'object') {
+    return kind;
+  }
+
+  const zodType = (zodDef as { type?: unknown; typeName?: unknown }).type;
+  const zodTypeName = (zodDef as { type?: unknown; typeName?: unknown })
+    .typeName;
+
+  if (zodType === 'object' || zodTypeName === 'ZodObject') {
+    kind.object = true;
+  } else if (zodType === 'string' || zodTypeName === 'ZodString') {
+    kind.string = true;
+  }
+
+  const innerSchema =
+    (
+      zodDef as {
+        innerType?: unknown;
+        schema?: unknown;
+        type?: unknown;
+      }
+    ).innerType ?? (zodDef as { schema?: unknown }).schema;
+  if (innerSchema) {
+    const innerKind = detectSchemaKind(innerSchema);
+    kind.object ||= innerKind.object;
+    kind.string ||= innerKind.string;
+  }
+
+  const options = (zodDef as { options?: unknown }).options;
+  if (Array.isArray(options)) {
+    for (const option of options) {
+      const optionKind = detectSchemaKind(option);
+      kind.object ||= optionKind.object;
+      kind.string ||= optionKind.string;
+    }
+  }
+
+  return kind;
+}
+
+function getToolInputSchemaKind(tool: t.GenericTool): ToolInputSchemaKind {
+  if (tool.constructor.name === 'DynamicTool') {
+    return { object: false, string: true };
+  }
+
+  const schema = (tool as { schema?: unknown }).schema;
+  return detectSchemaKind(schema);
+}
+
+function normalizeToolInput(
+  input: t.PTCToolCall['input'],
+  tool: t.GenericTool
+): t.PTCToolCall['input'] {
+  const schemaKind = getToolInputSchemaKind(tool);
+
+  if (typeof input !== 'string') {
+    if (!schemaKind.string || schemaKind.object) {
+      return input;
+    }
+
+    const inputValue = (input as { input?: unknown }).input;
+    if (typeof inputValue === 'string') {
+      return input;
+    }
+
+    return JSON.stringify(input);
+  }
+
+  if (!schemaKind.object || schemaKind.string) {
+    return input;
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed.startsWith('{')) {
+    return input;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      !Array.isArray(parsed)
+    ) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return input;
+  }
+
+  return input;
+}
+
 /**
  * Executes tools in parallel when requested by the API.
  * Uses Promise.all for parallel execution, catching individual errors.
@@ -496,7 +761,8 @@ export function unwrapToolResponse(
  */
 export async function executeTools(
   toolCalls: t.PTCToolCall[],
-  toolMap: t.ToolMap
+  toolMap: t.ToolMap,
+  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING
 ): Promise<t.PTCToolResult[]> {
   const executions = toolCalls.map(async (call): Promise<t.PTCToolResult> => {
     const tool = toolMap.get(call.name);
@@ -511,8 +777,8 @@ export async function executeTools(
     }
 
     try {
-      const result = await tool.invoke(call.input, {
-        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      const result = await tool.invoke(normalizeToolInput(call.input, tool), {
+        metadata: { [programmaticToolName]: true },
       });
 
       const isMCPTool = tool.mcp === true;
@@ -538,11 +804,17 @@ export async function executeTools(
 
 /**
  * Formats the completed response for the agent.
+ *
+ * Output includes stdout/stderr plus a compact session-file summary
+ * when artifacts were persisted. The artifact still carries every
+ * file so the host's session map stays in sync.
+ *
  * @param response - The completed API response
  * @returns Tuple of [formatted string, artifact]
  */
 export function formatCompletedResponse(
-  response: t.ProgrammaticExecutionResponse
+  response: t.ProgrammaticExecutionResponse,
+  sourceCode = ''
 ): [string, t.ProgrammaticExecutionArtifact] {
   let formatted = '';
 
@@ -556,29 +828,14 @@ export function formatCompletedResponse(
     formatted += `stderr:\n${response.stderr}\n`;
   }
 
-  if (response.files && response.files.length > 0) {
-    formatted += 'Generated files:\n';
-
-    const fileCount = response.files.length;
-    for (let i = 0; i < fileCount; i++) {
-      const file = response.files[i];
-      const isImage = imageExtRegex.test(file.name);
-      formatted += `- /mnt/data/${file.name} | ${isImage ? imageMessage : otherMessage}`;
-
-      if (i < fileCount - 1) {
-        formatted += fileCount <= 3 ? ', ' : ',\n';
-      }
-    }
-
-    formatted += `\n\n${accessMessage}`;
-  }
+  const outputWithReminder = appendTmpScratchReminder(formatted, sourceCode);
 
   return [
-    formatted.trim(),
+    appendCodeSessionFileSummary(outputWithReminder, response.files),
     {
       session_id: response.session_id,
       files: response.files,
-    },
+    } satisfies t.ProgrammaticExecutionArtifact,
   ];
 }
 
@@ -594,14 +851,11 @@ export function formatCompletedResponse(
  *
  * The tool map must be provided at runtime via config.configurable.toolMap.
  *
- * @param params - Configuration parameters (apiKey, baseUrl, maxRoundTrips, proxy)
+ * @param params - Configuration parameters (baseUrl, maxRoundTrips, proxy)
  * @returns A LangChain DynamicStructuredTool for programmatic tool calling
  *
  * @example
- * const ptcTool = createProgrammaticToolCallingTool({
- *   apiKey: process.env.CODE_API_KEY,
- *   maxRoundTrips: 20
- * });
+ * const ptcTool = createProgrammaticToolCallingTool({ maxRoundTrips: 20 });
  *
  * const [output, artifact] = await ptcTool.invoke(
  *   { code, tools },
@@ -611,21 +865,9 @@ export function formatCompletedResponse(
 export function createProgrammaticToolCallingTool(
   initParams: t.ProgrammaticToolCallingParams = {}
 ): DynamicStructuredTool {
-  const apiKey =
-    (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
-    initParams.apiKey ??
-    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-    '';
-
-  if (!apiKey) {
-    throw new Error(
-      'No API key provided for programmatic tool calling. ' +
-        'Set CODE_API_KEY environment variable or pass apiKey in initParams.'
-    );
-  }
-
   const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
   const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
+  const maxRunTimeoutMs = resolveCodeApiRunTimeoutMs(initParams.runTimeoutMs);
   const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.PTC_DEBUG === 'true';
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
@@ -633,15 +875,16 @@ export function createProgrammaticToolCallingTool(
   return tool(
     async (rawParams, config) => {
       const params = rawParams as { code: string; timeout?: number };
-      const { code, timeout = DEFAULT_TIMEOUT } = params;
+      const { code } = params;
+      const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
-      // Extra params injected by ToolNode (follows web_search pattern)
-      const { toolMap, toolDefs, session_id, _injected_files } =
-        (config.toolCall ?? {}) as ToolCall &
-          Partial<t.ProgrammaticCache> & {
-            session_id?: string;
-            _injected_files?: t.CodeEnvFile[];
-          };
+      // Extra params injected by ToolNode (follows web_search pattern).
+      const toolCall = (config.toolCall ?? {}) as ToolCall &
+        Partial<t.ProgrammaticCache> & {
+          session_id?: string;
+          _injected_files?: t.CodeEnvFile[];
+        };
+      const { toolMap, toolDefs, session_id, _injected_files } = toolCall;
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -675,20 +918,23 @@ export function createProgrammaticToolCallingTool(
         }
 
         /**
-         * File injection priority:
-         * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-         * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
+         * File injection: `_injected_files` from ToolNode session
+         * context. The legacy `/files/<session_id>` HTTP fallback was
+         * removed (see `CodeExecutor.ts`) — codeapi's sessionAuth now
+         * requires kind/id query params unavailable at this point.
          */
         let files: t.CodeEnvFile[] | undefined;
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          files = await fetchSessionFiles(baseUrl, apiKey, session_id, proxy);
+          // eslint-disable-next-line no-console
+          console.debug(
+            `[ProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          );
         }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,
-          apiKey,
           {
             code,
             tools: effectiveTools,
@@ -696,7 +942,8 @@ export function createProgrammaticToolCallingTool(
             timeout,
             ...(files && files.length > 0 ? { files } : {}),
           },
-          proxy
+          proxy,
+          initParams.authHeaders
         );
 
         // ====================================================================
@@ -728,12 +975,12 @@ export function createProgrammaticToolCallingTool(
 
           response = await makeRequest(
             EXEC_ENDPOINT,
-            apiKey,
             {
               continuation_token: response.continuation_token,
               tool_results: toolResults,
             },
-            proxy
+            proxy,
+            initParams.authHeaders
           );
         }
 
@@ -742,7 +989,7 @@ export function createProgrammaticToolCallingTool(
         // ====================================================================
 
         if (response.status === 'completed') {
-          return formatCompletedResponse(response);
+          return formatCompletedResponse(response, code);
         }
 
         if (response.status === 'error') {
@@ -756,15 +1003,19 @@ export function createProgrammaticToolCallingTool(
 
         throw new Error(`Unexpected response status: ${response.status}`);
       } catch (error) {
+        const messageWithReminder = appendFailedExecutionFileReminder(
+          (error as Error).message,
+          code
+        );
         throw new Error(
-          `Programmatic execution failed: ${(error as Error).message}`
+          `Programmatic execution failed: ${messageWithReminder}`
         );
       }
     },
     {
       name: Constants.PROGRAMMATIC_TOOL_CALLING,
       description: ProgrammaticToolCallingDescription,
-      schema: ProgrammaticToolCallingSchema,
+      schema: createProgrammaticToolCallingSchema(maxRunTimeoutMs),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );

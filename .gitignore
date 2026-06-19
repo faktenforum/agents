@@ -13,3 +13,5 @@ google_auth.json
 credentials/**/*
 coverage/**/*
 .cursor/
+.claude/
+.codex/

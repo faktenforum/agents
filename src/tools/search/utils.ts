@@ -1,6 +1,22 @@
 /* eslint-disable no-console */
 
+import { isAxiosError } from 'axios';
+
+import type { AxiosError } from 'axios';
 import type * as t from './types';
+
+const LOG_VALUE_MAX_LENGTH = 2048;
+
+export interface SafeErrorLog {
+  message: string;
+  name?: string;
+  code?: string;
+  status?: number;
+  method?: string;
+  url?: string;
+  responseDataSummary?: string;
+  value?: string;
+}
 
 /**
  * Singleton instance of the default logger
@@ -24,18 +40,99 @@ export const createDefaultLogger = (): t.Logger => {
   return defaultLoggerInstance;
 };
 
+const truncateLogValue = (value: string): string =>
+  value.length <= LOG_VALUE_MAX_LENGTH
+    ? value
+    : `${value.slice(0, LOG_VALUE_MAX_LENGTH)}... [truncated]`;
+
+const summarizeLogValue = (value: unknown): string => {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return `array(${value.length})`;
+  }
+  if (typeof value === 'string') {
+    return `string(${value.length})`;
+  }
+  if (typeof value === 'object') {
+    return `object(${Object.keys(value).length})`;
+  }
+  return typeof value;
+};
+
+const sanitizeUrlForLog = (url: string): string => {
+  try {
+    const parsed = new URL(url);
+    return truncateLogValue(`${parsed.origin}${parsed.pathname}`);
+  } catch {
+    return truncateLogValue(url.split('?')[0].split('#')[0]);
+  }
+};
+
+const formatAxiosErrorForLog = (
+  error: AxiosError<unknown, unknown>
+): SafeErrorLog => {
+  const log: SafeErrorLog = {
+    message: error.message,
+    name: error.name,
+  };
+  const { code, config, response, status } = error;
+  const responseStatus = response?.status ?? status;
+  const method = config?.method;
+  const url = config?.url;
+
+  if (typeof code === 'string' && code !== '') {
+    log.code = code;
+  }
+  if (responseStatus != null) {
+    log.status = responseStatus;
+  }
+  if (typeof method === 'string' && method !== '') {
+    log.method = method.toUpperCase();
+  }
+  if (typeof url === 'string' && url !== '') {
+    log.url = sanitizeUrlForLog(url);
+  }
+  if (typeof response?.data !== 'undefined') {
+    log.responseDataSummary = summarizeLogValue(response.data);
+  }
+
+  return log;
+};
+
+export const formatErrorForLog = (error: unknown): SafeErrorLog => {
+  if (isAxiosError<unknown, unknown>(error)) {
+    return formatAxiosErrorForLog(error);
+  }
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+    };
+  }
+  return {
+    message: String(error),
+    value: summarizeLogValue(error),
+  };
+};
+
 export const fileExtRegex =
   /\.(pdf|jpe?g|png|gif|svg|webp|bmp|ico|tiff?|avif|heic|doc[xm]?|xls[xm]?|ppt[xm]?|zip|rar|mp[34]|mov|avi|wav)(?:\?.*)?$/i;
 
 export const getDomainName = (
   link: string,
-  metadata?: t.ScrapeMetadata,
+  metadata?: t.ScrapeMetadata | t.GenericScrapeMetadata,
   logger?: t.Logger
 ): string | undefined => {
   try {
-    const url = metadata?.sourceURL ?? metadata?.url ?? (link || '');
+    const sourceUrl =
+      typeof metadata?.sourceURL === 'string' ? metadata.sourceURL : undefined;
+    const metadataUrl =
+      typeof metadata?.url === 'string' ? metadata.url : undefined;
+    const url = sourceUrl ?? metadataUrl ?? link;
     const domain = new URL(url).hostname.replace(/^www\./, '');
-    if (domain) {
+    if (domain !== '') {
       return domain;
     }
   } catch (e) {
@@ -52,7 +149,7 @@ export const getDomainName = (
 
 export function getAttribution(
   link: string,
-  metadata?: t.ScrapeMetadata,
+  metadata?: t.ScrapeMetadata | t.GenericScrapeMetadata,
   logger?: t.Logger
 ): string | undefined {
   if (!metadata) return getDomainName(link, metadata, logger);
@@ -60,16 +157,17 @@ export function getAttribution(
   const twitterSite = metadata['twitter:site'];
   const twitterSiteFormatted =
     typeof twitterSite === 'string' ? twitterSite.replace(/^@/, '') : undefined;
+  const title = metadata.title;
 
   const possibleAttributions = [
     metadata.ogSiteName,
     metadata['og:site_name'],
-    metadata.title?.split('|').pop()?.trim(),
+    typeof title === 'string' ? title.split('|').pop()?.trim() : undefined,
     twitterSiteFormatted,
   ];
 
   const attribution = possibleAttributions.find(
-    (attr) => attr != null && typeof attr === 'string' && attr.trim() !== ''
+    (attr): attr is string => typeof attr === 'string' && attr.trim() !== ''
   );
   if (attribution != null) {
     return attribution;

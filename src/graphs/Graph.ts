@@ -1,5 +1,6 @@
 /* eslint-disable no-console */
 import { nanoid } from 'nanoid';
+import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
@@ -10,6 +11,7 @@ import type {
   MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
   formatAnthropicArtifactContent,
@@ -17,13 +19,38 @@ import {
   convertMessagesToContent,
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
-  addBedrockCacheControl,
+  addBedrockTailCacheControl,
   formatArtifactPayload,
+  enforceOriginalContentCap,
   formatContentStrings,
+  isLegacyConvertible,
   createPruneMessages,
-  addCacheControl,
+  syncBudgetDerivedFields,
+  addTailCacheControl,
   getMessageId,
+  makeIsDeferred,
+  partitionAndMarkAnthropicToolCache,
 } from '@/messages';
+import {
+  resolveLangfuseConfig,
+  shouldTraceToolNodeForLangfuse,
+  withLangfuseToolOutputTracingConfig,
+} from '@/langfuseToolOutputTracing';
+import {
+  createLangfuseHandler,
+  createLangfuseTraceMetadata,
+  disposeLangfuseHandler,
+  isLangfuseCallbackHandler,
+} from '@/langfuse';
+import {
+  resetIfNotEmpty,
+  isAnthropicLike,
+  isOpenAILike,
+  isGoogleLike,
+  apportionTokenCounts,
+  joinKeys,
+  sleep,
+} from '@/utils';
 import {
   GraphNodeKeys,
   ContentTypes,
@@ -32,17 +59,23 @@ import {
   StepTypes,
 } from '@/common';
 import {
-  resetIfNotEmpty,
-  isAnthropicLike,
-  isOpenAILike,
-  isGoogleLike,
-  joinKeys,
-  sleep,
-} from '@/utils';
+  appendCallbacks,
+  findCallback,
+  type CallbackEntry,
+} from '@/utils/callbacks';
+import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
+import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
+import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { buildSubagentToolParams } from '@/tools/SubagentTool';
+import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
+import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
@@ -58,6 +91,413 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
+
+/**
+ * Start index of the span post-prune formatters can mutate in place: the
+ * trailing tool batch plus its owning AI message (artifact formatting touches
+ * every tool result after the last AI tool call; Bedrock rewrites the AI
+ * message before a trailing tool result). Capped so the usage-snapshot
+ * recount stays constant-cost.
+ */
+function trailingMutationStart(messages: BaseMessage[]): number {
+  const MAX_SPAN = 16;
+  let index = messages.length - 1;
+  while (
+    index >= 0 &&
+    messages[index]?.getType() === 'tool' &&
+    messages.length - index < MAX_SPAN
+  ) {
+    index--;
+  }
+  return Math.max(0, Math.min(index, messages.length - 2));
+}
+
+type ReasoningKey = 'reasoning_content' | 'reasoning';
+type ReasoningSummary = { summary?: Array<{ text?: string }> };
+type ReasoningDetail = { type?: string; text?: string };
+
+function getHandlerDispatchedEventKey(
+  eventName: string,
+  stepId: string
+): string {
+  return `${eventName}:${stepId}`;
+}
+
+function getReasoningText(
+  value: string | Partial<ReasoningSummary> | null | undefined
+): string | undefined {
+  if (typeof value === 'string') {
+    return value !== '' ? value : undefined;
+  }
+  const summaryText = value?.summary
+    ?.map((summary) => summary.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return summaryText != null && summaryText !== '' ? summaryText : undefined;
+}
+
+function getReasoningDetailsText(
+  value: ReasoningDetail[] | null | undefined
+): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const reasoningText = value
+    .filter((detail) => detail.type === 'reasoning.text')
+    .map((detail) => detail.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return reasoningText !== '' ? reasoningText : undefined;
+}
+
+function getResponseReasoningContent({
+  responseMessage,
+  reasoningKey,
+}: {
+  responseMessage?: Partial<AIMessageChunk>;
+  reasoningKey: ReasoningKey;
+}): string | undefined {
+  const additionalKwargs = responseMessage?.additional_kwargs;
+  if (additionalKwargs == null) {
+    return undefined;
+  }
+
+  const keyedReasoning = getReasoningText(
+    additionalKwargs[reasoningKey] as
+      | string
+      | Partial<ReasoningSummary>
+      | null
+      | undefined
+  );
+  if (keyedReasoning != null) {
+    return keyedReasoning;
+  }
+
+  const reasoningContent = getReasoningText(
+    additionalKwargs.reasoning_content as
+      | string
+      | Partial<ReasoningSummary>
+      | null
+      | undefined
+  );
+  if (reasoningContent != null) {
+    return reasoningContent;
+  }
+
+  const reasoning = getReasoningText(
+    additionalKwargs.reasoning as
+      | string
+      | Partial<ReasoningSummary>
+      | null
+      | undefined
+  );
+  if (reasoning != null) {
+    return reasoning;
+  }
+
+  return getReasoningDetailsText(
+    additionalKwargs.reasoning_details as ReasoningDetail[] | null | undefined
+  );
+}
+
+function isTextMessageContentPart(
+  contentPart: MessageContent[number] | t.MessageContentComplex
+): boolean {
+  return (
+    typeof contentPart === 'object' &&
+    'type' in contentPart &&
+    typeof contentPart.type === 'string' &&
+    contentPart.type.startsWith('text')
+  );
+}
+
+function isGoogleServerSideToolMessageContentPart(
+  contentPart: MessageContent[number] | t.MessageContentComplex
+): boolean {
+  return (
+    typeof contentPart === 'object' &&
+    'type' in contentPart &&
+    (contentPart.type === 'toolCall' || contentPart.type === 'toolResponse')
+  );
+}
+
+function hasGoogleServerSideToolDeltaContent(
+  provider: Providers | undefined,
+  content: t.MessageDelta['content']
+): content is t.MessageContentComplex[] {
+  return (
+    isGoogleLike(provider) &&
+    Array.isArray(content) &&
+    content.some((contentPart) =>
+      isGoogleServerSideToolMessageContentPart(contentPart)
+    )
+  );
+}
+
+function getMessageDeltaContent(
+  provider: Providers | undefined,
+  content: MessageContent | undefined
+): t.MessageDelta['content'] | undefined {
+  if (content == null) {
+    return undefined;
+  }
+  if (typeof content === 'string') {
+    return content !== ''
+      ? [{ type: ContentTypes.TEXT, text: content }]
+      : undefined;
+  }
+  if (content.length === 0) {
+    return undefined;
+  }
+
+  const hasGoogleServerSideToolPart =
+    isGoogleLike(provider) &&
+    content.some((contentPart) =>
+      isGoogleServerSideToolMessageContentPart(contentPart)
+    );
+  if (content.every((contentPart) => isTextMessageContentPart(contentPart))) {
+    return content as t.MessageDelta['content'];
+  }
+  if (!hasGoogleServerSideToolPart) {
+    return undefined;
+  }
+  const messageContent = content.filter(
+    (contentPart) =>
+      isTextMessageContentPart(contentPart) ||
+      isGoogleServerSideToolMessageContentPart(contentPart)
+  );
+  return messageContent.length > 0
+    ? (messageContent as t.MessageDelta['content'])
+    : undefined;
+}
+
+function hasTextDeltaContent(
+  content: t.MessageDelta['content'] | undefined
+): boolean {
+  if (content == null) {
+    return false;
+  }
+  return content.some((contentPart) => {
+    if (contentPart.type?.startsWith(ContentTypes.TEXT) !== true) {
+      return false;
+    }
+    const text = (contentPart as Partial<{ text: string }>).text;
+    return typeof text === 'string' && text !== '';
+  });
+}
+
+function hasReasoningDeltaContent(
+  content: t.ReasoningDelta['content'] | undefined
+): boolean {
+  if (content == null) {
+    return false;
+  }
+  return content.some(
+    (contentPart) =>
+      contentPart.type === ContentTypes.THINK && contentPart.think !== ''
+  );
+}
+
+function getCurrentStepIds({
+  graph,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
+}): string[] {
+  const baseStepKey = graph.getStepBaseKey(metadata);
+  const currentStepIds: string[] = [];
+  for (const [stepKey, stepIds] of graph.stepKeyIds) {
+    if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
+      continue;
+    }
+    currentStepIds.push(...stepIds);
+  }
+  return currentStepIds;
+}
+
+function hasCurrentTextDeltaStep({
+  graph,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
+}): boolean {
+  return getCurrentStepIds({ graph, metadata }).some((stepId) =>
+    graph.messageStepHasTextDeltas.has(stepId)
+  );
+}
+
+function hasCurrentReasoningDeltaStep({
+  graph,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
+}): boolean {
+  return getCurrentStepIds({ graph, metadata }).some((stepId) =>
+    graph.reasoningStepHasDeltas.has(stepId)
+  );
+}
+
+function clearCurrentDeltaStepMarkers({
+  graph,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
+}): void {
+  for (const stepId of getCurrentStepIds({ graph, metadata })) {
+    graph.messageStepHasTextDeltas.delete(stepId);
+    graph.reasoningStepHasDeltas.delete(stepId);
+  }
+}
+
+async function dispatchMessageCreationStep({
+  graph,
+  stepKey,
+  messageId,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  stepKey: string;
+  messageId: string;
+  metadata: Record<string, unknown>;
+}): Promise<string> {
+  await graph.dispatchRunStep(
+    stepKey,
+    {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: { message_id: messageId },
+    },
+    metadata
+  );
+  return graph.getStepIdByKey(stepKey);
+}
+
+async function dispatchTextMessageContent({
+  graph,
+  stepKey,
+  provider,
+  content,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  stepKey: string;
+  provider?: Providers;
+  content: t.MessageDelta['content'];
+  metadata: Record<string, unknown>;
+}): Promise<boolean> {
+  const messageId = getMessageId(stepKey, graph) ?? '';
+  if (!messageId) {
+    return false;
+  }
+  if (hasGoogleServerSideToolDeltaContent(provider, content)) {
+    for (const contentPart of content) {
+      const stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        messageId,
+        metadata,
+      });
+      await graph.dispatchMessageDelta(
+        stepId,
+        { content: [contentPart] },
+        metadata
+      );
+    }
+    return true;
+  }
+  const stepId = await dispatchMessageCreationStep({
+    graph,
+    stepKey,
+    messageId,
+    metadata,
+  });
+  await graph.dispatchMessageDelta(stepId, { content }, metadata);
+  return true;
+}
+
+async function dispatchReasoningContent({
+  graph,
+  agentContext,
+  reasoningContent,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  agentContext: AgentContext;
+  reasoningContent: string;
+  metadata: Record<string, unknown>;
+}): Promise<boolean> {
+  const previousTokenType = agentContext.currentTokenType;
+  const previousTokenTypeSwitch = agentContext.tokenTypeSwitch;
+  const previousTransitionCount = agentContext.reasoningTransitionCount;
+
+  agentContext.currentTokenType = ContentTypes.THINK;
+  agentContext.tokenTypeSwitch = 'reasoning';
+
+  const stepKey = graph.getStepKey(metadata);
+  const messageId = getMessageId(stepKey, graph) ?? '';
+  if (!messageId) {
+    agentContext.currentTokenType = previousTokenType;
+    agentContext.tokenTypeSwitch = previousTokenTypeSwitch;
+    agentContext.reasoningTransitionCount = previousTransitionCount;
+    return false;
+  }
+
+  await graph.dispatchRunStep(
+    stepKey,
+    {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: { message_id: messageId },
+    },
+    metadata
+  );
+  const stepId = graph.getStepIdByKey(stepKey);
+  await graph.dispatchReasoningDelta(
+    stepId,
+    {
+      content: [{ type: ContentTypes.THINK, think: reasoningContent }],
+    },
+    metadata
+  );
+  return true;
+}
+
+function markPostReasoningContent(agentContext: AgentContext): void {
+  if (
+    agentContext.tokenTypeSwitch !== 'reasoning' ||
+    agentContext.currentTokenType === ContentTypes.TEXT
+  ) {
+    return;
+  }
+  agentContext.currentTokenType = ContentTypes.TEXT;
+  agentContext.tokenTypeSwitch = 'content';
+  agentContext.reasoningTransitionCount++;
+}
+
+function getDispatchableFinalReasoningContent({
+  agentContext,
+  responseReasoningContent,
+  hasStreamedTextDeltaStep,
+  hasStreamedReasoningDeltaStep,
+}: {
+  agentContext: AgentContext;
+  responseReasoningContent: string | undefined;
+  hasStreamedTextDeltaStep: boolean;
+  hasStreamedReasoningDeltaStep: boolean;
+}): string | undefined {
+  if (responseReasoningContent == null || hasStreamedReasoningDeltaStep) {
+    return undefined;
+  }
+  if (
+    agentContext.provider === Providers.OPENROUTER &&
+    hasStreamedTextDeltaStep
+  ) {
+    return undefined;
+  }
+  return responseReasoningContent;
+}
 
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
@@ -77,6 +517,9 @@ export abstract class Graph<
   abstract getKeyList(
     metadata: Record<string, unknown> | undefined
   ): (string | number | undefined)[];
+  abstract getStepBaseKey(
+    metadata: Record<string, unknown> | undefined
+  ): string;
   abstract getStepKey(metadata: Record<string, unknown> | undefined): string;
   abstract checkKeyList(keyList: (string | number | undefined)[]): boolean;
   abstract getStepIdByKey(stepKey: string, index?: number): string;
@@ -88,15 +531,18 @@ export abstract class Graph<
   ): Promise<string>;
   abstract dispatchRunStepDelta(
     id: string,
-    delta: t.ToolCallDelta
+    delta: t.ToolCallDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void>;
   abstract dispatchMessageDelta(
     id: string,
-    delta: t.MessageDelta
+    delta: t.MessageDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void>;
   abstract dispatchReasoningDelta(
     stepId: string,
-    delta: t.ReasoningDelta
+    delta: t.ReasoningDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void>;
   abstract createCallModel(
     agentId?: string,
@@ -105,6 +551,7 @@ export abstract class Graph<
     state: t.AgentSubgraphState,
     config?: RunnableConfig
   ) => Promise<Partial<t.AgentSubgraphState>>;
+  messageStepHasTextDeltas: Set<string> = new Set();
   messageStepHasToolCalls: Map<string, boolean> = new Map();
   messageIdsByStepKey: Map<string, string> = new Map();
   prelimMessageIdsByStepKey: Map<string, string> = new Map();
@@ -114,15 +561,67 @@ export abstract class Graph<
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
   /**
-   * Step IDs that have been dispatched via handler registry directly
-   * (in dispatchRunStep).  Used by the custom event callback to skip
-   * duplicate dispatch through the LangGraph callback chain.
+   * Step IDs dispatched through the handler registry during this run.
+   * Event echo suppression is tracked separately so repeated deltas for
+   * the same step are scoped to the active custom event dispatch.
    */
   handlerDispatchedStepIds: Set<string> = new Set();
+  reasoningStepHasDeltas: Set<string> = new Set();
+  protected handlerDispatchedEventCounts: Map<string, number> = new Map();
   signal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
+  /**
+   * True when event-driven tool execution can be routed through callbacks even
+   * though this graph intentionally does not own the full handler registry.
+   * Self-spawned subagent graphs use this shape: their callback forwarder sends
+   * `ON_TOOL_EXECUTE` to the parent's handler, while child run-step events stay
+   * wrapped as `ON_SUBAGENT_UPDATE` instead of leaking as parent events.
+   */
+  eventToolExecutionAvailable: boolean = false;
+  hookRegistry: HookRegistry | undefined;
+  /**
+   * Run-scoped HITL configuration. When `humanInTheLoop?.enabled` is
+   * `true`, `ToolNode` raises a real `interrupt()` for `PreToolUse`
+   * `ask` decisions instead of treating them as a synchronous deny.
+   * Threaded from `RunConfig.humanInTheLoop`.
+   */
+  humanInTheLoop: t.HumanInTheLoopConfig | undefined;
+  /**
+   * Run-scoped config for the tool output reference registry. Threaded
+   * from `RunConfig.toolOutputReferences` down into every ToolNode this
+   * graph compiles.
+   */
+  toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
+  /**
+   * Run-scoped Langfuse defaults. Per-agent config wins when present.
+   */
+  langfuse: t.LangfuseConfig | undefined;
+  /**
+   * Run-scoped opt-in for eager event-driven tool execution. The stream
+   * handler may prestart eligible event-driven tools; ToolNode later
+   * consumes the settled promises while preserving final ToolMessage order.
+   */
+  eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
+  eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
+  eagerEventToolUsageCount: Map<string, number> = new Map();
+  private eagerEventToolUsageCountsByAgentId: Map<string, Map<string, number>> =
+    new Map();
+  eagerEventToolCallChunks: Map<string, t.EagerEventToolCallChunkState> =
+    new Map();
+  /**
+   * Run-scoped execution backend for built-in code tools. Defaults to the
+   * remote Code API sandbox when unset.
+   */
+  toolExecution: t.ToolExecutionConfig | undefined;
+  /**
+   * Shared registry instance used by every ToolNode compiled from this
+   * graph. Lazily constructed on first access so multi-agent graphs
+   * produce one registry per run (not one per agent), letting cross-
+   * agent `{{tool<i>turn<n>}}` substitutions resolve.
+   */
+  private _toolOutputRegistry?: ToolOutputReferenceRegistry;
   /**
    * Tool session contexts for automatic state persistence across tool invocations.
    * Keyed by tool name (e.g., Constants.EXECUTE_CODE).
@@ -143,11 +642,188 @@ export abstract class Graph<
     this.stepKeyIds = new Map();
     this.toolCallStepIds.clear();
     this.messageIdsByStepKey = new Map();
+    this.messageStepHasTextDeltas = new Set();
+    this.reasoningStepHasDeltas = new Set();
     this.messageStepHasToolCalls = new Map();
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
     this.handlerRegistry = undefined;
+    this.hookRegistry = undefined;
+    this.humanInTheLoop = undefined;
+    this.toolOutputReferences = undefined;
+    this.eagerEventToolExecution = undefined;
+    this.eagerEventToolExecutions.clear();
+    this.clearEagerEventToolUsageCounts();
+    this.eagerEventToolCallChunks.clear();
+    this.toolExecution = undefined;
+    this.handlerDispatchedEventCounts.clear();
+    /**
+     * ToolNodes compiled from this graph captured the registry
+     * instance at construction time, so simply dropping the Graph's
+     * own reference would leave their captured reference — and every
+     * stored `tool<i>turn<n>` entry, plus up to `maxTotalSize` of raw
+     * output — alive across subsequent `processStream()` calls. Wipe
+     * the registry's contents first so subsequent runs start fresh.
+     */
+    this._toolOutputRegistry?.clear();
+    this._toolOutputRegistry = undefined;
+    // NB: `_fileCheckpointer` is intentionally NOT cleared here.
+    // `Run.processStream()` calls `clearHeavyState()` in its
+    // finally block on natural-completion / error paths — exactly
+    // when the host is most likely to want `Run.rewindFiles()` (for
+    // rollback after a failed batch). Per-Run isolation is already
+    // automatic because each `Run.create()` constructs a brand-new
+    // Graph instance, so the next Run gets its own checkpointer
+    // without us needing to reset this field. Codex P1 #32: pre-fix
+    // the checkpointer was nulled before the caller could reach it.
+    // Flush each compiled ToolNode's direct-path turn cache so it
+    // doesn't leak across Runs (Codex P2 #33). The cache survives
+    // `run()` re-entry by design (resume-stable), but end-of-Run
+    // is the right point to reset it.
+    for (const node of this._compiledToolNodes) {
+      node.clearDirectPathTurns();
+    }
+    this._compiledToolNodes.clear();
     this.sessions.clear();
+  }
+
+  getEagerEventToolUsageCount(agentId?: string): Map<string, number> {
+    if (agentId == null || agentId === '') {
+      return this.eagerEventToolUsageCount;
+    }
+    let usageCount = this.eagerEventToolUsageCountsByAgentId.get(agentId);
+    if (usageCount == null) {
+      usageCount = new Map<string, number>();
+      this.eagerEventToolUsageCountsByAgentId.set(agentId, usageCount);
+    }
+    return usageCount;
+  }
+
+  protected clearEagerEventToolUsageCounts(): void {
+    this.eagerEventToolUsageCount.clear();
+    for (const usageCount of this.eagerEventToolUsageCountsByAgentId.values()) {
+      usageCount.clear();
+    }
+  }
+
+  markHandlerDispatchedEvent(eventName: string, stepId: string): () => void {
+    const key = getHandlerDispatchedEventKey(eventName, stepId);
+    this.handlerDispatchedEventCounts.set(
+      key,
+      (this.handlerDispatchedEventCounts.get(key) ?? 0) + 1
+    );
+    return () => {
+      const count = this.handlerDispatchedEventCounts.get(key) ?? 0;
+      if (count <= 1) {
+        this.handlerDispatchedEventCounts.delete(key);
+        return;
+      }
+      this.handlerDispatchedEventCounts.set(key, count - 1);
+    };
+  }
+
+  hasHandlerDispatchedEvent(eventName: string, stepId: string): boolean {
+    const key = getHandlerDispatchedEventKey(eventName, stepId);
+    return (this.handlerDispatchedEventCounts.get(key) ?? 0) > 0;
+  }
+
+  /**
+   * Subclass hook to register a freshly compiled ToolNode so
+   * `clearHeavyState` can flush its per-Run direct-path turn cache
+   * at end-of-Run. Internal — called from `initializeTools` in the
+   * concrete graph subclasses.
+   */
+  protected registerCompiledToolNode(node: {
+    clearDirectPathTurns(): void;
+  }): void {
+    this._compiledToolNodes.add(node);
+  }
+
+  /**
+   * Returns the shared `ToolOutputReferenceRegistry` for this run,
+   * constructing it on first access. Returns `undefined` when the
+   * feature is disabled. All ToolNodes compiled from this graph share
+   * this single instance so cross-agent `{{…}}` references resolve.
+   *
+   * @internal Public so `attemptInvoke` can read it through the typed
+   * `InvokeContext` and project ToolMessages into LLM-facing annotated
+   * copies right before each provider call (see
+   * `annotateMessagesForLLM`). Host code should not call this directly
+   * — registry mutations outside the ToolNode lifecycle break the
+   * partitioning, eviction, and turn-counter invariants.
+   */
+  public getOrCreateToolOutputRegistry():
+    | ToolOutputReferenceRegistry
+    | undefined {
+    if (this.toolOutputReferences?.enabled !== true) {
+      return undefined;
+    }
+    if (this._toolOutputRegistry == null) {
+      this._toolOutputRegistry = new ToolOutputReferenceRegistry({
+        maxOutputSize: this.toolOutputReferences.maxOutputSize,
+        maxTotalSize: this.toolOutputReferences.maxTotalSize,
+      });
+    }
+    return this._toolOutputRegistry;
+  }
+
+  /**
+   * Single per-Run file checkpointer shared across every ToolNode the
+   * graph compiles. Lazily constructed when
+   * `toolExecution.local.fileCheckpointing === true` or
+   * `toolExecution.cloudflare.fileCheckpointing === true` so
+   * multi-agent graphs see ONE snapshot store, not one-per-agent.
+   * Returns undefined when checkpointing is disabled or a supported
+   * coding-tool engine isn't selected. Exposed via
+   * `Run.getFileCheckpointer()` / `Run.rewindFiles()`.
+   */
+  private _fileCheckpointer?: t.LocalFileCheckpointer;
+  /**
+   * ToolNodes compiled into this Graph's workflow. Tracked so
+   * `clearHeavyState()` can flush their per-Run direct-path turn
+   * cache (`directPathTurns`) at end-of-Run — that map intentionally
+   * survives `run()` re-entry (resume-stable per Codex P2 #30) but
+   * would otherwise grow linearly with tool calls and could collide
+   * across Runs if a provider reuses call ids (Codex P2 #33).
+   */
+  private _compiledToolNodes: Set<{
+    clearDirectPathTurns(): void;
+  }> = new Set();
+  public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
+    // Return the cached instance unconditionally if one exists. The
+    // toolExecution check below decides whether to *create* a new
+    // one — `clearHeavyState` nulls `this.toolExecution` at end-of-
+    // Run, but we want post-Run `Run.rewindFiles()` to still resolve
+    // to the checkpointer that captured the writes. Codex P1 #32.
+    if (this._fileCheckpointer != null) {
+      return this._fileCheckpointer;
+    }
+    // Eagerly create via the bundle factory so the construction path
+    // matches the bundle-only callers (and future bundle-internal
+    // cleanup hooks fire). The bundle factory itself accepts a pre-
+    // supplied checkpointer when present, so re-injecting this one
+    // into every ToolNode is idempotent.
+    if (
+      this.toolExecution?.engine === 'local' &&
+      this.toolExecution.local?.fileCheckpointing === true
+    ) {
+      const bundle = createLocalCodingToolBundle(
+        this.toolExecution.local ?? {}
+      );
+      this._fileCheckpointer = bundle.checkpointer;
+      return this._fileCheckpointer;
+    }
+    if (
+      this.toolExecution?.engine === 'cloudflare-sandbox' &&
+      this.toolExecution.cloudflare?.fileCheckpointing === true
+    ) {
+      const bundle = createCloudflareCodingToolBundle(
+        this.toolExecution.cloudflare
+      );
+      this._fileCheckpointer = bundle.checkpointer;
+      return this._fileCheckpointer;
+    }
+    return undefined;
   }
 }
 
@@ -172,17 +848,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   agentContexts: Map<string, AgentContext> = new Map();
   /** Default agent ID to use */
   defaultAgentId: string;
+  /**
+   * Host sink for model usage emitted inside subagent child runs. Threaded
+   * into each `SubagentExecutor` this graph creates (and from there into
+   * child graphs, so nested subagents report too). See
+   * {@link t.StandardGraphInput.subagentUsageSink}.
+   */
+  subagentUsageSink?: t.SubagentUsageSink;
+
   constructor({
     runId,
     signal,
     agents,
+    langfuse,
     tokenCounter,
     indexTokenCountMap,
     calibrationRatio,
+    subagentUsageSink,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
     this.signal = signal;
+    this.langfuse = langfuse;
+    this.subagentUsageSink = subagentUsageSink;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -222,9 +910,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.eagerEventToolExecutions.clear();
+    this.clearEagerEventToolUsageCounts();
+    this.eagerEventToolCallChunks.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
+    );
+    this.handlerDispatchedEventCounts = resetIfNotEmpty(
+      this.handlerDispatchedEventCounts,
+      new Map()
     );
     this.messageIdsByStepKey = resetIfNotEmpty(
       this.messageIdsByStepKey,
@@ -233,6 +928,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.messageStepHasToolCalls = resetIfNotEmpty(
       this.messageStepHasToolCalls,
       new Map()
+    );
+    this.messageStepHasTextDeltas = resetIfNotEmpty(
+      this.messageStepHasTextDeltas,
+      new Set()
+    );
+    this.reasoningStepHasDeltas = resetIfNotEmpty(
+      this.reasoningStepHasDeltas,
+      new Set()
     );
     this.prelimMessageIdsByStepKey = resetIfNotEmpty(
       this.prelimMessageIdsByStepKey,
@@ -293,6 +996,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return agentContext;
   }
 
+  getStepBaseKey(metadata: Record<string, unknown> | undefined): string {
+    if (!metadata) return '';
+
+    const keyList = this.getInvocationKeyList(metadata);
+    if (this.checkKeyList(keyList)) {
+      throw new Error('Missing metadata');
+    }
+
+    return joinKeys(keyList);
+  }
+
   getStepKey(metadata: Record<string, unknown> | undefined): string {
     if (!metadata) return '';
 
@@ -339,14 +1053,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   ): (string | number | undefined)[] {
     if (!metadata) return [];
 
-    const keyList = [
-      metadata.run_id as string,
-      metadata.thread_id as string,
-      metadata.langgraph_node as string,
-      metadata.langgraph_step as number,
-      metadata.checkpoint_ns as string,
-    ];
-
+    const keyList = this.getInvocationKeyList(metadata);
     const agentContext = this.getAgentContext(metadata);
     if (
       agentContext.currentTokenType === ContentTypes.THINK ||
@@ -357,9 +1064,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
     }
 
+    return keyList;
+  }
+
+  private getInvocationKeyList(
+    metadata: Record<string, unknown>
+  ): (string | number | undefined)[] {
+    const keyList = this.getBaseKeyList(metadata);
     if (this.invokedToolIds != null && this.invokedToolIds.size > 0) {
       keyList.push(this.invokedToolIds.size + '');
     }
+    return keyList;
+  }
+
+  private getBaseKeyList(
+    metadata: Record<string, unknown>
+  ): (string | number | undefined)[] {
+    const configurable = this.config?.configurable;
+    const runId =
+      (metadata.run_id as string | undefined) ??
+      (configurable?.run_id as string | undefined) ??
+      this.runId;
+    const threadId =
+      (metadata.thread_id as string | undefined) ??
+      (configurable?.thread_id as string | undefined) ??
+      runId;
+    const checkpointNs =
+      (metadata.checkpoint_ns as string | undefined) ??
+      (metadata.langgraph_checkpoint_ns as string | undefined) ??
+      '';
+    const keyList = [
+      runId,
+      threadId,
+      metadata.langgraph_node as string,
+      metadata.langgraph_step as number,
+      checkpointNs,
+    ];
 
     return keyList;
   }
@@ -472,6 +1212,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const toolDefinitions = agentContext?.toolDefinitions;
     const eventDrivenMode =
       toolDefinitions != null && toolDefinitions.length > 0;
+    const traceToolNode = shouldTraceToolNodeForLangfuse({
+      runLangfuse: this.langfuse,
+      agentLangfuse: agentContext?.langfuse,
+    });
 
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
@@ -496,21 +1240,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      return new CustomToolNode<t.BaseGraphState>({
+      const node = new CustomToolNode<t.BaseGraphState>({
         tools: allTools,
         toolMap: allToolMap,
+        trace: traceToolNode,
+        runLangfuse: this.langfuse,
+        agentLangfuse: agentContext?.langfuse,
         eventDrivenMode: true,
         sessions: this.sessions,
         toolDefinitions: toolDefMap,
         agentId: agentContext?.agentId,
+        executingAgentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
+        hookRegistry: this.hookRegistry,
+        humanInTheLoop: this.humanInTheLoop,
+        eagerEventToolExecution: this.eagerEventToolExecution,
+        eagerEventToolExecutions: this.eagerEventToolExecutions,
+        eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
+          agentContext?.agentId
+        ),
+        toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
-        errorHandler: (data, metadata) =>
+        toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+        fileCheckpointer: this.getOrCreateFileCheckpointer(),
+        errorHandler: (data, metadata): Promise<void> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
+      this.registerCompiledToolNode(node);
+      return node;
     }
 
     const graphTools = agentContext?.graphTools as t.GenericTool[] | undefined;
@@ -529,17 +1289,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ])
         : currentToolMap;
 
-    return new CustomToolNode<t.BaseGraphState>({
+    const node = new CustomToolNode<t.BaseGraphState>({
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
+      trace: traceToolNode,
+      runLangfuse: this.langfuse,
+      agentLangfuse: agentContext?.langfuse,
+      // `agentId` is intentionally left unset on this path (it is the
+      // subagent-scope marker); `executingAgentId` always identifies the owning
+      // agent so hooks can attribute the batch even at the top level.
+      executingAgentId: agentContext?.agentId,
       toolCallStepIds: this.toolCallStepIds,
-      errorHandler: (data, metadata) =>
+      errorHandler: (data, metadata): Promise<void> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      toolExecution: this.toolExecution,
+      hookRegistry: this.hookRegistry,
+      humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
+      toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+      fileCheckpointer: this.getOrCreateFileCheckpointer(),
     });
+    this.registerCompiledToolNode(node);
+    return node;
   }
 
   overrideTestModel(
@@ -603,7 +1377,63 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const toolsForBinding = agentContext.getToolsForBinding();
+      const rawToolsForBinding = resolveLocalToolsForBinding({
+        tools: agentContext.getToolsForBinding(),
+        toolExecution: this.toolExecution,
+      });
+
+      /**
+       * Anthropic prompt-cache breakpoint on the tool definitions.
+       *
+       * Without this, the (often static) tool inventory shows up as
+       * fresh input on every turn — measured at ~28k tokens/turn for
+       * the local engine's coding-tool bundle, dominating per-turn
+       * cost even when message-level caching is on.
+       *
+       * Strategy: partition tools into [static, deferred] and stamp
+       * `cache_control: ephemeral` on the last static tool.
+       * Discovered deferred tools that arrive across turns sit *after*
+       * the breakpoint and don't invalidate the prefix.
+       */
+      let toolsForBinding = rawToolsForBinding;
+      if (
+        agentContext.provider === Providers.ANTHROPIC &&
+        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
+          ?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkAnthropicToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
+      } else if (
+        agentContext.provider === Providers.OPENROUTER &&
+        (
+          agentContext.clientOptions as
+            | t.ProviderOptionsMap[Providers.OPENROUTER]
+            | undefined
+        )?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkOpenRouterToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
+      } else if (
+        agentContext.provider === Providers.BEDROCK &&
+        (
+          agentContext.clientOptions as
+            | t.BedrockAnthropicClientOptions
+            | undefined
+        )?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkBedrockToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
+      }
+
       const clientOptionsWithVision = {
         ...agentContext.clientOptions,
         vision: agentContext.vision,
@@ -629,7 +1459,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
 
       let messagesToUse = messages;
-
+      let contextUsage: t.ContextUsageEvent | null = null;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -669,6 +1499,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           originalToolContent,
           calibrationRatio,
           resolvedInstructionOverhead,
+          contextBudget,
+          effectiveInstructionTokens,
         } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
@@ -696,9 +1528,41 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               : 1;
           if (variance > CALIBRATION_VARIANCE_THRESHOLD) {
             agentContext.toolSchemaTokens = calibratedToolTokens;
+            /** Largest-remainder apportionment keeps the per-tool breakdown
+             *  summing exactly to the calibrated aggregate */
+            if (agentContext.toolTokenCounts != null && currentToolTokens > 0) {
+              agentContext.toolTokenCounts = apportionTokenCounts(
+                agentContext.toolTokenCounts,
+                calibratedToolTokens / currentToolTokens,
+                calibratedToolTokens
+              );
+            }
           }
         }
         messagesToUse = context;
+
+        /** Dispatched right before the model invoke — a summarization
+         *  detour returns from this node without an LLM call, and the
+         *  post-summary retry produces its own snapshot.
+         *
+         *  The breakdown describes the post-prune prompt: counts from the
+         *  kept context, message tokens derived from the same calibrated
+         *  budget math as `remainingContextTokens` (the index map is keyed
+         *  by pre-prune state indices, so summing it over `context` would
+         *  missum); `prePruneContextTokens` carries the pre-prune metric. */
+        const usageBreakdown = agentContext.getTokenBudgetBreakdown(messages);
+        usageBreakdown.messageCount = context.length;
+        contextUsage = {
+          runId: this.runId,
+          agentId,
+          breakdown: usageBreakdown,
+          contextBudget,
+          effectiveInstructionTokens,
+          prePruneContextTokens,
+          remainingContextTokens,
+          calibrationRatio: agentContext.calibrationRatio,
+        };
+        syncBudgetDerivedFields(contextUsage);
 
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
@@ -724,7 +1588,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
           if (triggerResult) {
             if (originalToolContent != null && originalToolContent.size > 0) {
-              agentContext.pendingOriginalToolContent = originalToolContent;
+              /**
+               * Merge — never overwrite — the pruner's masking record
+               * into pendingOriginalToolContent.  Carry-over entries
+               * from a prior summarize (preserved by the recency
+               * window for masked tool messages still in the tail) and
+               * the current pruner's new entries are both keyed by
+               * indices in the current `state.messages`, so a key-wise
+               * union is correct.  Overwriting would discard the
+               * carry-over and reduce summary fidelity when those
+               * masked tail messages eventually move into the head.
+               */
+              if (agentContext.pendingOriginalToolContent == null) {
+                agentContext.pendingOriginalToolContent = originalToolContent;
+              } else {
+                for (const [idx, content] of originalToolContent) {
+                  agentContext.pendingOriginalToolContent.set(idx, content);
+                }
+                /**
+                 * Re-apply the per-store char cap after the union.  The
+                 * pruner enforces ORIGINAL_CONTENT_MAX_CHARS inside its
+                 * own map via the onContentStored callback, but a
+                 * key-wise merge with recency carry-over bypasses that
+                 * accounting and could let the merged map grow without
+                 * bound across long sessions.
+                 */
+                enforceOriginalContentCap(
+                  agentContext.pendingOriginalToolContent
+                );
+              }
             }
 
             emitAgentLog(
@@ -777,6 +1669,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       let finalMessages = messagesToUse;
+      /** Tail snapshot for the dispatch-time usage delta: in-place
+       *  formatters (artifact appends, Bedrock content rewrites, legacy
+       *  string conversion) mutate without changing length or identity —
+       *  capture before they run. Legacy string conversion can also touch
+       *  messages before the tail, so those convertible indices are
+       *  tracked separately (none exist in the common case). */
+      const tailStart = trailingMutationStart(messagesToUse);
+      let preFormatTailTokens: number | null = null;
+      let legacyIndices: number[] | null = null;
+      let preFormatLegacyTokens = 0;
+      if (contextUsage != null && agentContext.tokenCounter != null) {
+        preFormatTailTokens = 0;
+        for (const message of messagesToUse.slice(tailStart)) {
+          preFormatTailTokens += agentContext.tokenCounter(message);
+        }
+        if (agentContext.useLegacyContent) {
+          legacyIndices = [];
+          for (let i = 0; i < tailStart; i++) {
+            if (isLegacyConvertible(messagesToUse[i])) {
+              legacyIndices.push(i);
+              preFormatLegacyTokens += agentContext.tokenCounter(
+                messagesToUse[i]
+              );
+            }
+          }
+        }
+      }
       if (agentContext.useLegacyContent) {
         finalMessages = formatContentStrings(finalMessages);
       }
@@ -818,42 +1737,74 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      if (agentContext.provider === Providers.ANTHROPIC) {
-        const anthropicOptions = agentContext.clientOptions as
-          | t.AnthropicClientOptions
-          | undefined;
-        if (
-          anthropicOptions?.promptCache === true &&
-          !agentContext.systemRunnable
-        ) {
-          finalMessages = addCacheControl<BaseMessage>(finalMessages);
-        }
-      } else if (agentContext.provider === Providers.BEDROCK) {
-        const bedrockOptions = agentContext.clientOptions as
-          | t.BedrockAnthropicClientOptions
-          | undefined;
-        if (bedrockOptions?.promptCache === true) {
-          finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
-        }
-      }
-
       if (
         isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
       ) {
+        /**
+         * Pass `this.startIndex` so the function can distinguish CURRENT-run
+         * AI messages (the agent's own iterations — possibly without a
+         * leading thinking block, which Claude is allowed to skip) from
+         * historical context that genuinely needs the
+         * `[Previous agent context]` placeholder. Without this signal the
+         * function would convert the agent's own in-run tool_use messages,
+         * polluting the next iteration's prompt with a placeholder the
+         * model treats as suspicious injected content.
+         */
         finalMessages = ensureThinkingBlockInMessages(
           finalMessages,
           agentContext.provider,
-          config
+          config,
+          this.startIndex
         );
       }
 
-      // Intentionally broad: runs when the pruner wasn't used OR any post-pruning
-      // transform (addCacheControl, ensureThinkingBlock, etc.) reassigned finalMessages.
-      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans exist,
-      // so the cost is negligible and this acts as a safety net for Anthropic/Bedrock.
+      // Determine the prompt-cache strategy up front. Two distinct facts:
+      //
+      //   `providerPromptCacheEnabled` — prompt caching is on for this provider
+      //   at all. This drives orphan cleanup, because EVERY cached send must be
+      //   sanitized — including the system-runnable path, where AgentContext (not
+      //   this node) adds the body marker.
+      //
+      //   `willAddTailCache` — THIS node will add the marker itself. Anthropic /
+      //   OpenRouter defer to the system runnable when one owns the system-prompt
+      //   breakpoint, so they exclude that case; Bedrock always marks here.
+      const anthropicPromptCacheEnabled =
+        agentContext.provider === Providers.ANTHROPIC &&
+        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
+          ?.promptCache === true;
+      const openRouterPromptCacheEnabled =
+        agentContext.provider === Providers.OPENROUTER &&
+        (
+          agentContext.clientOptions as
+            | t.ProviderOptionsMap[Providers.OPENROUTER]
+            | undefined
+        )?.promptCache === true;
+      const bedrockPromptCacheEnabled =
+        agentContext.provider === Providers.BEDROCK &&
+        (
+          agentContext.clientOptions as
+            | t.BedrockAnthropicClientOptions
+            | undefined
+        )?.promptCache === true;
+      const providerPromptCacheEnabled =
+        anthropicPromptCacheEnabled ||
+        openRouterPromptCacheEnabled ||
+        bedrockPromptCacheEnabled;
+
+      // Intentionally broad: runs when the pruner wasn't used, when any
+      // post-pruning transform (ensureThinkingBlock, etc.) reassigned
+      // finalMessages, OR when this is a prompt-cached send. The last clause
+      // matters because the marker is now applied AFTER this gate (and, for the
+      // system-runnable path, in AgentContext entirely): without it, a cached
+      // send whose pruner returned the context unchanged would skip cleanup and
+      // could ship orphaned AI/tool pairs from persisted history.
+      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans
+      // exist, so the cost is negligible.
       const needsOrphanSanitize =
         anthropicLike &&
-        (!agentContext.pruneMessages || finalMessages !== messagesToUse);
+        (!agentContext.pruneMessages ||
+          finalMessages !== messagesToUse ||
+          providerPromptCacheEnabled);
       if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;
         finalMessages = sanitizeOrphanToolBlocks(finalMessages);
@@ -871,6 +1822,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             { runId: this.runId, agentId }
           );
         }
+      }
+
+      // Place the single tail prompt-cache breakpoint LAST, after thinking
+      // normalization and orphan sanitization. ensureThinkingBlockInMessages can
+      // fold a trailing non-thinking AI→Tool chain into a `[Previous agent
+      // context]` HumanMessage whose builder copies text but not cache_control /
+      // cachePoint, and sanitizeOrphanToolBlocks can drop the anchored block — so
+      // marking earlier would let the only breakpoint vanish before the model
+      // call (zero message caching). Anchoring on the final message list keeps
+      // the marker on a block that actually ships. The system-runnable path
+      // adds its body marker in AgentContext, so this node skips it there.
+      if (
+        (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
+        !agentContext.systemRunnable
+      ) {
+        finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
+      } else if (bedrockPromptCacheEnabled) {
+        finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
       }
 
       if (
@@ -946,6 +1915,79 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      /** Past the empty-prompt guard — a model call is now guaranteed */
+      if (contextUsage != null) {
+        const usageRatio =
+          contextUsage.calibrationRatio != null &&
+          contextUsage.calibrationRatio > 0
+            ? contextUsage.calibrationRatio
+            : 1;
+        if (
+          agentContext.tokenCounter != null &&
+          finalMessages.length !== messagesToUse.length
+        ) {
+          /** Post-prune formatting restructured the payload (e.g. thinking
+           *  placeholder collapse, orphan drops) — recount so the gauge
+           *  reflects what is actually sent */
+          let rawTokens = 0;
+          for (const message of finalMessages) {
+            rawTokens += agentContext.tokenCounter(message);
+          }
+          contextUsage.breakdown.messageCount = finalMessages.length;
+          if (
+            contextUsage.contextBudget != null &&
+            contextUsage.effectiveInstructionTokens != null
+          ) {
+            contextUsage.remainingContextTokens = Math.max(
+              0,
+              contextUsage.contextBudget -
+                contextUsage.effectiveInstructionTokens -
+                Math.round(rawTokens * usageRatio)
+            );
+          }
+        } else if (
+          preFormatTailTokens != null &&
+          agentContext.tokenCounter != null &&
+          contextUsage.remainingContextTokens != null
+        ) {
+          /** Same-length formatting can still mutate in place — the trailing
+           *  tool batch (artifacts, Bedrock rewrites) and any legacy-converted
+           *  messages before it — adjust remaining by the calibrated delta */
+          let postFormatTailTokens = 0;
+          for (const message of finalMessages.slice(tailStart)) {
+            postFormatTailTokens += agentContext.tokenCounter(message);
+          }
+          let formatDelta = postFormatTailTokens - preFormatTailTokens;
+          if (legacyIndices != null && legacyIndices.length > 0) {
+            let postFormatLegacyTokens = 0;
+            for (const index of legacyIndices) {
+              postFormatLegacyTokens += agentContext.tokenCounter(
+                finalMessages[index]
+              );
+            }
+            formatDelta += postFormatLegacyTokens - preFormatLegacyTokens;
+          }
+          if (formatDelta !== 0) {
+            contextUsage.remainingContextTokens = Math.max(
+              0,
+              Math.min(
+                contextUsage.contextBudget ?? Number.MAX_SAFE_INTEGER,
+                contextUsage.remainingContextTokens -
+                  Math.round(formatDelta * usageRatio)
+              )
+            );
+          }
+        }
+        syncBudgetDerivedFields(contextUsage);
+        /** Awaited so async host handlers receive the pre-invoke snapshot
+         *  before any model deltas are emitted */
+        await safeDispatchCustomEvent(
+          GraphEvents.ON_CONTEXT_USAGE,
+          contextUsage,
+          config
+        );
+      }
+
       const invokeStart = Date.now();
       const invokeMeta = { runId: this.runId, agentId };
       emitAgentLog(
@@ -961,25 +2003,79 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         { force: true }
       );
 
+      const langfuse = resolveLangfuseConfig(
+        this.langfuse,
+        agentContext.langfuse
+      );
+      const traceMetadata = createLangfuseTraceMetadata({
+        messageId: this.runId,
+        parentMessageId: config.configurable?.requestBody?.parentMessageId,
+        agentId,
+        agentName: agentContext.name,
+      });
+      let langfuseHandler: CallbackEntry | undefined;
+      let invokeConfig = {
+        ...config,
+        metadata: {
+          ...(config.metadata ?? {}),
+          ...traceMetadata,
+        },
+      };
+      initializeLangfuseTracing(langfuse);
+      if (findCallback(config.callbacks, isLangfuseCallbackHandler) == null) {
+        langfuseHandler = createLangfuseHandler({
+          langfuse,
+          userId: config.configurable?.user_id as string | undefined,
+          sessionId: config.configurable?.thread_id as string | undefined,
+          traceMetadata,
+          tags: ['librechat', 'agent'],
+        });
+        if (langfuseHandler != null) {
+          invokeConfig = {
+            ...invokeConfig,
+            callbacks: appendCallbacks(invokeConfig.callbacks, [
+              langfuseHandler,
+            ]),
+          };
+        }
+      }
+      const metadata = config.metadata as Record<string, unknown>;
+
       try {
-        result = await attemptInvoke(
-          {
-            model: (this.overrideModel ?? model) as t.ChatModel,
-            messages: finalMessages,
-            provider: agentContext.provider,
-            context: this,
-          },
-          config
+        result = await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            attemptInvoke(
+              {
+                model: (this.overrideModel ?? model) as t.ChatModel,
+                messages: finalMessages,
+                provider: agentContext.provider,
+                context: this,
+              },
+              invokeConfig
+            ),
+          agentContext.langfuse
         );
       } catch (primaryError) {
-        result = await tryFallbackProviders({
-          fallbacks,
-          tools: agentContext.tools,
-          messages: finalMessages,
-          config,
-          primaryError,
-          context: this,
+        clearCurrentDeltaStepMarkers({
+          graph: this,
+          metadata,
         });
+        result = await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            tryFallbackProviders({
+              fallbacks,
+              tools: agentContext.tools,
+              messages: finalMessages,
+              config: invokeConfig,
+              primaryError,
+              context: this,
+            }),
+          agentContext.langfuse
+        );
+      } finally {
+        await disposeLangfuseHandler(langfuseHandler);
       }
 
       if (!result) {
@@ -1005,52 +2101,53 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const toolCalls = (responseMessage as AIMessageChunk | undefined)
         ?.tool_calls;
       const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+      const responseReasoningContent = getResponseReasoningContent({
+        responseMessage: responseMessage as Partial<AIMessageChunk> | undefined,
+        reasoningKey: agentContext.reasoningKey,
+      });
+      const textMessageContent = getMessageDeltaContent(
+        agentContext.provider,
+        responseMessage?.content as MessageContent | undefined
+      );
+      const hasStreamedTextDeltaStep = hasCurrentTextDeltaStep({
+        graph: this,
+        metadata,
+      });
+      const hasStreamedReasoningDeltaStep = hasCurrentReasoningDeltaStep({
+        graph: this,
+        metadata,
+      });
+      const dispatchableFinalReasoningContent =
+        getDispatchableFinalReasoningContent({
+          agentContext,
+          responseReasoningContent,
+          hasStreamedTextDeltaStep,
+          hasStreamedReasoningDeltaStep,
+        });
 
       if (hasToolCalls) {
-        const metadata = config.metadata as Record<string, unknown>;
-        const stepKey = this.getStepKey(metadata);
-        const content = responseMessage?.content as MessageContent | undefined;
-        const hasTextContent =
-          content != null &&
-          (typeof content === 'string'
-            ? content !== ''
-            : Array.isArray(content) && content.length > 0);
-
-        /**
-         * Dispatch text content BEFORE creating TOOL_CALLS steps.
-         * getMessageId returns a new ID only on the first call for a step key;
-         * if the for-await consumer already claimed it, this is a no-op.
-         */
-        if (hasTextContent) {
-          const messageId = getMessageId(stepKey, this) ?? '';
-          if (messageId) {
-            await this.dispatchRunStep(
-              stepKey,
-              {
-                type: StepTypes.MESSAGE_CREATION,
-                message_creation: { message_id: messageId },
-              },
-              metadata
-            );
-            const stepId = this.getStepIdByKey(stepKey);
-            if (typeof content === 'string') {
-              await this.dispatchMessageDelta(stepId, {
-                content: [{ type: ContentTypes.TEXT, text: content }],
-              });
-            } else if (
-              Array.isArray(content) &&
-              content.every(
-                (c) =>
-                  typeof c === 'object' &&
-                  'type' in c &&
-                  typeof c.type === 'string' &&
-                  c.type.startsWith('text')
-              )
-            ) {
-              await this.dispatchMessageDelta(stepId, {
-                content: content as t.MessageDelta['content'],
-              });
-            }
+        const dispatchedReasoning =
+          dispatchableFinalReasoningContent != null &&
+          (await dispatchReasoningContent({
+            graph: this,
+            agentContext,
+            reasoningContent: dispatchableFinalReasoningContent,
+            metadata,
+          }));
+        if (dispatchedReasoning) {
+          markPostReasoningContent(agentContext);
+        }
+        if (textMessageContent != null && !hasStreamedTextDeltaStep) {
+          const stepKey = this.getStepKey(metadata);
+          const dispatchedText = await dispatchTextMessageContent({
+            graph: this,
+            stepKey,
+            provider: agentContext.provider,
+            content: textMessageContent,
+            metadata,
+          });
+          if (dispatchedText) {
+            markPostReasoningContent(agentContext);
           }
         }
 
@@ -1058,52 +2155,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       /**
-       * When streaming is disabled, on_chat_model_stream events are never
-       * emitted so ChatModelStreamHandler never fires. Dispatch the text
-       * content as MESSAGE_CREATION + MESSAGE_DELTA here.
+       * When streaming events are unavailable, ChatModelStreamHandler never
+       * fires. Dispatch final reasoning/text content here. getMessageId makes
+       * this a no-op when the streaming path already handled the same step.
        */
-      const disableStreaming =
-        (agentContext.clientOptions as t.OpenAIClientOptions | undefined)
-          ?.disableStreaming === true;
-
-      if (
-        disableStreaming &&
-        !hasToolCalls &&
-        responseMessage != null &&
-        (responseMessage.content as MessageContent | undefined) != null
-      ) {
-        const metadata = config.metadata as Record<string, unknown>;
-        const stepKey = this.getStepKey(metadata);
-        const messageId = getMessageId(stepKey, this) ?? '';
-        if (messageId) {
-          await this.dispatchRunStep(
+      if (!hasToolCalls && responseMessage != null) {
+        const dispatchedReasoning =
+          dispatchableFinalReasoningContent != null &&
+          (await dispatchReasoningContent({
+            graph: this,
+            agentContext,
+            reasoningContent: dispatchableFinalReasoningContent,
+            metadata,
+          }));
+        if (dispatchedReasoning && textMessageContent != null) {
+          markPostReasoningContent(agentContext);
+        }
+        if (textMessageContent != null && !hasStreamedTextDeltaStep) {
+          const stepKey = this.getStepKey(metadata);
+          await dispatchTextMessageContent({
+            graph: this,
             stepKey,
-            {
-              type: StepTypes.MESSAGE_CREATION,
-              message_creation: { message_id: messageId },
-            },
-            metadata
-          );
-          const stepId = this.getStepIdByKey(stepKey);
-          const content = responseMessage.content;
-          if (typeof content === 'string') {
-            await this.dispatchMessageDelta(stepId, {
-              content: [{ type: ContentTypes.TEXT, text: content }],
-            });
-          } else if (
-            Array.isArray(content) &&
-            content.every(
-              (c) =>
-                typeof c === 'object' &&
-                'type' in c &&
-                typeof c.type === 'string' &&
-                c.type.startsWith('text')
-            )
-          ) {
-            await this.dispatchMessageDelta(stepId, {
-              content: content as t.MessageDelta['content'],
-            });
-          }
+            provider: agentContext.provider,
+            content: textMessageContent,
+            metadata,
+          });
         }
       }
 
@@ -1150,6 +2226,138 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const agentContext = this.agentContexts.get(agentId);
     if (!agentContext) {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
+    }
+
+    /**
+     * Depth countdown across graph boundaries: the parent's `maxSubagentDepth`
+     * becomes this executor's `maxDepth`. When the child graph is constructed,
+     * `buildChildInputs()` decrements `maxSubagentDepth` on the child's
+     * `AgentInputs` (only when `allowNested: true`; otherwise subagentConfigs
+     * are stripped entirely). The child graph's own `createAgentNode()` then
+     * reads the decremented value here and creates a narrower executor —
+     * recursion is bounded even though each graph has its own separate
+     * executor instance.
+     */
+    const effectiveSubagentDepth = agentContext.maxSubagentDepth ?? 1;
+    if (
+      agentContext.subagentConfigs != null &&
+      agentContext.subagentConfigs.length > 0 &&
+      effectiveSubagentDepth > 0
+    ) {
+      const resolvedConfigs = resolveSubagentConfigs(
+        agentContext.subagentConfigs,
+        agentContext
+      );
+      if (resolvedConfigs.length > 0) {
+        const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
+          this.handlerRegistry;
+        const executor = new SubagentExecutor({
+          configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
+          parentSignal: this.signal,
+          hookRegistry: this.hookRegistry,
+          /** Lazy — Run wires the registry onto the graph AFTER
+           *  `createWorkflow()` runs, so a direct capture here would be
+           *  `undefined` at construction time. */
+          parentHandlerRegistry: getParentHandlerRegistry,
+          parentRunId: this.runId ?? '',
+          parentAgentId: agentContext.agentId,
+          langfuse: this.langfuse,
+          tokenCounter: agentContext.tokenCounter,
+          usageSink: this.subagentUsageSink,
+          maxDepth: effectiveSubagentDepth,
+          createChildGraph: (input): StandardGraph => {
+            const childGraph = new StandardGraph(input);
+            childGraph.hookRegistry = this.hookRegistry;
+            /**
+             * Do not propagate `humanInTheLoop` into the child graph yet:
+             * nested subagent interrupts need a stable child checkpoint and
+             * resume bridge. Child hooks still fire; `ask` decisions fail
+             * closed inside the subagent until that flow is implemented.
+             */
+            childGraph.toolOutputReferences = this.toolOutputReferences;
+            childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
+            childGraph.toolExecution = this.toolExecution;
+            childGraph.eventToolExecutionAvailable =
+              this.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
+              null;
+            return childGraph;
+          },
+        });
+
+        const subagentTool = tool(async (rawInput, config) => {
+          const input = rawInput as {
+            description?: string;
+            subagent_type?: string;
+          };
+          const description =
+            typeof input.description === 'string' &&
+            input.description.trim().length > 0
+              ? input.description
+              : 'No task description provided';
+          const subagentType =
+            typeof input.subagent_type === 'string' ? input.subagent_type : '';
+          const threadId = config.configurable?.thread_id as string | undefined;
+          /**
+           * When the tool is dispatched from an LLM's `tool_call`, LangChain
+           * threads the originating `ToolCall` onto the RunnableConfig as
+           * `config.toolCall` (see `ToolRunnableConfig` in
+           * `@langchain/core/tools` — internal but stable since ≥0.3.x).
+           * Surfacing its id lets hosts correlate `SubagentUpdateEvent`s
+           * back to the parent's `tool_call_id` deterministically — no
+           * temporal heuristics needed. If a future LangChain version
+           * changes the threading, the type-guarded read falls back to
+           * `undefined` and the correlation degrades gracefully.
+           */
+          const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
+          const parentToolCallId =
+            typeof toolCall?.id === 'string' ? toolCall.id : undefined;
+          const result = await executor.execute({
+            description,
+            subagentType,
+            threadId,
+            parentToolCallId,
+            /**
+             * Forward the parent's `configurable` so host-set fields
+             * (`requestBody`, `user`, etc.) propagate into the child
+             * workflow. The executor scrubs run-identity fields before
+             * forwarding — see `SubagentExecuteParams.parentConfigurable`.
+             */
+            parentConfigurable: config.configurable as
+              | Record<string, unknown>
+              | undefined,
+          });
+          return result.content;
+        }, buildSubagentToolParams(resolvedConfigs));
+
+        if (!agentContext.graphTools) {
+          agentContext.graphTools = [];
+        }
+        (agentContext.graphTools as t.GenericTool[]).push(subagentTool);
+
+        /**
+         * Refresh toolSchemaTokens to include the subagent tool's schema.
+         * `calculateInstructionTokens()` was kicked off in `fromConfig()`
+         * before graphTools was populated, so its result did not count this
+         * tool. Without this retrigger, token-budget/pruning logic
+         * underestimates prompt overhead.
+         */
+        if (agentContext.tokenCounter) {
+          const { tokenCounter, baseIndexTokenCountMap } = agentContext;
+          agentContext.tokenCalculationPromise = agentContext
+            .calculateInstructionTokens(tokenCounter)
+            .then(() => {
+              agentContext.updateTokenMapWithInstructions(
+                baseIndexTokenCountMap
+              );
+            })
+            .catch((err) => {
+              console.error(
+                'Error recalculating instruction tokens after subagent tool injection:',
+                err
+              );
+            });
+        }
+      }
     }
 
     const agentNode = `${AGENT}${agentId}` as const;
@@ -1207,6 +2415,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             },
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
+            hookRegistry: this.hookRegistry,
             dispatchRunStep: async (runStep, nodeConfig) => {
               this.contentData.push(runStep);
               this.contentIndexMap.set(runStep.id, runStep.index);
@@ -1225,12 +2434,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 this.handlerDispatchedStepIds.add(runStep.id);
               }
 
-              if (resolvedConfig) {
-                await safeDispatchCustomEvent(
+              const unmarkHandlerDispatchedEvent = handler
+                ? this.markHandlerDispatchedEvent(
                   GraphEvents.ON_RUN_STEP,
-                  runStep,
-                  resolvedConfig
-                );
+                  runStep.id
+                )
+                : undefined;
+              try {
+                if (resolvedConfig) {
+                  await safeDispatchCustomEvent(
+                    GraphEvents.ON_RUN_STEP,
+                    runStep,
+                    resolvedConfig
+                  );
+                }
+              } finally {
+                unmarkHandlerDispatchedEvent?.();
               }
             },
             dispatchRunStepCompleted: async (
@@ -1275,7 +2494,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
-          if (!a.length) {
+          if (!this.messages.length) {
             this.startIndex = a.length + b.length;
           }
           const result = messagesStateReducer(a, b);
@@ -1286,7 +2505,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }),
     });
     const workflow = new StateGraph(StateAnnotation)
-      .addNode(this.defaultAgentId, agentNode, { ends: [END] })
+      .addNode(
+        this.defaultAgentId,
+        agentNode as Runnable<
+          t.AgentSubgraphState,
+          Partial<t.AgentSubgraphState>
+        >,
+        { ends: [END] }
+      )
       .addEdge(START, this.defaultAgentId)
       // LangGraph compile() types are overly strict for opt-in options
       .compile(this.compileOptions as unknown as never);
@@ -1387,11 +2613,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     // but the primary dispatch above guarantees the event reaches the handler.
     // The customEventCallback in run.ts skips events already dispatched above
     // to prevent double handling.
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_RUN_STEP,
-      runStep,
-      this.config
-    );
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_RUN_STEP, stepId)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_RUN_STEP,
+        runStep,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
     return stepId;
   }
 
@@ -1463,7 +2696,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   async dispatchRunStepDelta(
     id: string,
-    delta: t.ToolCallDelta
+    delta: t.ToolCallDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
@@ -1474,14 +2708,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id,
       delta,
     };
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_RUN_STEP_DELTA,
-      runStepDelta,
-      this.config
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_RUN_STEP_DELTA
     );
+    if (handler) {
+      await handler.handle(
+        GraphEvents.ON_RUN_STEP_DELTA,
+        runStepDelta,
+        metadata,
+        this
+      );
+      this.handlerDispatchedStepIds.add(id);
+    }
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_RUN_STEP_DELTA, id)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_RUN_STEP_DELTA,
+        runStepDelta,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
   }
 
-  async dispatchMessageDelta(id: string, delta: t.MessageDelta): Promise<void> {
+  async dispatchMessageDelta(
+    id: string,
+    delta: t.MessageDelta,
+    metadata?: Record<string, unknown>
+  ): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
     }
@@ -1489,16 +2746,39 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id,
       delta,
     };
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_MESSAGE_DELTA,
-      messageDelta,
-      this.config
+    if (hasTextDeltaContent(delta.content)) {
+      this.messageStepHasTextDeltas.add(id);
+    }
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_MESSAGE_DELTA
     );
+    if (handler) {
+      await handler.handle(
+        GraphEvents.ON_MESSAGE_DELTA,
+        messageDelta,
+        metadata,
+        this
+      );
+      this.handlerDispatchedStepIds.add(id);
+    }
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_MESSAGE_DELTA, id)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_MESSAGE_DELTA,
+        messageDelta,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
   }
 
   dispatchReasoningDelta = async (
     stepId: string,
-    delta: t.ReasoningDelta
+    delta: t.ReasoningDelta,
+    metadata?: Record<string, unknown>
   ): Promise<void> => {
     if (!this.config) {
       throw new Error('No config provided');
@@ -1507,10 +2787,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id: stepId,
       delta,
     };
-    await safeDispatchCustomEvent(
-      GraphEvents.ON_REASONING_DELTA,
-      reasoningDelta,
-      this.config
+    if (hasReasoningDeltaContent(delta.content)) {
+      this.reasoningStepHasDeltas.add(stepId);
+    }
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_REASONING_DELTA
     );
+    if (handler) {
+      await handler.handle(
+        GraphEvents.ON_REASONING_DELTA,
+        reasoningDelta,
+        metadata,
+        this
+      );
+      this.handlerDispatchedStepIds.add(stepId);
+    }
+    const unmarkHandlerDispatchedEvent = handler
+      ? this.markHandlerDispatchedEvent(GraphEvents.ON_REASONING_DELTA, stepId)
+      : undefined;
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_REASONING_DELTA,
+        reasoningDelta,
+        this.config
+      );
+    } finally {
+      unmarkHandlerDispatchedEvent?.();
+    }
   };
 }

@@ -6,12 +6,18 @@ import {
   SystemMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
-import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
+import type { AnthropicMessage } from '@/types/messages';
+import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
+import { withMessageRole } from './format';
 
 type MessageWithContent = {
   content?: string | MessageContentComplex[];
+};
+
+type MessageContentWithCacheControl = MessageContentComplex & {
+  cache_control?: unknown;
 };
 
 /**
@@ -35,13 +41,13 @@ function deepCloneContent<T extends string | MessageContentComplex[]>(
  * in downstream code (e.g., ensureThinkingBlockInMessages).
  * For plain objects (AnthropicMessage), uses object spread.
  */
-function cloneMessage<T extends MessageWithContent>(
+export function cloneMessage<T extends MessageWithContent>(
   message: T,
   content: string | MessageContentComplex[]
 ): T {
   if (message instanceof BaseMessage) {
     const baseParams = {
-      content,
+      content: toLangChainContent(content),
       additional_kwargs: { ...message.additional_kwargs },
       response_metadata: { ...message.response_metadata },
       id: message.id,
@@ -51,19 +57,31 @@ function cloneMessage<T extends MessageWithContent>(
     const msgType = message.getType();
     switch (msgType) {
     case 'ai':
-      return new AIMessage({
-        ...baseParams,
-        tool_calls: (message as unknown as AIMessage).tool_calls,
-      }) as unknown as T;
+      return withMessageRole(
+        new AIMessage({
+          ...baseParams,
+          tool_calls: (message as unknown as AIMessage).tool_calls,
+        }),
+        'assistant'
+      ) as unknown as T;
     case 'human':
-      return new HumanMessage(baseParams) as unknown as T;
+      return withMessageRole(
+        new HumanMessage(baseParams),
+        'user'
+      ) as unknown as T;
     case 'system':
-      return new SystemMessage(baseParams) as unknown as T;
+      return withMessageRole(
+        new SystemMessage(baseParams),
+        'system'
+      ) as unknown as T;
     case 'tool':
-      return new ToolMessage({
-        ...baseParams,
-        tool_call_id: (message as unknown as ToolMessage).tool_call_id,
-      }) as unknown as T;
+      return withMessageRole(
+        new ToolMessage({
+          ...baseParams,
+          tool_call_id: (message as unknown as ToolMessage).tool_call_id,
+        }),
+        'tool'
+      ) as unknown as T;
     default:
       break;
     }
@@ -101,6 +119,40 @@ function cloneMessage<T extends MessageWithContent>(
   return cloned;
 }
 
+function stripAnthropicCacheControlFromBlocks(
+  content: MessageContentComplex[]
+): { content: MessageContentComplex[]; modified: boolean } {
+  let modified = false;
+  const strippedContent = content.map((block) => {
+    if (!('cache_control' in block)) {
+      return block;
+    }
+
+    const cloned: MessageContentWithCacheControl = { ...block };
+    delete cloned.cache_control;
+    modified = true;
+    return cloned;
+  });
+
+  return { content: strippedContent, modified };
+}
+
+function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
+  message: T
+): T {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return message;
+  }
+
+  const stripped = stripAnthropicCacheControlFromBlocks(content);
+  if (!stripped.modified) {
+    return message;
+  }
+
+  return cloneMessage(message, stripped.content);
+}
+
 /**
  * Anthropic API: Adds cache control to the appropriate user messages in the payload.
  * Strips ALL existing cache control (both Anthropic and Bedrock formats) from all messages,
@@ -130,6 +182,7 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
     const needsCacheAdd =
       userMessagesModified < 2 &&
       isUserMessage &&
+      !isSyntheticMetaMessage(originalMessage) &&
       (typeof content === 'string' || hasArrayContent);
 
     // Skip messages that don't need any work
@@ -199,6 +252,317 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
  */
 function isCachePoint(block: MessageContentComplex): boolean {
   return 'cachePoint' in block && !('type' in block);
+}
+
+/**
+ * Block types that must never anchor the tail cache breakpoint, because the
+ * marker would not survive to the model call:
+ * - `thinking` / `redacted_thinking`: native Anthropic reasoning — the API
+ *   rejects `cache_control` on these blocks.
+ * - `reasoning_content` / `reasoning` / `think`: foreign reasoning (Bedrock,
+ *   Google, LibreChat) that `_convertMessagesToAnthropicPayload` DROPS on
+ *   assistant turns during a cross-provider handoff.
+ * - `input_json_delta`: persisted partial tool-input deltas, also DROPPED by
+ *   `_convertMessagesToAnthropicPayload` (the assembled input is restored onto
+ *   the tool_use block).
+ * Anchoring the only breakpoint on a block that is about to disappear silently
+ * loses tail caching, so all of these are excluded.
+ */
+const NON_ANCHORABLE_BLOCK_TYPES = new Set([
+  'thinking',
+  'redacted_thinking',
+  'reasoning_content',
+  'reasoning',
+  'think',
+  'input_json_delta',
+]);
+
+/**
+ * A block can anchor the tail cache breakpoint when it is a real content block
+ * that the Anthropic API accepts `cache_control` on and that survives provider
+ * conversion. Reasoning / dropped-delta blocks are excluded (see
+ * {@link NON_ANCHORABLE_BLOCK_TYPES}), and empty text blocks are not cacheable,
+ * so both are skipped.
+ */
+function isTailCacheableBlock(block: MessageContentComplex): boolean {
+  if (isCachePoint(block)) {
+    return false;
+  }
+  const type = (block as { type?: string }).type;
+  if (type == null || NON_ANCHORABLE_BLOCK_TYPES.has(type)) {
+    return false;
+  }
+  if (type === 'text') {
+    const text = (block as { text?: string }).text;
+    return text != null && text.trim() !== '';
+  }
+  return true;
+}
+
+/**
+ * Anthropic API: single tail cache breakpoint (default strategy).
+ *
+ * Places exactly ONE `cache_control` marker on the last cacheable block of the
+ * final non-synthetic message, mirroring the Claude Code strategy
+ * (`markerIndex = messages.length - 1`). Because the marker always rides the
+ * true tail, the entire conversation prefix is written once and read back on
+ * the next turn as the history grows append-only — instead of the rolling
+ * "last two user messages" markers, which leave freshly appended tool/assistant
+ * turns outside the cached prefix and re-write large spans every step.
+ *
+ * Stale markers (Anthropic `cache_control` and Bedrock cache points) are
+ * stripped from every message in a single backward pass so exactly one marker
+ * survives. Synthetic skill/meta messages are skipped as anchors (their volatile
+ * content must not pin the cache) but still have stale markers removed.
+ *
+ * Returns a new array; only messages that require modification are cloned.
+ */
+export function addTailCacheControl<T extends AnthropicMessage | BaseMessage>(
+  messages: T[]
+): T[] {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const updatedMessages: T[] = [...messages];
+  let markerPlaced = false;
+
+  for (let i = updatedMessages.length - 1; i >= 0; i--) {
+    const originalMessage = updatedMessages[i];
+    const content = originalMessage.content;
+    const hasArrayContent = Array.isArray(content);
+    const canPlaceMarker =
+      !markerPlaced && !isSyntheticMetaMessage(originalMessage);
+
+    // Earlier string-content messages carry no markers to strip.
+    if (!canPlaceMarker && !hasArrayContent) {
+      continue;
+    }
+
+    let workingContent: MessageContentComplex[];
+    let modified = false;
+
+    if (hasArrayContent) {
+      const src = content as MessageContentComplex[];
+      workingContent = [];
+      let tailIndex = -1;
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
+          continue;
+        }
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+        if (
+          canPlaceMarker &&
+          isTailCacheableBlock(cloned as MessageContentComplex)
+        ) {
+          tailIndex = workingContent.length;
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
+
+      if (canPlaceMarker && tailIndex >= 0) {
+        (workingContent[tailIndex] as Anthropic.TextBlockParam).cache_control =
+          {
+            type: 'ephemeral',
+          };
+        markerPlaced = true;
+        modified = true;
+      }
+
+      if (!modified) {
+        continue;
+      }
+    } else if (
+      typeof content === 'string' &&
+      canPlaceMarker &&
+      content.trim() !== ''
+    ) {
+      workingContent = [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ] as unknown as MessageContentComplex[];
+      markerPlaced = true;
+    } else {
+      continue;
+    }
+
+    updatedMessages[i] = cloneMessage(
+      originalMessage as MessageWithContent,
+      workingContent
+    ) as T;
+  }
+
+  return updatedMessages;
+}
+
+function getMessageRole(message: MessageWithContent): string | undefined {
+  if (message instanceof BaseMessage) {
+    return message.getType();
+  }
+  if ('role' in message && typeof message.role === 'string') {
+    return message.role;
+  }
+  return undefined;
+}
+
+const SKILL_MESSAGE_SOURCE = 'skill';
+
+/**
+ * Synthetic skill/meta messages (reconstructed skill bodies, primed SKILL.md
+ * instructions) are re-injected every turn and are not stable conversation
+ * turns. They must not anchor a fresh prompt-cache marker — doing so pins the
+ * cache to a volatile/duplicated prefix. Stale markers are still stripped from
+ * them; only the *adding* of new markers is suppressed. Detected via
+ * `additional_kwargs.isMeta === true` or `additional_kwargs.source === 'skill'`.
+ */
+function isSyntheticMetaMessage(message: MessageWithContent): boolean {
+  const { additional_kwargs: kwargs } = message as {
+    additional_kwargs?: { isMeta?: unknown; source?: unknown };
+  };
+  if (kwargs == null) {
+    return false;
+  }
+  return kwargs.isMeta === true || kwargs.source === SKILL_MESSAGE_SOURCE;
+}
+
+function isCacheableConversationMessage(message: MessageWithContent): boolean {
+  const role = getMessageRole(message);
+  return (
+    role === 'human' || role === 'user' || role === 'ai' || role === 'assistant'
+  );
+}
+
+function isAssistantConversationMessage(message: MessageWithContent): boolean {
+  const role = getMessageRole(message);
+  return role === 'ai' || role === 'assistant';
+}
+
+function hasCacheMarker(message: MessageWithContent): boolean {
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((block) => 'cache_control' in block)
+  );
+}
+
+function addCacheControlToRecentMessages<
+  T extends AnthropicMessage | BaseMessage,
+>(
+  messages: T[],
+  maxCachePoints: number,
+  canUseMessage: (message: MessageWithContent) => boolean
+): T[] {
+  if (
+    !Array.isArray(messages) ||
+    messages.length === 0 ||
+    maxCachePoints <= 0
+  ) {
+    return messages;
+  }
+
+  const updatedMessages: T[] = [...messages];
+  let cachePointsAdded = 0;
+
+  for (let i = updatedMessages.length - 1; i >= 0; i--) {
+    const originalMessage = updatedMessages[i];
+    const content = originalMessage.content;
+    const hasArrayContent = Array.isArray(content);
+    const canAddCache =
+      cachePointsAdded < maxCachePoints &&
+      canUseMessage(originalMessage) &&
+      !isSyntheticMetaMessage(originalMessage);
+
+    if (!canAddCache && !hasArrayContent) {
+      continue;
+    }
+
+    let workingContent: MessageContentComplex[];
+    let modified = false;
+
+    if (hasArrayContent) {
+      const src = content as MessageContentComplex[];
+      workingContent = [];
+      let lastNonEmptyTextIndex = -1;
+
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
+          continue;
+        }
+
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+
+        if ('type' in cloned && cloned.type === 'text') {
+          const text = (cloned as { text?: string }).text;
+          if (text != null && text.trim() !== '') {
+            lastNonEmptyTextIndex = workingContent.length;
+          }
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
+
+      if (canAddCache && lastNonEmptyTextIndex >= 0) {
+        (
+          workingContent[lastNonEmptyTextIndex] as Anthropic.TextBlockParam
+        ).cache_control = {
+          type: 'ephemeral',
+        };
+        cachePointsAdded++;
+        modified = true;
+      }
+
+      if (!modified) {
+        continue;
+      }
+    } else if (
+      typeof content === 'string' &&
+      content.trim() !== '' &&
+      canAddCache
+    ) {
+      workingContent = [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ] as unknown as MessageContentComplex[];
+      cachePointsAdded++;
+    } else {
+      continue;
+    }
+
+    updatedMessages[i] = cloneMessage(
+      originalMessage as MessageWithContent,
+      workingContent
+    ) as T;
+  }
+
+  return updatedMessages;
+}
+
+export function addCacheControlToStablePrefixMessages<
+  T extends AnthropicMessage | BaseMessage,
+>(messages: T[], maxCachePoints: number): T[] {
+  const assistantMarked = addCacheControlToRecentMessages(
+    messages,
+    maxCachePoints,
+    isAssistantConversationMessage
+  );
+
+  if (assistantMarked.some(hasCacheMarker)) {
+    return assistantMarked;
+  }
+
+  return addCacheControlToRecentMessages(
+    messages,
+    maxCachePoints,
+    isCacheableConversationMessage
+  );
 }
 
 /**
@@ -288,48 +652,68 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
 }
 
 /**
- * Adds Bedrock Converse API cache points to the last two messages.
+ * Adds Bedrock Converse API cache points to the latest two user messages.
  * Inserts `{ cachePoint: { type: 'default' } }` as a separate content block
  * immediately after the last text block in each targeted message.
  * Strips ALL existing cache control (both Bedrock and Anthropic formats) from all messages,
- * then adds fresh cache points to the last 2 messages in a single backward pass.
+ * then adds fresh cache points to the latest two non-tool user messages in a single backward pass.
  * This ensures we don't accumulate stale cache points across multiple turns.
  * Returns a new array - only clones messages that require modification.
  * @param messages - The array of message objects.
  * @returns - A new array of message objects with cache points added.
  */
 export function addBedrockCacheControl<
-  T extends Partial<BaseMessage> & MessageWithContent,
+  T extends MessageWithContent & { getType?: () => string; role?: string },
 >(messages: T[]): T[] {
-  if (!Array.isArray(messages) || messages.length < 2) {
+  if (!Array.isArray(messages) || messages.length === 0) {
     return messages;
   }
 
   const updatedMessages: T[] = [...messages];
-  let messagesModified = 0;
+  let cachePointsAdded = 0;
 
   for (let i = updatedMessages.length - 1; i >= 0; i--) {
     const originalMessage = updatedMessages[i];
-    const isToolMessage =
+    const messageType =
       'getType' in originalMessage &&
-      typeof originalMessage.getType === 'function' &&
-      originalMessage.getType() === 'tool';
+      typeof originalMessage.getType === 'function'
+        ? originalMessage.getType()
+        : undefined;
+    const messageRole =
+      'role' in originalMessage && typeof originalMessage.role === 'string'
+        ? originalMessage.role
+        : undefined;
 
-    const content = originalMessage.content;
-    const hasArrayContent = Array.isArray(content);
-    const isEmptyString = typeof content === 'string' && content === '';
-    const needsCacheAdd =
-      messagesModified < 2 &&
-      !isToolMessage &&
-      !isEmptyString &&
-      (typeof content === 'string' || hasArrayContent);
-
-    if (!needsCacheAdd && !hasArrayContent) {
+    const isSystemMessage =
+      messageType === 'system' || messageRole === 'system';
+    if (isSystemMessage) {
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
       continue;
     }
 
-    let workingContent: MessageContentComplex[];
-    let modified = false;
+    const isToolMessage = messageType === 'tool' || messageRole === 'tool';
+    const isUserMessage = messageType === 'human' || messageRole === 'user';
+    const content = originalMessage.content;
+    const hasSerializationProps =
+      'lc_kwargs' in originalMessage ||
+      'lc_serializable' in originalMessage ||
+      'lc_namespace' in originalMessage;
+    const hasArrayContent = Array.isArray(content);
+    const isEmptyString = typeof content === 'string' && content === '';
+    const needsCacheAdd =
+      cachePointsAdded < 2 &&
+      isUserMessage &&
+      !isToolMessage &&
+      !isEmptyString &&
+      !isSyntheticMetaMessage(originalMessage) &&
+      (typeof content === 'string' || hasArrayContent);
+
+    if (!needsCacheAdd && !hasArrayContent && !hasSerializationProps) {
+      continue;
+    }
+
+    let workingContent: string | MessageContentComplex[];
+    let modified = hasSerializationProps;
 
     if (hasArrayContent) {
       // Single pass: clone blocks, strip cache markers, find last
@@ -368,14 +752,136 @@ export function addBedrockCacheControl<
         workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
           cachePoint: { type: 'default' },
         } as MessageContentComplex);
-        messagesModified++;
+        cachePointsAdded++;
       }
     } else if (typeof content === 'string' && needsCacheAdd) {
       workingContent = [
         { type: ContentTypes.TEXT, text: content },
         { cachePoint: { type: 'default' } } as MessageContentComplex,
       ];
-      messagesModified++;
+      cachePointsAdded++;
+    } else if (typeof content === 'string' && hasSerializationProps) {
+      workingContent = content;
+    } else {
+      continue;
+    }
+
+    updatedMessages[i] = cloneMessage(originalMessage, workingContent);
+  }
+
+  return updatedMessages;
+}
+
+/**
+ * Bedrock Converse API: single tail cache breakpoint (default strategy).
+ *
+ * The Bedrock counterpart of {@link addTailCacheControl}. Strips ALL existing
+ * cache control (Bedrock cache points and Anthropic `cache_control`) from every
+ * message, then inserts exactly ONE `{ cachePoint: { type: 'default' } }` block
+ * immediately after the last non-empty text block of the most recent
+ * non-synthetic, non-system message. Anchoring on the rolling tail keeps the
+ * cached prefix append-only as the conversation grows, instead of re-writing
+ * large spans every turn with the legacy "last two user messages" cache points.
+ *
+ * System messages are sanitized (Anthropic `cache_control` stripped) but never
+ * anchored. Synthetic skill/meta messages are skipped as anchors so their
+ * volatile content cannot pin the cache.
+ *
+ * Returns a new array - only clones messages that require modification.
+ */
+export function addBedrockTailCacheControl<
+  T extends MessageWithContent & { getType?: () => string; role?: string },
+>(messages: T[]): T[] {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const updatedMessages: T[] = [...messages];
+  let cachePointPlaced = false;
+
+  for (let i = updatedMessages.length - 1; i >= 0; i--) {
+    const originalMessage = updatedMessages[i];
+    const messageType =
+      'getType' in originalMessage &&
+      typeof originalMessage.getType === 'function'
+        ? originalMessage.getType()
+        : undefined;
+    const messageRole =
+      'role' in originalMessage && typeof originalMessage.role === 'string'
+        ? originalMessage.role
+        : undefined;
+
+    const isSystemMessage =
+      messageType === 'system' || messageRole === 'system';
+    if (isSystemMessage) {
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      continue;
+    }
+
+    const content = originalMessage.content;
+    const hasSerializationProps =
+      'lc_kwargs' in originalMessage ||
+      'lc_serializable' in originalMessage ||
+      'lc_namespace' in originalMessage;
+    const hasArrayContent = Array.isArray(content);
+    const isEmptyString = typeof content === 'string' && content === '';
+    const canPlaceCachePoint =
+      !cachePointPlaced &&
+      !isEmptyString &&
+      !isSyntheticMetaMessage(originalMessage) &&
+      (typeof content === 'string' || hasArrayContent);
+
+    if (!canPlaceCachePoint && !hasArrayContent && !hasSerializationProps) {
+      continue;
+    }
+
+    let workingContent: string | MessageContentComplex[];
+    let modified = hasSerializationProps;
+
+    if (hasArrayContent) {
+      const src = content as MessageContentComplex[];
+      workingContent = [];
+      let lastNonEmptyTextIndex = -1;
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
+          continue;
+        }
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+        const type = (cloned as { type?: string }).type;
+        if (type === ContentTypes.TEXT || type === 'text') {
+          const text = (cloned as { text?: string }).text;
+          if (text != null && text.trim() !== '') {
+            lastNonEmptyTextIndex = workingContent.length;
+          }
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
+
+      if (!modified && !canPlaceCachePoint) {
+        continue;
+      }
+
+      if (canPlaceCachePoint && lastNonEmptyTextIndex >= 0) {
+        workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
+          cachePoint: { type: 'default' },
+        } as MessageContentComplex);
+        cachePointPlaced = true;
+        modified = true;
+      }
+    } else if (typeof content === 'string' && canPlaceCachePoint) {
+      workingContent = [
+        { type: ContentTypes.TEXT, text: content },
+        { cachePoint: { type: 'default' } } as MessageContentComplex,
+      ];
+      cachePointPlaced = true;
+    } else if (typeof content === 'string' && hasSerializationProps) {
+      workingContent = content;
     } else {
       continue;
     }

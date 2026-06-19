@@ -5,16 +5,48 @@
 import {
   type BaseMessage,
   isAIMessage,
+  type Data,
   parseBase64DataUrl,
   parseMimeType,
   MessageContentComplex,
+  type StandardContentBlockConverter,
+  convertToProviderContentBlock,
+  isDataContentBlock,
 } from '@langchain/core/messages';
+import type {
+  AudioFormat,
+  AudioSource,
+  DocumentFormat,
+  DocumentSource,
+  VideoFormat,
+  VideoSource,
+} from '@aws-sdk/client-bedrock-runtime';
 import type {
   BedrockMessage,
   BedrockSystemContentBlock,
   BedrockContentBlock,
   MessageContentReasoningBlock,
 } from '../types';
+
+/**
+ * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
+ * reasoning format is `reasoning_content`; these carry provider-specific
+ * signatures Bedrock cannot validate, so they are dropped on a cross-provider
+ * handoff (e.g. Anthropic → Bedrock) rather than crashing the conversion.
+ */
+const FOREIGN_REASONING_TYPES = [
+  'thinking',
+  'redacted_thinking',
+  'reasoning',
+  'think',
+];
+
+/**
+ * Bedrock Converse rejects assistant messages with no content blocks. When
+ * filtering (e.g. dropping foreign reasoning) empties an assistant turn that
+ * also has no tool calls, fall back to this placeholder text.
+ */
+const BEDROCK_EMPTY_TEXT_PLACEHOLDER = '_';
 
 /**
  * Convert a LangChain reasoning block to a Bedrock reasoning block.
@@ -38,6 +70,22 @@ export function langchainReasoningBlockToBedrockReasoningBlock(
     };
   }
   throw new Error('Invalid reasoning content');
+}
+
+/**
+ * Whether a reasoning block can be serialized to a valid Bedrock
+ * `reasoningContent`. Bedrock Converse rejects `reasoningText` with a null/empty
+ * `text` (e.g. a signature-only block that never merged with its text), so such
+ * blocks must be dropped rather than sent.
+ */
+function isSerializableBedrockReasoningBlock(
+  content: MessageContentReasoningBlock
+): boolean {
+  if (content.reasoningText != null) {
+    const text = content.reasoningText.text;
+    return text != null && text !== '';
+  }
+  return content.redactedContent != null && content.redactedContent !== '';
 }
 
 /**
@@ -127,6 +175,258 @@ export function extractImageInfo(base64: string): BedrockContentBlock {
   };
 }
 
+type MediaContentBlock = MessageContentComplex & {
+  data?: string | Uint8Array;
+  url?: string;
+  fileId?: string;
+  mimeType?: string;
+};
+
+const mimeTypeToVideoFormat: Record<string, VideoFormat> = {
+  'video/flv': 'flv',
+  'video/mkv': 'mkv',
+  'video/mov': 'mov',
+  'video/mp4': 'mp4',
+  'video/mpeg': 'mpeg',
+  'video/mpg': 'mpg',
+  'video/three_gp': 'three_gp',
+  'video/webm': 'webm',
+  'video/wmv': 'wmv',
+};
+
+const mimeTypeToAudioFormat: Record<string, AudioFormat> = {
+  'audio/aac': 'aac',
+  'audio/flac': 'flac',
+  'audio/m4a': 'm4a',
+  'audio/mka': 'mka',
+  'audio/mkv': 'mkv',
+  'audio/mp3': 'mp3',
+  'audio/mp4': 'mp4',
+  'audio/mpeg': 'mpeg',
+  'audio/mpga': 'mpga',
+  'audio/ogg': 'ogg',
+  'audio/opus': 'opus',
+  'audio/pcm': 'pcm',
+  'audio/wav': 'wav',
+  'audio/webm': 'webm',
+  'audio/x-aac': 'x-aac',
+};
+
+const mimeTypeToDocumentFormat: Partial<Record<string, DocumentFormat>> = {
+  'text/csv': 'csv',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+    'docx',
+  'text/html': 'html',
+  'text/markdown': 'md',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+};
+
+function base64ToBytes(data: string): Uint8Array {
+  return Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
+}
+
+function getMediaFormat<T extends string>(
+  mimeType: string | undefined,
+  formatMap: Record<string, T>
+): T | undefined {
+  if (mimeType == null || mimeType === '') {
+    return undefined;
+  }
+  return formatMap[mimeType] ?? (parseMimeType(mimeType).subtype as T);
+}
+
+function resolveMediaSource(
+  block: MediaContentBlock
+): AudioSource | VideoSource {
+  if (typeof block.data === 'string') {
+    return { bytes: base64ToBytes(block.data) };
+  }
+  if (block.data instanceof Uint8Array) {
+    return { bytes: block.data };
+  }
+  if (typeof block.url === 'string') {
+    const parsedData = parseBase64DataUrl({
+      dataUrl: block.url,
+      asTypedArray: true,
+    });
+    if (parsedData != null) {
+      return { bytes: parsedData.data as Uint8Array };
+    }
+    throw new Error(
+      `Only base64 data URLs are supported for ${block.type} blocks with 'url' field with ChatBedrockConverse.`
+    );
+  }
+  if (typeof block.fileId === 'string') {
+    return { s3Location: { uri: block.fileId } };
+  }
+  throw new Error(
+    `${block.type} block must include one of: 'data' (base64 string or Uint8Array), 'url' (base64 data URL), or 'fileId' (S3 URI).`
+  );
+}
+
+function convertMultimodalVideoBlock(
+  block: MediaContentBlock
+): BedrockContentBlock {
+  return {
+    video: {
+      format: getMediaFormat(block.mimeType, mimeTypeToVideoFormat),
+      source: resolveMediaSource(block) as VideoSource,
+    },
+  } as BedrockContentBlock;
+}
+
+function convertMultimodalAudioBlock(
+  block: MediaContentBlock
+): BedrockContentBlock {
+  return {
+    audio: {
+      format: getMediaFormat(block.mimeType, mimeTypeToAudioFormat),
+      source: resolveMediaSource(block) as AudioSource,
+    },
+  } as BedrockContentBlock;
+}
+
+function getDocumentName(block: Data.StandardFileBlock): string {
+  return (
+    (block.metadata?.name as string | undefined) ??
+    (block.metadata?.filename as string | undefined) ??
+    (block.metadata?.title as string | undefined) ??
+    globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12)
+  );
+}
+
+function getDocumentFormat(
+  mimeType: string | undefined
+): DocumentFormat | undefined {
+  if (mimeType == null || mimeType === '') {
+    return undefined;
+  }
+  const parsedMimeType = parseMimeType(mimeType);
+  const format =
+    mimeTypeToDocumentFormat[
+      `${parsedMimeType.type}/${parsedMimeType.subtype}`
+    ];
+  if (format === undefined) {
+    throw new Error(
+      `Unsupported file mime type: "${mimeType}" ChatBedrockConverse only supports ${Object.keys(
+        mimeTypeToDocumentFormat
+      ).join(', ')} formats.`
+    );
+  }
+  return format;
+}
+
+const standardContentBlockConverter: StandardContentBlockConverter<{
+  text: BedrockContentBlock;
+  image: BedrockContentBlock;
+  file: BedrockContentBlock;
+}> = {
+  providerName: 'ChatBedrockConverse',
+
+  fromStandardTextBlock(block: Data.StandardTextBlock): BedrockContentBlock {
+    return { text: block.text };
+  },
+
+  fromStandardImageBlock(block: Data.StandardImageBlock): BedrockContentBlock {
+    if (block.source_type === 'url') {
+      const parsedData = parseBase64DataUrl({
+        dataUrl: block.url,
+        asTypedArray: true,
+      });
+      if (parsedData == null) {
+        throw new Error(
+          [
+            'Only base64 data URLs are supported for image blocks with source type ',
+            'url',
+            ' with ChatBedrockConverse.',
+          ].join(String.fromCharCode(39))
+        );
+      }
+      return {
+        image: {
+          format: parseMimeType(parsedData.mime_type).subtype as
+            | 'gif'
+            | 'jpeg'
+            | 'png'
+            | 'webp',
+          source: { bytes: parsedData.data as Uint8Array },
+        },
+      };
+    }
+    if (block.source_type === 'base64') {
+      let format: 'gif' | 'jpeg' | 'png' | 'webp' | undefined;
+      if (block.mime_type != null && block.mime_type !== '') {
+        format = parseMimeType(block.mime_type).subtype as typeof format;
+      }
+      if (format != null && !['gif', 'jpeg', 'png', 'webp'].includes(format)) {
+        throw new Error(
+          `Unsupported image mime type: "${block.mime_type}" ChatBedrockConverse only supports "image/gif", "image/jpeg", "image/png", and "image/webp" formats.`
+        );
+      }
+      return {
+        image: {
+          format,
+          source: { bytes: base64ToBytes(block.data) },
+        },
+      };
+    }
+    throw new Error(
+      `Image source type '${block.source_type}' not supported with ChatBedrockConverse.`
+    );
+  },
+
+  fromStandardFileBlock(block: Data.StandardFileBlock): BedrockContentBlock {
+    const name = getDocumentName(block);
+    if (block.source_type === 'text') {
+      return {
+        document: {
+          name,
+          format: 'txt',
+          source: { bytes: new TextEncoder().encode(block.text) },
+        },
+      } as BedrockContentBlock;
+    }
+    if (block.source_type === 'url') {
+      const parsedData = parseBase64DataUrl({
+        dataUrl: block.url,
+        asTypedArray: true,
+      });
+      if (parsedData == null) {
+        throw new Error(
+          [
+            'Only base64 data URLs are supported for file blocks with source type ',
+            'url',
+            ' with ChatBedrockConverse.',
+          ].join(String.fromCharCode(39))
+        );
+      }
+      return {
+        document: {
+          name,
+          format: getDocumentFormat(parsedData.mime_type),
+          source: { bytes: parsedData.data as Uint8Array } as DocumentSource,
+        },
+      } as BedrockContentBlock;
+    }
+    if (block.source_type === 'base64') {
+      return {
+        document: {
+          name,
+          format: getDocumentFormat(block.mime_type),
+          source: { bytes: base64ToBytes(block.data) } as DocumentSource,
+        },
+      } as BedrockContentBlock;
+    }
+    throw new Error(
+      `File source type '${block.source_type}' not supported with ChatBedrockConverse.`
+    );
+  },
+};
+
 /**
  * Check if a block has a cache point.
  */
@@ -159,6 +459,10 @@ function convertLangChainContentBlockToConverseContentBlock({
 }): BedrockContentBlock {
   if (typeof block === 'string') {
     return { text: block };
+  }
+
+  if (isDataContentBlock(block)) {
+    return convertToProviderContentBlock(block, standardContentBlockConverter);
   }
 
   if (block.type === 'text') {
@@ -232,6 +536,32 @@ function convertLangChainContentBlockToConverseContentBlock({
   }
 
   if (
+    block.type === 'video' &&
+    (block as { video?: unknown }).video !== undefined
+  ) {
+    return {
+      video: (block as { video: unknown }).video,
+    } as BedrockContentBlock;
+  }
+
+  if (block.type === 'video') {
+    return convertMultimodalVideoBlock(block as MediaContentBlock);
+  }
+
+  if (
+    block.type === 'audio' &&
+    (block as { audio?: unknown }).audio !== undefined
+  ) {
+    return {
+      audio: (block as { audio: unknown }).audio,
+    } as BedrockContentBlock;
+  }
+
+  if (block.type === 'audio') {
+    return convertMultimodalAudioBlock(block as MediaContentBlock);
+  }
+
+  if (
     block.type === 'document' &&
     (block as { document?: unknown }).document !== undefined
   ) {
@@ -298,7 +628,10 @@ function convertSystemMessageToConverseMessage(
  */
 function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   // Check for v1 format from other providers (PR #9766 fix)
-  if (msg.response_metadata.output_version === 'v1') {
+  const responseMetadata = msg.response_metadata as
+    | { output_version?: string }
+    | undefined;
+  if (responseMetadata?.output_version === 'v1') {
     return convertFromV1ToChatBedrockConverseMessage(msg);
   }
 
@@ -336,10 +669,17 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           contentBlocks.push({ text });
         }
       } else if (block.type === 'reasoning_content') {
+        const reasoningBlock = block as MessageContentReasoningBlock;
+        // Bedrock Converse rejects reasoningContent whose reasoningText.text is
+        // null/empty (a signature-only block that never merged with its text).
+        // Drop it rather than emit an invalid request; the empty-turn
+        // placeholder below covers a turn left with no content.
+        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+          return;
+        }
         contentBlocks.push({
-          reasoningContent: langchainReasoningBlockToBedrockReasoningBlock(
-            block as MessageContentReasoningBlock
-          ),
+          reasoningContent:
+            langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
       } else if (isDefaultCachePoint(block)) {
         contentBlocks.push({
@@ -347,6 +687,15 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
             type: 'default',
           },
         } as BedrockContentBlock);
+      } else if (FOREIGN_REASONING_TYPES.some((t) => t === block.type)) {
+        // Reasoning from another provider (Anthropic `thinking`/
+        // `redacted_thinking`, Google `reasoning`, LibreChat `think`). Bedrock's
+        // native reasoning is `reasoning_content` (handled above); a foreign
+        // block carries a signature Bedrock cannot validate, so drop it on a
+        // cross-provider handoff (e.g. Anthropic → Bedrock) rather than crash.
+        // The Bedrock model produces its own reasoning. Anything else unknown
+        // still throws below — real content must be surfaced, not dropped.
+        return;
       } else {
         const blockValues = Object.fromEntries(
           Object.entries(block).filter(([key]) => key !== 'type')
@@ -375,6 +724,12 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
     ] as BedrockContentBlock[];
   }
 
+  // Bedrock rejects an assistant message with no content blocks; if filtering
+  // (e.g. dropping foreign reasoning) left it empty, emit a placeholder.
+  if (assistantMsg.content == null || assistantMsg.content.length === 0) {
+    assistantMsg.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
+  }
+
   return assistantMsg;
 }
 
@@ -392,7 +747,9 @@ function convertFromV1ToChatBedrockConverseMessage(
   };
 
   if (Array.isArray(msg.content)) {
-    for (const block of msg.content) {
+    for (const block of msg.content as Array<
+      MessageContentComplex | MessageContentReasoningBlock
+    >) {
       if (typeof block === 'string') {
         assistantMsg.content?.push({ text: block });
       } else if (block.type === 'text') {
@@ -498,15 +855,34 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
     content = [{ text: String(msg.content) }];
   }
 
+  // A `cachePoint` is a message-level ContentBlock — it is NOT a valid
+  // ToolResultContentBlock. A tail prompt-cache breakpoint that anchors on a
+  // tool result therefore ends up nested inside `toolResult.content`, which
+  // Bedrock silently ignores (no cache write, no cache read). Hoist any
+  // cachePoint(s) out of the tool result body so they sit as siblings after
+  // it, which is the only position Bedrock honors.
+  const toolResultContent: BedrockContentBlock[] = [];
+  const trailingCachePoints: BedrockContentBlock[] = [];
+  for (const block of content) {
+    if (isDefaultCachePoint(block)) {
+      trailingCachePoints.push({
+        cachePoint: { type: 'default' },
+      } as BedrockContentBlock);
+    } else {
+      toolResultContent.push(block);
+    }
+  }
+
   return {
     role: 'user',
     content: [
       {
         toolResult: {
           toolUseId: toolCallId,
-          content: content as { text: string }[],
+          content: toolResultContent as { text: string }[],
         },
       },
+      ...trailingCachePoints,
     ],
   };
 }
@@ -539,11 +915,11 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
   // Combine consecutive user tool result messages into a single message
   const combinedConverseMessages = converseMessages.reduce<BedrockMessage[]>(
     (acc, curr) => {
-      const lastMessage = acc[acc.length - 1];
-      if (lastMessage == null) {
+      if (acc.length === 0) {
         acc.push(curr);
         return acc;
       }
+      const lastMessage = acc[acc.length - 1];
       const lastHasToolResult =
         lastMessage.content?.some((c) => 'toolResult' in c) === true;
       const currHasToolResult =

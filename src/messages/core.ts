@@ -8,7 +8,16 @@ import {
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
-import { Providers } from '@/common';
+import { ContentTypes, Providers } from '@/common';
+import { toLangChainContent } from './langchain';
+
+type ReasoningSummary = { summary?: Array<{ text?: string }> };
+type ReasoningDetail = { type?: string; text?: string };
+type ReasoningAdditionalKwargs = {
+  reasoning_content?: string | Partial<ReasoningSummary> | null;
+  reasoning?: string | Partial<ReasoningSummary> | null;
+  reasoning_details?: ReasoningDetail[] | null;
+};
 
 export function getConverseOverrideMessage({
   userMessage,
@@ -41,7 +50,14 @@ User: ${userMessage[1]}
 const _allowedTypes = ['image_url', 'text', 'tool_use', 'tool_result'];
 const allowedTypesByProvider: Record<string, string[]> = {
   default: _allowedTypes,
-  [Providers.ANTHROPIC]: [..._allowedTypes, 'thinking', 'redacted_thinking'],
+  [Providers.ANTHROPIC]: [
+    ..._allowedTypes,
+    'thinking',
+    'redacted_thinking',
+    'server_tool_use',
+    'web_search_tool_result',
+    'web_search_result',
+  ],
   [Providers.BEDROCK]: [..._allowedTypes, 'reasoning_content'],
   [Providers.OPENAI]: _allowedTypes,
 };
@@ -134,6 +150,75 @@ function reduceBlocks(blocks: ContentBlock[]): ContentBlock[] {
   return reduced;
 }
 
+function getReasoningText(
+  value: string | Partial<ReasoningSummary> | null | undefined
+): string | undefined {
+  if (typeof value === 'string') {
+    return value !== '' ? value : undefined;
+  }
+  const summaryText = value?.summary
+    ?.map((summary) => summary.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return summaryText != null && summaryText !== '' ? summaryText : undefined;
+}
+
+function getReasoningDetailsText(
+  value: ReasoningDetail[] | null | undefined
+): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const reasoningText = value
+    .filter((detail) => detail.type === 'reasoning.text')
+    .map((detail) => detail.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return reasoningText !== '' ? reasoningText : undefined;
+}
+
+function getAdditionalReasoningContent(
+  message: BaseMessage
+): string | undefined {
+  const additionalKwargs =
+    message.additional_kwargs as ReasoningAdditionalKwargs | undefined;
+  if (additionalKwargs == null) {
+    return undefined;
+  }
+
+  const reasoningContent = getReasoningText(
+    additionalKwargs.reasoning_content
+  );
+  if (reasoningContent != null) {
+    return reasoningContent;
+  }
+
+  const reasoning = getReasoningText(additionalKwargs.reasoning);
+  if (reasoning != null) {
+    return reasoning;
+  }
+
+  return getReasoningDetailsText(additionalKwargs.reasoning_details);
+}
+
+function hasReasoningContent(content: BaseMessage['content']): boolean {
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((item) => {
+    if (typeof item !== 'object' || !('type' in item)) {
+      return false;
+    }
+    return (
+      item.type === ContentTypes.THINK ||
+      item.type === ContentTypes.THINKING ||
+      item.type === ContentTypes.REASONING ||
+      item.type === ContentTypes.REASONING_CONTENT ||
+      item.type === 'redacted_thinking'
+    );
+  });
+}
+
 export function modifyDeltaProperties(
   provider: Providers,
   obj?: AIMessageChunk
@@ -145,14 +230,18 @@ export function modifyDeltaProperties(
     : '';
 
   if (provider === Providers.BEDROCK && Array.isArray(obj.content)) {
-    obj.content = reduceBlocks(obj.content as ContentBlock[]);
+    obj.content = toLangChainContent(
+      reduceBlocks(obj.content as ContentBlock[])
+    );
   }
   if (Array.isArray(obj.content)) {
-    obj.content = modifyContent({
-      provider,
-      messageType,
-      content: obj.content,
-    }) as t.MessageContentComplex[];
+    obj.content = toLangChainContent(
+      modifyContent({
+        provider,
+        messageType,
+        content: obj.content as t.ExtendedMessageContent[],
+      }) as t.MessageContentComplex[]
+    );
   }
   if (
     (obj as Partial<AIMessageChunk>).lc_kwargs &&
@@ -174,7 +263,7 @@ export function modifyDeltaProperties(
 
 export function formatAnthropicMessage(message: AIMessageChunk): AIMessage {
   if (!message.tool_calls || message.tool_calls.length === 0) {
-    return new AIMessage({ content: message.content });
+    return new AIMessage({ content: toLangChainContent(message.content) });
   }
 
   const toolCallMap = new Map(message.tool_calls.map((tc) => [tc.id, tc]));
@@ -261,7 +350,7 @@ export function formatAnthropicMessage(message: AIMessageChunk): AIMessage {
   );
 
   return new AIMessage({
-    content: formattedContent,
+    content: toLangChainContent(formattedContent),
     tool_calls: formattedToolCalls as ToolCall[],
     additional_kwargs: {
       ...message.additional_kwargs,
@@ -274,25 +363,52 @@ export function convertMessagesToContent(
 ): t.MessageContentComplex[] {
   const processedContent: t.MessageContentComplex[] = [];
 
-  const addContentPart = (message: BaseMessage | null): void => {
+  const addToolCallBoundary = (): number => {
+    processedContent.push({ type: ContentTypes.TEXT, text: '' });
+    return processedContent.length - 1;
+  };
+
+  const addContentPart = (message: BaseMessage | null): number | undefined => {
     const content =
       message?.lc_kwargs.content != null
         ? message.lc_kwargs.content
         : message?.content;
     if (content === undefined) {
-      return;
+      return undefined;
+    }
+    const reasoningContent =
+      message?._getType() === 'ai' && !hasReasoningContent(content)
+        ? getAdditionalReasoningContent(message)
+        : undefined;
+    if (reasoningContent != null) {
+      processedContent.push({
+        type: ContentTypes.THINK,
+        think: reasoningContent,
+      });
     }
     if (typeof content === 'string') {
+      if (content === '') {
+        return undefined;
+      }
       processedContent.push({
-        type: 'text',
+        type: ContentTypes.TEXT,
         text: content,
       });
+      return processedContent.length - 1;
     } else if (Array.isArray(content)) {
-      const filteredContent = content.filter(
-        (item) => item != null && item.type !== 'tool_use'
-      );
-      processedContent.push(...filteredContent);
+      let textContentIndex: number | undefined;
+      for (const item of content) {
+        if (item == null || item.type === 'tool_use') {
+          continue;
+        }
+        processedContent.push(item);
+        if (item.type === ContentTypes.TEXT) {
+          textContentIndex = processedContent.length - 1;
+        }
+      }
+      return textContentIndex;
     }
+    return undefined;
   };
 
   let currentAIMessageIndex = -1;
@@ -315,8 +431,8 @@ export function convertMessagesToContent(
         toolCallMap.set(tool_call.id, tool_call);
       }
 
-      addContentPart(message);
-      currentAIMessageIndex = processedContent.length - 1;
+      currentAIMessageIndex =
+        addContentPart(message) ?? addToolCallBoundary();
       continue;
     } else if (
       messageType === 'tool' &&
@@ -346,6 +462,12 @@ export function convertMessagesToContent(
   }
 
   return processedContent;
+}
+
+function stringifyToolMessageContent(
+  content: ToolMessage['content'] | null | undefined
+): string {
+  return content == null ? '' : String(content);
 }
 
 export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
@@ -385,7 +507,12 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
     ) {
       const base = Array.isArray(msg.content)
         ? msg.content
-        : [{ type: 'text' as const, text: String(msg.content ?? '') }];
+        : [
+          {
+            type: ContentTypes.TEXT,
+            text: stringifyToolMessageContent(msg.content),
+          },
+        ];
       msg.content = base.concat(msg.artifact.content);
     }
   }
@@ -445,7 +572,7 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
       : [{ type: 'text', text: String(toolMsg.content) }];
 
     // Append artifacts directly to ToolMessage content
-    // Artifacts are already filtered by ToolNode based on vision capability
+    // Artifacts are already filtered by the vision strip before sending
     toolMsg.content = [...currentContent, ...artifact.content];
   }
 }

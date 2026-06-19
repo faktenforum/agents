@@ -1,27 +1,15 @@
 // src/types/graph.ts
 import type {
-  START,
-  StateType,
-  UpdateType,
-  StateGraph,
-  StateGraphArgs,
-  StateDefinition,
-  CompiledStateGraph,
-  BinaryOperatorAggregate,
-} from '@langchain/langgraph';
-import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
-import type {
   BaseMessage,
   AIMessageChunk,
   SystemMessage,
+  UsageMetadata,
 } from '@langchain/core/messages';
+import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
+import type { START, StateGraph, StateGraphArgs } from '@langchain/langgraph';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
-import type { ToolMap, ToolEndEvent, GenericTool, LCTool } from '@/types/tools';
-import type { Providers, Callback, GraphNodeKeys } from '@/common';
-import type { StandardGraph, MultiAgentGraph } from '@/graphs';
-import type { ClientOptions } from '@/types/llm';
 import type {
   SummarizationNodeInput,
   SummarizeCompleteEvent,
@@ -30,12 +18,22 @@ import type {
   SummarizeDeltaEvent,
 } from '@/types/summarize';
 import type {
+  ToolMap,
+  ToolEndEvent,
+  GenericTool,
+  LCTool,
+  ToolExecuteBatchRequest,
+} from '@/types/tools';
+import type {
   RunStep,
   RunStepDeltaEvent,
   MessageDeltaEvent,
   ReasoningDeltaEvent,
 } from '@/types/stream';
-import type { TokenCounter } from '@/types/run';
+import type { TokenCounter, TokenBudgetBreakdown } from '@/types/run';
+import type { Providers, Callback, GraphNodeKeys } from '@/common';
+import type { StandardGraph, MultiAgentGraph } from '@/graphs';
+import type { ClientOptions } from '@/types/llm';
 
 /** Interface for bound model with stream and invoke methods */
 export interface ChatModel {
@@ -92,6 +90,30 @@ export interface AgentLogEvent {
   agentId?: string;
 }
 
+/**
+ * Per-model-call context window usage snapshot, dispatched after pruning and
+ * before the model invocation. Dispatched once per `callModel` invocation:
+ * fallback retries reuse the snapshot since the prompt is identical — budget
+ * numbers reflect the primary provider's tokenizer, and the calibration
+ * ratio self-corrects from whichever provider reports usage.
+ */
+export interface ContextUsageEvent {
+  runId?: string;
+  agentId?: string;
+  /** Structural token budget snapshot from AgentContext.getTokenBudgetBreakdown */
+  breakdown: TokenBudgetBreakdown;
+  /** Usable budget this call: maxContextTokens minus output reserve */
+  contextBudget?: number;
+  /** Calibrated instruction overhead actually applied this call */
+  effectiveInstructionTokens?: number;
+  /** Calibrated message tokens before pruning (excluding instructions) */
+  prePruneContextTokens?: number;
+  /** Tokens still free after instructions + pruned messages */
+  remainingContextTokens?: number;
+  /** EMA ratio of provider-reported vs locally estimated token counts */
+  calibrationRatio?: number;
+}
+
 export interface EventHandler {
   handle(
     event: string,
@@ -105,7 +127,10 @@ export interface EventHandler {
       | SummarizeStartEvent
       | SummarizeDeltaEvent
       | SummarizeCompleteEvent
+      | SubagentUpdateEvent
       | AgentLogEvent
+      | ContextUsageEvent
+      | ToolExecuteBatchRequest
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
@@ -121,76 +146,40 @@ export type Workflow<
   N extends string = string,
 > = StateGraph<T, U, N>;
 
+type LangChainEventStreamCallbackHandlerInput = NonNullable<
+  Parameters<Runnable['streamEvents']>[2]
+>;
+
+export type EventStreamCallbackHandlerInput =
+  LangChainEventStreamCallbackHandlerInput & {
+    autoClose?: boolean;
+    raiseError?: boolean;
+    ignoreCustomEvent?: boolean;
+  };
+
+export type WorkflowValuesStreamConfig = RunnableConfig & {
+  streamMode: 'values';
+};
+
+/**
+ * LangGraph stream output is mode-dependent (`values`, `updates`, SSE, etc.).
+ * Keep the base Runnable stream output as unknown and narrow at callsites that
+ * choose a concrete streamMode.
+ */
 export type CompiledWorkflow<
-  T extends BaseGraphState = BaseGraphState,
-  U extends Partial<T> = Partial<T>,
-  N extends string = string,
-> = CompiledStateGraph<T, U, N>;
+  TInput extends BaseGraphState = BaseGraphState,
+  TOutput extends BaseGraphState = TInput,
+> = Omit<Runnable<TInput, unknown>, 'invoke'> & {
+  invoke(input: TInput, config?: RunnableConfig): Promise<TOutput>;
+};
 
-export type CompiledStateWorkflow = CompiledStateGraph<
-  StateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  UpdateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  string,
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  StateDefinition
->;
+export type CompiledStateWorkflow = CompiledWorkflow;
 
-export type CompiledMultiAgentWorkflow = CompiledStateGraph<
-  StateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  UpdateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  string,
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  StateDefinition
->;
+export type CompiledMultiAgentWorkflow = CompiledWorkflow<MultiAgentGraphState>;
 
-export type CompiledAgentWorfklow = CompiledStateGraph<
+export type CompiledAgentWorfklow = CompiledWorkflow<
   AgentSubgraphState,
-  Partial<AgentSubgraphState>,
-  '__start__' | `agent=${string}` | `tools=${string}` | `summarize=${string}`,
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    summarizationRequest: BinaryOperatorAggregate<
-      SummarizationNodeInput | undefined,
-      SummarizationNodeInput | undefined
-    >;
-  },
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    summarizationRequest: BinaryOperatorAggregate<
-      SummarizationNodeInput | undefined,
-      SummarizationNodeInput | undefined
-    >;
-  },
-  StateDefinition,
-  {
-    [x: `agent=${string}`]: Partial<BaseGraphState>;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    [x: `tools=${string}`]: any;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    [x: `summarize=${string}`]: any;
-  }
+  AgentSubgraphState
 >;
 
 export type SystemRunnable =
@@ -206,20 +195,10 @@ export type SystemRunnable =
  * These are intentionally untyped to avoid coupling to library internals.
  */
 export type CompileOptions = {
-  // A checkpointer instance (e.g., MemorySaver, SQL saver)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  checkpointer?: any;
+  checkpointer?: unknown;
   interruptBefore?: string[];
   interruptAfter?: string[];
 };
-
-export type EventStreamCallbackHandlerInput =
-  Parameters<CompiledWorkflow['streamEvents']>[2] extends Omit<
-    infer T,
-    'autoClose'
-  >
-    ? T
-    : never;
 
 export type StreamChunk =
   | (ChatGenerationChunk & {
@@ -342,9 +321,21 @@ export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
+  langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
+  /**
+   * Receives a {@link SubagentUsageEvent} for every model call made inside
+   * a subagent child run spawned from this graph (including nested
+   * subagents and child-side summarization calls). Child graphs run via
+   * `invoke()` outside the host's `streamEvents` loop, so their
+   * `on_chat_model_end` events never reach the run's handler registry —
+   * this sink is the only way hosts can observe child token usage for
+   * billing/accounting. Parent-graph model calls are NOT reported here;
+   * they already flow through the registry's `CHAT_MODEL_END` handler.
+   */
+  subagentUsageSink?: SubagentUsageSink;
 };
 
 export type GraphEdge = {
@@ -388,6 +379,177 @@ export type MultiAgentGraphInput = StandardGraphInput & {
   edges: GraphEdge[];
 };
 
+/** Configuration for a subagent type that can be spawned by a parent agent. */
+export type SubagentConfig = {
+  /** Identifier used in the tool's `subagent_type` enum (e.g. 'researcher', 'coder'). */
+  type: string;
+  /** Human-readable display name. */
+  name: string;
+  /** What this subagent specializes in — shown to the LLM. */
+  description: string;
+  /** Full agent config for the child graph. Omit when `self` is true. */
+  agentInputs?: AgentInputs;
+  /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
+  self?: boolean;
+  /** Max AGENT→TOOLS cycles before forced stop (default: 25). */
+  maxTurns?: number;
+  /** Allow this subagent to spawn its own subagents (default: false). */
+  allowNested?: boolean;
+};
+
+/** SubagentConfig with agentInputs guaranteed present (self-spawn resolved). */
+export type ResolvedSubagentConfig = SubagentConfig & {
+  agentInputs: AgentInputs;
+};
+
+/** Lifecycle phase carried on {@link SubagentUpdateEvent}. */
+export type SubagentUpdatePhase =
+  | 'start'
+  | 'run_step'
+  | 'run_step_delta'
+  | 'run_step_completed'
+  | 'message_delta'
+  | 'reasoning_delta'
+  | 'stop'
+  | 'error';
+
+/**
+ * Wrapper event emitted when a subagent's child graph dispatches activity.
+ * Lets hosts show subagent progress in a UI surface separate from the parent
+ * conversation without having to untangle events by agent ID.
+ */
+export interface SubagentUpdateEvent {
+  /** Parent run ID. */
+  runId: string;
+  /** Child run ID (unique per subagent execution). */
+  subagentRunId: string;
+  /**
+   * Parent-side `tool_call_id` for the `subagent` tool invocation that
+   * triggered this run. Stable for the duration of the child; lets hosts
+   * correlate updates deterministically instead of inferring by ordering.
+   * Omitted when the executor was invoked outside of a tool-call context.
+   */
+  parentToolCallId?: string;
+  /** Subagent `type` identifier from the SubagentConfig. */
+  subagentType: string;
+  /** Child agent ID assigned to this subagent execution. */
+  subagentAgentId: string;
+  /** Parent agent ID that spawned this subagent. */
+  parentAgentId?: string;
+  /** Lifecycle phase carried by this update. */
+  phase: SubagentUpdatePhase;
+  /** Underlying event payload (shape depends on phase). */
+  data?: unknown;
+  /** Short human-readable description. Hosts can render this directly. */
+  label?: string;
+  /** ISO timestamp for ordering / display. */
+  timestamp: string;
+}
+
+/**
+ * Token usage for a single model call made inside a subagent child run.
+ * Emitted through {@link SubagentUsageSink} as each call completes, so
+ * hosts can bill child-run model usage that never reaches the parent
+ * run's `CHAT_MODEL_END` handler (child graphs execute via `invoke()`
+ * outside the host's `streamEvents` loop).
+ */
+export interface SubagentUsageEvent {
+  /** Usage metadata reported by the child's model call. */
+  usage: UsageMetadata;
+  /**
+   * Model that produced this usage. Per-call `ls_model_name` from the
+   * model's callback metadata when available (covers child-side
+   * summarization or any call that differs from the configured model),
+   * then the fallback-invocation's configured model (`INVOKED_MODEL`
+   * metadata), then the subagent config's `clientOptions` model.
+   */
+  model?: string;
+  /**
+   * Provider that actually served this call — the SDK `Providers` enum
+   * value stamped per-invocation by `attemptInvoke` (`INVOKED_PROVIDER`
+   * metadata), so fallback-served calls are attributed to the fallback
+   * provider, not the configured primary. Falls back to the subagent
+   * config's provider. Never LangSmith's `ls_provider` string — derived
+   * providers inherit that from their base class, and hosts key
+   * pricing/cache semantics off the enum.
+   */
+  provider?: string;
+  /** Subagent `type` identifier from the SubagentConfig. */
+  subagentType: string;
+  /** Child run ID (unique per subagent execution). */
+  subagentRunId: string;
+  /** Child agent ID assigned to this subagent execution. */
+  subagentAgentId: string;
+  /**
+   * ROOT run ID of the host run that owns billing. For nested subagents
+   * each forwarding layer rewrites this upward, so events from any depth
+   * surface with the outermost run's ID — never an intermediate
+   * `*_sub_*` child id (use {@link subagentRunId} to identify the
+   * emitting child).
+   */
+  runId: string;
+}
+
+/**
+ * Host-provided callback receiving {@link SubagentUsageEvent}s. Invoked as
+ * each child model call completes. May return a promise — the executor
+ * awaits each dispatch (so all usage is recorded before the child's result
+ * resolves to the parent) and swallows both synchronous throws and
+ * rejections; implementations should still be cheap, as they sit on the
+ * child's model-call path.
+ */
+export type SubagentUsageSink = (
+  event: SubagentUsageEvent
+) => void | Promise<void>;
+
+export type LangfuseToolOutputTracingConfig = {
+  /**
+   * Whether tool outputs should be exported to Langfuse. Defaults to
+   * `true`. Set to `false` to keep tool spans and redact their output.
+   */
+  enabled?: boolean;
+  /**
+   * Optional allowlist of tool names whose outputs should be redacted even
+   * when `enabled` is true.
+   */
+  redactedToolNames?: string[];
+  /**
+   * Match strategy for `redactedToolNames`. Defaults to `exact`; use
+   * `partial` to redact tools whose names contain a configured value.
+   */
+  redactedToolNameMatchMode?: 'exact' | 'partial';
+  /** Replacement text used for redacted tool outputs. */
+  redactionText?: string;
+};
+
+export type LangfuseToolNodeTracingConfig = {
+  /**
+   * Overrides ToolNode callback tracing. ToolNode spans are exported by the
+   * env-backed Langfuse callback, so this only enables tracing when that
+   * callback is configured.
+   */
+  enabled?: boolean;
+};
+
+export interface LangfuseConfig {
+  enabled?: boolean;
+  publicKey?: string;
+  secretKey?: string;
+  baseUrl?: string;
+  metadata?: Record<string, string | number | boolean | null | undefined>;
+  tags?: string[];
+  toolNodeTracing?: LangfuseToolNodeTracingConfig;
+  toolOutputTracing?: LangfuseToolOutputTracingConfig;
+  /**
+   * When true, derive the run's root Langfuse trace id deterministically from
+   * its `runId` (`sha256(runId)` → 32 hex chars, matching `@langfuse/tracing`
+   * `createTraceId`) instead of a random id. This lets external systems attach
+   * scores or observations to the trace afterwards by regenerating the same id
+   * from the run/message id, without a trace lookup. Default: random ids.
+   */
+  deterministicTraceId?: boolean;
+}
+
 export interface AgentInputs {
   agentId: string;
   /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
@@ -396,10 +558,14 @@ export interface AgentInputs {
   toolMap?: ToolMap;
   tools?: GraphTools;
   provider: Providers;
+  /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;
   maxContextTokens?: number;
   clientOptions?: ClientOptions;
+  /** Per-agent Langfuse tracing configuration. */
+  langfuse?: LangfuseConfig;
+  /** Dynamic system tail appended after stable instructions without provider cache markers. */
   additional_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
@@ -427,12 +593,16 @@ export interface AgentInputs {
   summarizationEnabled?: boolean;
   summarizationConfig?: SummarizationConfig;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Injected into the system message via AgentContext.buildInstructionsString(). */
+   *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;
   /** Pre-computed tool schema token count (from cache). Skips recalculation when provided. */
   toolSchemaTokens?: number;
+  /** Subagent configurations for hierarchical delegation. Each defines a child agent type. */
+  subagentConfigs?: SubagentConfig[];
+  /** Maximum subagent nesting depth. Default 1 means top-level agents can spawn subagents but subagents cannot nest further. */
+  maxSubagentDepth?: number;
 }
 
 export interface ContextPruningConfig {

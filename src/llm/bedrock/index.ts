@@ -22,18 +22,24 @@
  */
 
 import { ChatBedrockConverse } from '@langchain/aws';
-import { ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
+import {
+  ConverseStreamCommand,
+  type GuardrailConfiguration,
+  type GuardrailStreamConfiguration,
+} from '@aws-sdk/client-bedrock-runtime';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
-import type { BaseMessage } from '@langchain/core/messages';
 import {
   convertToConverseMessages,
+  createConverseToolUseStopChunk,
   handleConverseStreamContentBlockStart,
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
 } from './utils';
+import { insertBedrockToolCachePoint } from './toolCache';
 
 /**
  * Service tier type for Bedrock invocations.
@@ -42,6 +48,9 @@ import {
  */
 export type ServiceTierType = 'priority' | 'default' | 'flex' | 'reserved';
 
+export type CustomGuardrailConfiguration = GuardrailConfiguration &
+  Pick<GuardrailStreamConfiguration, 'streamProcessingMode'>;
+
 /**
  * Extended input interface with additional features:
  * - applicationInferenceProfile: Use an inference profile ARN instead of model ID
@@ -49,6 +58,17 @@ export type ServiceTierType = 'priority' | 'default' | 'flex' | 'reserved';
  */
 export interface CustomChatBedrockConverseInput
   extends ChatBedrockConverseInput {
+  /**
+   * Enables Bedrock prompt cache checkpoints for message and tool prefixes.
+   */
+  promptCache?: boolean;
+
+  /**
+   * Guardrail configuration for Converse and ConverseStream invocations.
+   * `streamProcessingMode` is only used by ConverseStream.
+   */
+  guardrailConfig?: CustomGuardrailConfiguration;
+
   /**
    * Application Inference Profile ARN to use for the model.
    * For example, "arn:aws:bedrock:eu-west-1:123456789102:application-inference-profile/fm16bt65tzgx"
@@ -80,9 +100,15 @@ export interface CustomChatBedrockConverseInput
  */
 export interface CustomChatBedrockConverseCallOptions {
   serviceTier?: ServiceTierType;
+  guardrailConfig?: CustomGuardrailConfiguration;
 }
 
 export class CustomChatBedrockConverse extends ChatBedrockConverse {
+  /**
+   * Whether to insert Bedrock prompt cache checkpoints when available.
+   */
+  promptCache?: boolean;
+
   /**
    * Application Inference Profile ARN to use instead of model ID.
    */
@@ -95,6 +121,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
   constructor(fields?: CustomChatBedrockConverseInput) {
     super(fields);
+    this.promptCache = fields?.promptCache;
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
   }
@@ -120,12 +147,17 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     serviceTier?: { type: ServiceTierType };
   } {
     const baseParams = super.invocationParams(options);
+    const toolConfig =
+      this.promptCache === true
+        ? insertBedrockToolCachePoint(baseParams.toolConfig, true)
+        : baseParams.toolConfig;
 
     /** Service tier from options or fall back to class-level setting */
     const serviceTierType = options?.serviceTier ?? this.serviceTier;
 
     return {
       ...baseParams,
+      toolConfig,
       serviceTier: serviceTierType ? { type: serviceTierType } : undefined,
     };
   }
@@ -193,6 +225,15 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     }
 
     const seenBlockIndices = new Set<number>();
+    const toolUseBlockIndices = new Set<number>();
+    /**
+     * Guardrails can reject an already-streamed toolUse block at
+     * `messageStop` (`guardrail_intervened`), after `contentBlockStop` has
+     * passed. Only emit eager-execution seals when no guardrails are
+     * configured, so a later intervention can't race an eagerly started tool.
+     */
+    const sealToolUseOnStop =
+      options.guardrailConfig == null && this.guardrailConfig == null;
 
     for await (const event of response.stream) {
       if (event.contentBlockStart != null) {
@@ -203,8 +244,23 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           const idx = event.contentBlockStart.contentBlockIndex;
           if (idx != null) {
             seenBlockIndices.add(idx);
+            if (event.contentBlockStart.start?.toolUse != null) {
+              toolUseBlockIndices.add(idx);
+            }
           }
           yield this.enrichChunk(startChunk, seenBlockIndices);
+
+          // Registered stream handlers receive chunks through callback
+          // events, not the yielded generator — dispatch the start chunk so
+          // they see the tool call's id/name (eager chunk state needs both).
+          await runManager?.handleLLMNewToken(
+            startChunk.text,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { chunk: startChunk }
+          );
         }
       } else if (event.contentBlockDelta != null) {
         const deltaChunk = handleConverseStreamContentBlockDelta(
@@ -232,13 +288,28 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         const stopIdx = event.contentBlockStop.contentBlockIndex;
         if (stopIdx != null) {
           seenBlockIndices.add(stopIdx);
+          if (sealToolUseOnStop && toolUseBlockIndices.has(stopIdx)) {
+            // Converse guarantees the block's input is complete at stop, so
+            // emit an explicit seal chunk for eager tool execution — through
+            // the callback path too, for registered stream handlers.
+            const sealChunk = createConverseToolUseStopChunk(stopIdx);
+            yield sealChunk;
+            await runManager?.handleLLMNewToken(
+              sealChunk.text,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              { chunk: sealChunk }
+            );
+          }
         }
       } else {
         yield new ChatGenerationChunk({
           text: '',
           message: new AIMessageChunk({
             content: '',
-            response_metadata: event,
+            response_metadata: { ...event } as ResponseMetadata,
           }),
         });
       }
