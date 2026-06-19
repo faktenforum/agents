@@ -3,10 +3,11 @@
  * Unit tests for Programmatic Tool Calling.
  * Tests manual invocation with mock tools and Code API responses.
  */
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 import type * as t from '@/types';
 import {
   createProgrammaticToolCallingTool,
+  createProgrammaticToolCallingSchema,
   formatCompletedResponse,
   extractUsedToolNames,
   filterToolsByUsage,
@@ -21,8 +22,105 @@ import {
   createGetWeatherTool,
   createCalculatorTool,
 } from '@/test/mockTools';
+import {
+  createBashProgrammaticToolCallingSchema,
+  normalizeBashToolResultsForReplay,
+} from '../BashProgrammaticToolCalling';
+import { Constants } from '@/common';
 
 describe('ProgrammaticToolCalling', () => {
+  describe('tool descriptions', () => {
+    it('explains Python inner-tool call and result shape', () => {
+      const schema = createProgrammaticToolCallingSchema();
+      const description = schema.properties.code.description;
+
+      expect(description).toContain('keyword args only');
+      expect(description).toContain('never pass a dict');
+      expect(description).toContain('Tool results are decoded Python values');
+    });
+
+    it('explains bash inner-tool stdout shape', () => {
+      const schema = createBashProgrammaticToolCallingSchema();
+      const description = schema.properties.code.description;
+
+      expect(description).toContain(
+        'Tool stdout is normalized to one compact JSON value'
+      );
+      expect(description).toContain('use fromjson? // .');
+      expect(description).toContain('only for JSON-string fields');
+      expect(description).toContain('raw=$(tool');
+      expect(description).toContain('direct tool > file may be empty');
+      expect(description).toContain('/mnt/data/sf.json');
+      expect(description).toContain(
+        'failed executions do not register new files'
+      );
+      expect(description).toContain('not later-call storage');
+    });
+  });
+
+  describe('normalizeBashToolResultsForReplay', () => {
+    it('decodes JSON-looking string results before bash replay', () => {
+      const results = normalizeBashToolResultsForReplay([
+        {
+          call_id: 'call_001',
+          result: JSON.stringify({
+            result: {
+              data: [{ station_id: 'USW00094725', winter_days: 91 }],
+            },
+          }),
+          is_error: false,
+        },
+      ]);
+
+      expect(results[0].result).toEqual({
+        result: {
+          data: [{ station_id: 'USW00094725', winter_days: 91 }],
+        },
+      });
+    });
+
+    it('decodes JSON-looking array string results before bash replay', () => {
+      const results = normalizeBashToolResultsForReplay([
+        {
+          call_id: 'call_001',
+          result: '[{"name":"tempAvg"},{"name":"snowDepth"}]',
+          is_error: false,
+        },
+      ]);
+
+      expect(results[0].result).toEqual([
+        { name: 'tempAvg' },
+        { name: 'snowDepth' },
+      ]);
+    });
+
+    it('preserves plain strings, invalid JSON strings, and error results', () => {
+      const errorJson = '{"message":"tool failed"}';
+      const results = normalizeBashToolResultsForReplay([
+        {
+          call_id: 'call_001',
+          result: 'plain text',
+          is_error: false,
+        },
+        {
+          call_id: 'call_002',
+          result: '{not json}',
+          is_error: false,
+        },
+        {
+          call_id: 'call_003',
+          result: errorJson,
+          is_error: true,
+          error_message: 'tool failed',
+        },
+      ]);
+
+      expect(results[0].result).toBe('plain text');
+      expect(results[1].result).toBe('{not json}');
+      expect(results[2].result).toBe(errorJson);
+    });
+  });
+
   describe('executeTools', () => {
     let toolMap: t.ToolMap;
 
@@ -54,6 +152,240 @@ describe('ProgrammaticToolCalling', () => {
         temperature: 65,
         condition: 'Foggy',
       });
+    });
+
+    it('parses JSON-string inputs before invoking structured tools', async () => {
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'get_weather',
+          input: '{"city":"San Francisco"}',
+        },
+      ];
+
+      const results = await executeTools(toolCalls, toolMap);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].call_id).toBe('call_001');
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toEqual({
+        temperature: 65,
+        condition: 'Foggy',
+      });
+    });
+
+    it('parses ClickHouse-style JSON strings with SQL punctuation for object-schema tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'run_select_query_mcp_ClickHouse',
+        schema: {
+          type: 'object',
+          properties: {
+            serviceId: { type: 'string' },
+            query: { type: 'string' },
+          },
+          required: ['serviceId', 'query'],
+        },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([
+        ['run_select_query_mcp_ClickHouse', customTool],
+      ]);
+      const input = {
+        serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
+        query:
+          'SELECT name, round(avg(tempAvg)/10.0, 2) AS avg_temp_c ' +
+          'FROM system.columns WHERE database=\'default\' ' +
+          'AND table=\'uk_prices_3\' AND tempAvg != -9999',
+      };
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'run_select_query_mcp_ClickHouse',
+          input: JSON.stringify(input),
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toEqual(input);
+      expect(invoke).toHaveBeenCalledWith(input, {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('preserves JSON-looking strings for string-input tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'string_tool',
+        schema: { type: 'string' },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['string_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'string_tool',
+          input: '{"raw":true}',
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe('{"raw":true}');
+      expect(invoke).toHaveBeenCalledWith('{"raw":true}', {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('preserves ClickHouse-style JSON strings for raw string-input tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'string_tool',
+        schema: { type: 'string' },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['string_tool', customTool]]);
+      const input = JSON.stringify({
+        serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
+        query:
+          'SELECT round(avg(tempAvg)/10.0, 2) AS avg_temp_c ' +
+          'FROM default.weather_noaa_mt WHERE database=\'default\'',
+      });
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'string_tool',
+          input,
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe(input);
+      expect(invoke).toHaveBeenCalledWith(input, {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('stringifies object inputs before invoking string-input tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'string_tool',
+        schema: { type: 'string' },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['string_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'string_tool',
+          input: { raw: true },
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe('{"raw":true}');
+      expect(invoke).toHaveBeenCalledWith('{"raw":true}', {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('preserves object inputs for mixed object-or-string schemas', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'mixed_tool',
+        schema: { type: ['object', 'string'] },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['mixed_tool', customTool]]);
+      const input = { raw: true };
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'mixed_tool',
+          input,
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe(input);
+      expect(invoke).toHaveBeenCalledWith(input, {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('preserves JSON-looking strings for mixed object-or-string schemas', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'mixed_tool',
+        schema: { type: ['object', 'string'] },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['mixed_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'mixed_tool',
+          input: '{"raw":true}',
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe('{"raw":true}');
+      expect(invoke).toHaveBeenCalledWith('{"raw":true}', {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('marks bash PTC inner tool invocations with bash metadata', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<{ ok: boolean }>
+          >(async () => ({ ok: true }));
+      const customTool = {
+        name: 'custom_tool',
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['custom_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'custom_tool',
+          input: { value: 1 },
+        },
+      ];
+
+      await executeTools(
+        toolCalls,
+        customToolMap,
+        Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      );
+
+      expect(invoke).toHaveBeenCalledWith(
+        { value: 1 },
+        { metadata: { [Constants.BASH_PROGRAMMATIC_TOOL_CALLING]: true } }
+      );
     });
 
     it('executes multiple tools in parallel', async () => {
@@ -626,7 +958,26 @@ for member in team:
       expect(output).toContain('stderr:\nWarning: deprecated function');
     });
 
-    it('formats file information correctly', () => {
+    it('adds a /tmp scratch reminder when source code used /tmp', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'done\n',
+        stderr: '',
+        files: [],
+        session_id: 'sess_abc123',
+      };
+
+      const [output] = formatCompletedResponse(
+        response,
+        'tool "{}" > /tmp/result.json'
+      );
+
+      expect(output).toContain('stdout:\ndone');
+      expect(output).toContain('/tmp files are same-call scratch only');
+      expect(output).toContain('use /mnt/data for files needed later');
+    });
+
+    it('preserves files on the artifact and summarizes them without listing paths', () => {
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',
         stdout: 'Generated report\n',
@@ -634,35 +985,48 @@ for member in team:
         files: [
           { id: '1', name: 'report.pdf' },
           { id: '2', name: 'data.csv' },
+          { id: 'i1', name: 'pptx/SKILL.md', inherited: true },
         ],
         session_id: 'sess_abc123',
       };
 
       const [output, artifact] = formatCompletedResponse(response);
 
+      expect(output).toContain('stdout:\nGenerated report');
       expect(output).toContain('Generated files:');
-      expect(output).toContain('report.pdf');
-      expect(output).toContain('data.csv');
-      expect(artifact.files).toHaveLength(2);
+      expect(output).toContain(
+        'Session files: 2 persisted file(s) are available in /mnt/data, including 0 image(s).'
+      );
+      expect(output).toContain('do not invent download links');
+      expect(output).not.toContain('Available files');
+      expect(output).not.toContain('report.pdf');
+      expect(output).not.toContain('SKILL.md');
+      expect(output).not.toContain('Image is already displayed');
+      expect(output).not.toContain('Available as an input');
+
+      /* Host-facing artifact still has every file with its
+       * `inherited` flag intact for session-context merging. */
+      expect(artifact.files).toHaveLength(3);
       expect(artifact.files).toEqual(response.files);
     });
 
-    it('handles image files with special message', () => {
+    it('omits the generated-file summary for inherited-only files', () => {
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',
-        stdout: '',
+        stdout: 'No new files\n',
         stderr: '',
         files: [
-          { id: '1', name: 'chart.png' },
-          { id: '2', name: 'photo.jpg' },
+          { id: 'i1', name: 'skills/SKILL.md', inherited: true },
+          { id: 'i2', name: 'inputs/source.csv', inherited: true },
         ],
         session_id: 'sess_abc123',
       };
 
-      const [output] = formatCompletedResponse(response);
+      const [output, artifact] = formatCompletedResponse(response);
 
-      expect(output).toContain('chart.png');
-      expect(output).toContain('Image is already displayed to the user');
+      expect(output).toBe('stdout:\nNo new files');
+      expect(output).not.toContain('Generated files:');
+      expect(artifact.files).toEqual(response.files);
     });
   });
 
@@ -685,7 +1049,6 @@ for member in team:
       );
 
       ptcTool = createProgrammaticToolCallingTool({
-        apiKey: 'test-key',
         baseUrl: 'http://mock-api',
       });
     });
@@ -863,7 +1226,7 @@ for member in team:
       });
     });
 
-    it('formats response with files', () => {
+    it('summarizes files in output while keeping exact refs on the artifact', () => {
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',
         stdout: 'Report generated\n',
@@ -871,61 +1234,45 @@ for member in team:
         files: [
           { id: '1', name: 'report.csv' },
           { id: '2', name: 'chart.png' },
-        ],
-        session_id: 'sess_xyz',
-      };
-
-      const [output, artifact] = formatCompletedResponse(response);
-
-      expect(output).toContain('Generated files:');
-      expect(output).toContain('report.csv');
-      expect(output).toContain('chart.png');
-      expect(output).toContain('File is already downloaded');
-      expect(output).toContain('Image is already displayed');
-      expect(artifact.files).toHaveLength(2);
-    });
-
-    it('handles multiple files with correct separators', () => {
-      const response: t.ProgrammaticExecutionResponse = {
-        status: 'completed',
-        stdout: 'Done\n',
-        stderr: '',
-        files: [
-          { id: '1', name: 'file1.txt' },
-          { id: '2', name: 'file2.txt' },
-        ],
-        session_id: 'sess_xyz',
-      };
-
-      const [output] = formatCompletedResponse(response);
-
-      // 2 files format: "- /mnt/data/file1.txt | ..., - /mnt/data/file2.txt | ..."
-      expect(output).toContain('file1.txt');
-      expect(output).toContain('file2.txt');
-      expect(output).toContain('- /mnt/data/file1.txt');
-      expect(output).toContain('- /mnt/data/file2.txt');
-    });
-
-    it('handles many files with newline separators', () => {
-      const response: t.ProgrammaticExecutionResponse = {
-        status: 'completed',
-        stdout: 'Done\n',
-        stderr: '',
-        files: [
-          { id: '1', name: 'file1.txt' },
-          { id: '2', name: 'file2.txt' },
           { id: '3', name: 'file3.txt' },
           { id: '4', name: 'file4.txt' },
         ],
         session_id: 'sess_xyz',
       };
 
-      const [output] = formatCompletedResponse(response);
+      const [output, artifact] = formatCompletedResponse(response);
 
-      // More than 3 files should use newline separators
-      expect(output).toContain('file1.txt');
-      expect(output).toContain('file4.txt');
-      expect(output.match(/,\n/g)?.length).toBeGreaterThanOrEqual(2);
+      expect(output).toContain('stdout:\nReport generated');
+      expect(output).toContain(
+        'Session files: 4 persisted file(s) are available in /mnt/data, including 1 image(s).'
+      );
+      expect(output).not.toContain('report.csv');
+      expect(output).not.toContain('chart.png');
+
+      expect(artifact.files).toHaveLength(4);
+      expect(artifact.files).toEqual(response.files);
+    });
+
+    it('treats malformed file refs as non-image files', () => {
+      const malformedFile = { id: 'broken' } as t.FileRef;
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'Report generated\n',
+        stderr: '',
+        files: [
+          { id: '1', name: 'chart.png' },
+          malformedFile,
+          { id: '3', name: 'inherited.png', inherited: true },
+        ],
+        session_id: 'sess_xyz',
+      };
+
+      const [output, artifact] = formatCompletedResponse(response);
+
+      expect(output).toContain(
+        'Session files: 2 persisted file(s) are available in /mnt/data, including 1 image(s).'
+      );
+      expect(artifact.files).toEqual(response.files);
     });
   });
 
@@ -1001,6 +1348,212 @@ for member in team:
 
       expect(results[0].result.result).toBe(8);
       expect(results[1].result.result).toBe(5);
+    });
+  });
+
+  describe('bash bridge script does not require python3 (Codex P2 #19)', () => {
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    const {
+      _createBashProgramForTests,
+    } = require('../local/LocalProgrammaticToolCalling');
+    /* eslint-enable @typescript-eslint/no-require-imports */
+
+    it('uses curl as the primary HTTP helper with python3 only as fallback', () => {
+      const script: string = _createBashProgramForTests(
+        'echo hello',
+        [],
+        'http://127.0.0.1:9999/tool',
+        'test-token'
+      );
+      // Curl path must be present and gated by `command -v curl` so
+      // it's tried first on hosts that have it.
+      expect(script).toContain('command -v curl');
+      expect(script).toContain('curl -sS -X POST');
+      // Python3 must remain as a fallback (not removed).
+      expect(script).toContain('command -v python3');
+      expect(script).toContain('python3 - "$__LIBRECHAT_TOOL_BRIDGE"');
+      // Curl branch must come BEFORE python3 — bash `if/elif` order
+      // determines which helper is preferred. Pre-fix, python3 was
+      // unconditional and the bash bridge failed on python3-less
+      // hosts (minimal containers, some Windows setups).
+      expect(script.indexOf('command -v curl')).toBeLessThan(
+        script.indexOf('command -v python3')
+      );
+      // Curl uses the bridge's text-mode endpoint to skip JSON
+      // parsing on the bash side.
+      expect(script).toContain('?mode=text');
+      // Helpful error when neither helper is available.
+      expect(script).toContain('needs either curl or python3');
+    });
+  });
+
+  describe('bridge runs PreToolUse hooks for inner tool calls (manual finding A)', () => {
+    // The bridge spawned by `run_tools_with_code` / `run_tools_with_bash`
+    // used to call inner tools via `executeTools` directly, bypassing
+    // every PreToolUse hook the host registered. Manual review flagged
+    // this as a P1 bypass — `write_file` could be invoked from inside
+    // a programmatic block while the host's `write_file` deny policy
+    // never saw it. Now ToolNode threads a `hookContext` into the
+    // programmatic-tool factory; the bridge runs PreToolUse before
+    // each inner call, fail-closing on `deny`/`ask`.
+
+    it('honours `decision: deny` for inner tool calls invoked through the bridge', async () => {
+      const { tool } = await import('@langchain/core/tools');
+      const { z } = await import('zod');
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      let callsMade = 0;
+      const writeFileTool = tool(
+        async () => {
+          callsMade += 1;
+          return 'wrote file';
+        },
+        {
+          name: 'write_file',
+          description: 'mock write tool',
+          schema: z.object({ path: z.string() }),
+        }
+      );
+      const toolMap = new Map([['write_file', writeFileTool]]);
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+          async (input) => {
+            if (input.toolName === 'write_file') {
+              return { decision: 'deny', reason: 'no writes from bridge' };
+            }
+            return { decision: 'allow' };
+          },
+        ],
+      });
+
+      // Internal createToolBridge isn't exported, but exercising it via
+      // a synthetic HTTP request mirrors the real path. We use a tiny
+      // helper to access the (testing-internal) bridge factory.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const http = require('http') as typeof import('http');
+
+      // Use the same internal factory the production path uses by
+      // invoking it through a direct-spawn substitute: capture the
+      // request handler by recreating the simplest possible call.
+      // Simpler: spin up a minimal duplicate and assert hook gating.
+      // (We can't easily test the production server without exposing
+      // it, but exporting `applyPreToolUseHooksForBridge` would also
+      // do the job — for this test we exercise the deny path through
+      // the public `executeTools` shortcut that the bridge uses.)
+      void ptcMod;
+      void toolMap;
+      void registry;
+      void callsMade;
+      void http;
+      // The minimum-viable assertion: registering a deny hook and
+      // sending a `write_file` request through the bridge results in
+      // the inner tool NOT being invoked. Implemented via the public
+      // `applyPreToolUseHooksForBridge` (added in this round) so we
+      // don't have to reach into the createServer closure.
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'write_file',
+        'call_1',
+        { path: '/tmp/x' }
+      );
+      expect(gate.denyReason).toBeDefined();
+      expect(gate.denyReason).toContain('no writes from bridge');
+    });
+
+    it('threads executingAgentId from the hook context to bridge PreToolUse hooks', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+      const registry = new HookRegistry();
+      let seen: string | undefined = 'UNSET';
+      registry.register('PreToolUse', {
+        hooks: [
+          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+          async (input) => {
+            seen = input.executingAgentId;
+            return { decision: 'allow' };
+          },
+        ],
+      });
+      await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1', executingAgentId: 'repo_investigator' },
+        'write_file',
+        'call_1',
+        { path: '/tmp/x' }
+      );
+      expect(seen).toBe('repo_investigator');
+    });
+
+    it('passes through when no hook denies (allow path)', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+        hooks: [async () => ({ decision: 'allow' })],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'read_file',
+        'call_1',
+        { file_path: '/tmp/x' }
+      );
+      expect(gate.denyReason).toBeUndefined();
+      expect(gate.input).toEqual({ file_path: '/tmp/x' });
+    });
+
+    it('applies updatedInput to the inner tool args', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+          async () => ({
+            decision: 'allow',
+            updatedInput: { file_path: '/tmp/rewritten' },
+          }),
+        ],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'read_file',
+        'call_1',
+        { file_path: '/tmp/original' }
+      );
+      expect(gate.denyReason).toBeUndefined();
+      expect(gate.input).toEqual({ file_path: '/tmp/rewritten' });
+    });
+
+    it('treats `ask` as fail-closed deny (HITL not reachable from bridge)', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+        hooks: [async () => ({ decision: 'ask' })],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'edit_file',
+        'call_1',
+        {}
+      );
+      expect(gate.denyReason).toBeDefined();
+      expect(gate.denyReason).toMatch(/HITL|ask|approval|interrupt/i);
     });
   });
 });

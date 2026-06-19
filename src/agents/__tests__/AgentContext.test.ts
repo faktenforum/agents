@@ -1,9 +1,15 @@
 // src/agents/__tests__/AgentContext.test.ts
-import { AgentContext } from '../AgentContext';
-import { Providers } from '@/common';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { addBedrockCacheControl } from '@/messages/cache';
+import { Constants, Providers } from '@/common';
+import { AgentContext } from '../AgentContext';
 
 describe('AgentContext', () => {
+  type TestSystemContentBlock =
+    | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
+    | { cachePoint: { type: 'default' } };
+
   type ContextOptions = {
     agentConfig?: Partial<t.AgentInputs>;
     tokenCounter?: t.TokenCounter;
@@ -59,14 +65,688 @@ describe('AgentContext', () => {
       expect(ctx.systemRunnable).toBeUndefined();
     });
 
-    it('includes additional_instructions in system message', () => {
+    it('keeps additional_instructions after stable instructions', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base instructions',
           additional_instructions: 'Additional instructions',
         },
       });
-      expect(ctx.systemRunnable).toBeDefined();
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe(
+        'Base instructions\n\nAdditional instructions'
+      );
+    });
+
+    it('moves Anthropic dynamic instructions behind stable history', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+        new HumanMessage('Second'),
+      ]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text: 'Stable instructions',
+          cache_control: { type: 'ephemeral' },
+        },
+      ]);
+      expect(result[1].content).toBe('Hello');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('places Anthropic dynamic instructions before a single latest user prompt', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Latest'),
+      ]);
+
+      expect(result[1].content).toBe('Dynamic instructions');
+      expect(result[2].content).toBe('Latest');
+    });
+
+    it('omits Anthropic cache control when only dynamic system text exists', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([{ type: 'text', text: 'Dynamic only' }]);
+      expect(content[0]).not.toHaveProperty('cache_control');
+    });
+
+    it('keeps cross-run summaries in the dynamic Anthropic tail', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setInitialSummary('Prior summary', 13);
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toHaveLength(1);
+      expect(content[0]).toHaveProperty('cache_control');
+      expect(result[1].content).toBe(
+        '## Conversation Summary\n\nPrior summary'
+      );
+    });
+
+    it('places the Bedrock cache point before dynamic system text', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([
+        { type: 'text', text: 'Stable instructions' },
+        { cachePoint: { type: 'default' } },
+        { type: 'text', text: 'Dynamic instructions' },
+      ]);
+    });
+
+    it('uses plain Bedrock system text when only dynamic system text exists', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe('Dynamic only');
+    });
+
+    it('keeps non-cache providers as plain system text with promptCache-like options', async () => {
+      const clientOptions: t.OpenAIClientOptions & { promptCache: true } = {
+        modelName: 'gpt-4o-mini',
+        promptCache: true,
+      };
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENAI,
+          clientOptions,
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe(
+        'Stable instructions\n\nDynamic instructions'
+      );
+    });
+
+    it('moves OpenRouter dynamic instructions behind stable history', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+        new HumanMessage('Second'),
+      ]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text: 'Stable instructions',
+          cache_control: { type: 'ephemeral' },
+        },
+      ]);
+      expect(result[1].content).toBe('Hello');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('keeps dynamic-only OpenRouter instructions as system text', async () => {
+      const tokenCounter = (msg: { content: unknown }): number => {
+        const content =
+          typeof msg.content === 'string'
+            ? msg.content
+            : JSON.stringify(msg.content);
+        return content.length;
+      };
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+        tokenCounter,
+      });
+
+      ctx.initializeSystemRunnable();
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+      const secondContent = result[2].content as TestSystemContentBlock[];
+
+      expect(result).toHaveLength(3);
+      expect(result[0].content).toBe('Dynamic only');
+      expect(result[1].content).toBe('First');
+      expect(secondContent[0]).toMatchObject({
+        type: 'text',
+        text: 'Second',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(ctx.systemMessageTokens).toBeGreaterThan(0);
+      expect(ctx.dynamicInstructionTokens).toBe(0);
+      expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
+    });
+
+    it('does not cache OpenRouter body messages after dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-2.5-flash',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+
+      expect(result[1].content).toBe('First');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('keeps the first OpenRouter user message before single-turn dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Latest'),
+      ]);
+
+      expect(result[1].content).toBe('Latest');
+      expect(result[2].content).toBe('Dynamic instructions');
+    });
+
+    it('caches stable Anthropic history before dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new AIMessage('Stable assistant history'),
+        new HumanMessage('Latest'),
+      ]);
+      const stableHistory = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First');
+      expect(stableHistory[0]).toMatchObject({
+        type: 'text',
+        text: 'Stable assistant history',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Latest');
+    });
+
+    it('keeps Anthropic dynamic instructions attached to the latest user turn during tool follow-up', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+
+      expect(result[1].content).toBe('Dynamic instructions');
+      expect(result[2].content).toBe('Use the tool');
+      expect((result[3] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[4].getType()).toBe('tool');
+    });
+
+    it('keeps Anthropic stable history cacheable before dynamic tool-follow-up context', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Earlier'),
+        new AIMessage('Earlier assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+      const stableAssistant = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('Earlier');
+      expect(stableAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'Earlier assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Use the tool');
+      expect((result[5] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[6].getType()).toBe('tool');
+    });
+
+    it('keeps Anthropic dynamic context on latest no-tool turn after mixed prior turns', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First turn, no tools'),
+        new AIMessage('First assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+        new AIMessage('4'),
+        new HumanMessage('Now answer without tools'),
+      ]);
+      const firstAssistant = result[2].content as TestSystemContentBlock[];
+      const toolAnswer = result[6].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First turn, no tools');
+      expect(firstAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'First assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Use the tool');
+      expect((result[4] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[5].getType()).toBe('tool');
+      expect(toolAnswer[0]).toMatchObject({
+        type: 'text',
+        text: '4',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[7].content).toBe('Dynamic instructions');
+      expect(result[8].content).toBe('Now answer without tools');
+    });
+
+    it('caches stable OpenRouter history before dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new AIMessage('Stable assistant history'),
+        new HumanMessage('Latest'),
+      ]);
+      const stableHistory = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First');
+      expect(stableHistory[0]).toMatchObject({
+        type: 'text',
+        text: 'Stable assistant history',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Latest');
+    });
+
+    it('keeps OpenRouter opening user message before dynamic tool-follow-up context', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+
+      expect(result[1].content).toBe('Use the tool');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect((result[3] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[4].getType()).toBe('tool');
+    });
+
+    it('keeps OpenRouter stable history cacheable before dynamic tool-follow-up context', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Earlier'),
+        new AIMessage('Earlier assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+      const stableAssistant = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('Earlier');
+      expect(stableAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'Earlier assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Use the tool');
+      expect((result[5] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[6].getType()).toBe('tool');
+    });
+
+    it('keeps OpenRouter dynamic context on latest no-tool turn after mixed prior turns', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First turn, no tools'),
+        new AIMessage('First assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+        new AIMessage('4'),
+        new HumanMessage('Now answer without tools'),
+      ]);
+      const firstAssistant = result[2].content as TestSystemContentBlock[];
+      const toolAnswer = result[6].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First turn, no tools');
+      expect(firstAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'First assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Use the tool');
+      expect((result[4] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[5].getType()).toBe('tool');
+      expect(toolAnswer[0]).toMatchObject({
+        type: 'text',
+        text: '4',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[7].content).toBe('Dynamic instructions');
+      expect(result[8].content).toBe('Now answer without tools');
+    });
+
+    it('adds a single OpenRouter body cache point on the tail when there is no dynamic tail', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-3.1-pro-preview',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+      const secondContent = result[2].content as TestSystemContentBlock[];
+      expect(result[1].content).toBe('First');
+      expect(secondContent[0]).toHaveProperty('cache_control');
+    });
+
+    it('places OpenRouter user-message summaries after the first stable message', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-3.1-pro-preview',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setSummary('Rotating summary', 7);
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+
+      expect(result[1].content).toBe('First');
+      expect(result[2].content).toContain('Rotating summary');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('preserves the Bedrock system cache point through message cache-control pass', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+      ]);
+      const finalMessages = addBedrockCacheControl(result);
+      expect(finalMessages[0].content).toEqual([
+        { type: 'text', text: 'Stable instructions' },
+        { cachePoint: { type: 'default' } },
+        { type: 'text', text: 'Dynamic instructions' },
+      ]);
     });
   });
 
@@ -156,7 +836,7 @@ describe('AgentContext', () => {
   });
 
   describe('buildProgrammaticOnlyToolsInstructions', () => {
-    it('includes code_execution-only tools in system message', () => {
+    it('includes code_execution-only tools in system message', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
           'programmatic_tool',
@@ -169,11 +849,44 @@ describe('AgentContext', () => {
       ]);
 
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Base', toolRegistry },
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
       });
 
       const runnable = ctx.systemRunnable;
       expect(runnable).toBeDefined();
+      const result = await runnable!.invoke([]);
+      expect(result[0].content).toContain('run_tools_with_bash');
+      expect(result[0].content).not.toContain('run_tools_with_code');
+    });
+
+    it('uses Python PTC guidance when only run_tools_with_code is available', async () => {
+      const toolRegistry: t.LCToolRegistry = new Map([
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            description: 'Only callable via code execution',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toContain('run_tools_with_code');
+      expect(result[0].content).toContain('Python code');
+      expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
     it('excludes direct-callable tools from programmatic section', () => {
@@ -374,6 +1087,351 @@ describe('AgentContext', () => {
       void ctx.systemRunnable;
 
       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
+    });
+
+    it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
+      const activeDef: t.LCTool = {
+        name: 'active_tool',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const deferredDef: t.LCTool = {
+        name: 'deferred_tool',
+        description: 'Loaded via tool search',
+        parameters: { type: 'object', properties: {} },
+        defer_loading: true,
+      };
+
+      const ctxBase = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef] },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithDeferred = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef, deferredDef] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithDeferred.tokenCalculationPromise;
+
+      expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('counts OpenRouter dynamic instructions outside the system message', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-3.1-pro-preview',
+            promptCache: true,
+          },
+          instructions: 'Stable',
+          additional_instructions: 'Dynamic tail',
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      ctx.initializeSystemRunnable();
+
+      expect(ctx.systemMessageTokens).toBeGreaterThan(0);
+      expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
+      expect(ctx.instructionTokens).toBe(
+        ctx.systemMessageTokens + ctx.dynamicInstructionTokens
+      );
+      expect(ctx.getTokenBudgetBreakdown().dynamicInstructionTokens).toBe(
+        ctx.dynamicInstructionTokens
+      );
+    });
+
+    it('clears OpenRouter dynamic instruction tokens when no prompt remains', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-3.1-pro-preview',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      ctx.setInitialSummary('Volatile summary', 8);
+      ctx.initializeSystemRunnable();
+      expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
+
+      ctx.instructions = undefined;
+      ctx.clearSummary();
+      ctx.initializeSystemRunnable();
+
+      expect(ctx.systemRunnable).toBeUndefined();
+      expect(ctx.systemMessageTokens).toBe(0);
+      expect(ctx.dynamicInstructionTokens).toBe(0);
+      expect(ctx.instructionTokens).toBe(0);
+    });
+
+    it('excludes programmatic-only toolDefinitions from toolSchemaTokens', async () => {
+      // getEventDrivenToolsForBinding excludes definitions whose
+      // allowed_callers omit 'direct'. Accounting must mirror that — a
+      // programmatic-only definition is never bound to the model and
+      // shouldn't inflate toolSchemaTokens.
+      const activeDef: t.LCTool = {
+        name: 'active_tool',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const programmaticDef: t.LCTool = {
+        name: 'programmatic_tool',
+        description: 'Only callable via code execution',
+        parameters: { type: 'object', properties: {} },
+        allowed_callers: ['code_execution'],
+      };
+
+      const ctxBase = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef] },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithProgrammatic = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef, programmaticDef] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithProgrammatic.tokenCalculationPromise;
+
+      expect(ctxWithProgrammatic.toolSchemaTokens).toBe(
+        ctxBase.toolSchemaTokens
+      );
+    });
+
+    it('excludes deferred-undiscovered instance tools from toolSchemaTokens', async () => {
+      const activeTool = createMockTool('active_tool');
+      const deferredTool = createMockTool('deferred_tool');
+      const programmaticTool = createMockTool('programmatic_tool');
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctxBase = createBasicContext({
+        agentConfig: { tools: [activeTool], toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithExcluded = createBasicContext({
+        agentConfig: {
+          tools: [activeTool, deferredTool, programmaticTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithExcluded.tokenCalculationPromise;
+
+      expect(ctxWithExcluded.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('includes deferred instance tools once discovered via discoveredTools input', async () => {
+      const tools = [createMockTool('deferred_tool')];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+      ]);
+
+      const ctxUndiscovered = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxDiscovered = createBasicContext({
+        agentConfig: {
+          tools,
+          toolRegistry,
+          discoveredTools: ['deferred_tool'],
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxUndiscovered.tokenCalculationPromise;
+      await ctxDiscovered.tokenCalculationPromise;
+
+      expect(ctxUndiscovered.toolSchemaTokens).toBe(0);
+      expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
+    });
+
+    it('does not filter instance tools in event-driven mode (matches getEventDrivenToolsForBinding)', async () => {
+      // In event-driven mode, getEventDrivenToolsForBinding appends
+      // `this.tools` UNFILTERED. Accounting must do the same — otherwise we
+      // under-count and risk exceeding the model's context budget.
+      const activeDef: t.LCTool = {
+        name: 'active_def',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const nativeTool = createMockTool('native_tool');
+      // Registry marks the native tool as deferred-undiscovered. In the
+      // non-event-driven path this would exclude it; in event-driven mode
+      // it is still bound and must still be counted.
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['native_tool', { name: 'native_tool', defer_loading: true }],
+      ]);
+
+      const ctxWithoutNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          tools: [nativeTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxWithoutNative.tokenCalculationPromise;
+      await ctxWithNative.tokenCalculationPromise;
+
+      expect(ctxWithNative.toolSchemaTokens).toBeGreaterThan(
+        ctxWithoutNative.toolSchemaTokens
+      );
+    });
+
+    it('includes deferred toolDefinitions once discovered via discoveredTools input', async () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred_tool',
+          description: 'Loaded via tool search',
+          parameters: { type: 'object', properties: {} },
+          defer_loading: true,
+        },
+      ];
+
+      const ctxUndiscovered = createBasicContext({
+        agentConfig: { toolDefinitions },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxDiscovered = createBasicContext({
+        agentConfig: { toolDefinitions, discoveredTools: ['deferred_tool'] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxUndiscovered.tokenCalculationPromise;
+      await ctxDiscovered.tokenCalculationPromise;
+
+      expect(ctxUndiscovered.toolSchemaTokens).toBe(0);
+      expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
+    });
+
+    it('getTokenBudgetBreakdown toolCount excludes deferred-undiscovered toolDefinitions', () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'active',
+          parameters: { type: 'object', properties: {} },
+        },
+        {
+          name: 'deferred',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} },
+        },
+      ];
+
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+    });
+
+    it('getTokenBudgetBreakdown toolCount excludes deferred-undiscovered instance tools', () => {
+      // Mirrors the toolDefinitions test for the instance-tools path so
+      // toolCount stays aligned with toolSchemaTokens (and with what
+      // getToolsForBinding actually emits) for non-event-driven runs.
+      const tools = [
+        createMockTool('active_tool'),
+        createMockTool('deferred_tool'),
+        createMockTool('programmatic_tool'),
+      ];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+      });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+      ctx.markToolsAsDiscovered(['deferred_tool']);
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
+    });
+
+    it('getTokenBudgetBreakdown toolCount reflects newly discovered deferred tools', () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} },
+        },
+      ];
+
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(0);
+      ctx.markToolsAsDiscovered(['deferred']);
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+    });
+
+    it('getTokenBudgetBreakdown toolCount includes graphTools', () => {
+      // graphTools (handoff/subagent) are bound to the model alongside
+      // instance tools. Now that toolCount derives from getToolsForBinding(),
+      // graphTools are reflected in the diagnostic just like they're
+      // counted in toolSchemaTokens. Locks in that alignment.
+      const ctx = createBasicContext({
+        agentConfig: { tools: [createMockTool('direct_tool')] },
+      });
+      ctx.graphTools = [createMockTool('handoff_tool')];
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
+    });
+
+    it('refreshes toolSchemaTokens and per-tool counts after markToolsAsDiscovered', async () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred',
+          description: 'Loaded via tool search',
+          parameters: { type: 'object', properties: {} },
+          defer_loading: true,
+        },
+      ];
+
+      const ctx = createBasicContext({
+        agentConfig: { toolDefinitions },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBe(0);
+      expect(ctx.toolTokenCounts).toEqual({});
+
+      ctx.markToolsAsDiscovered(['deferred']);
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBeGreaterThan(0);
+      expect(ctx.toolTokenCounts?.deferred).toBeGreaterThan(0);
+      expect(ctx.deferredToolNames).toContain('deferred');
     });
   });
 
@@ -1081,6 +2139,235 @@ describe('AgentContext', () => {
 
       // cache_creation (8000) > input_tokens (5) → additive
       expect(ctx.lastCallUsage!.inputTokens).toBe(8005);
+    });
+  });
+
+  describe('projectContextUsage', () => {
+    const countByChars = (msg: { content: unknown }): number => {
+      const content =
+        typeof msg.content === 'string'
+          ? msg.content
+          : JSON.stringify(msg.content);
+      return content.length;
+    };
+
+    const buildBranch = (
+      maxContextTokens: number,
+      perMessageTokens: number,
+      count: number,
+    ): { ctx: AgentContext; messages: AIMessage[] } => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = maxContextTokens;
+      const messages: AIMessage[] = [];
+      for (let i = 0; i < count; i++) {
+        // countByChars counts content length, and projectContextUsage recounts
+        // the supplied messages — so size content to the intended per-msg tokens.
+        const content = 'x'.repeat(perMessageTokens);
+        messages.push(
+          i % 2 === 0
+            ? (new HumanMessage(content) as unknown as AIMessage)
+            : new AIMessage(content),
+        );
+      }
+      return { ctx, messages };
+    };
+
+    it('returns null without a tokenizer or a window', () => {
+      const noCounter = createBasicContext({});
+      noCounter.maxContextTokens = 1000;
+      expect(noCounter.projectContextUsage([new HumanMessage('hi')])).toBeNull();
+
+      const noWindow = createBasicContext({ tokenCounter: countByChars });
+      noWindow.maxContextTokens = undefined;
+      expect(noWindow.projectContextUsage([new HumanMessage('hi')])).toBeNull();
+    });
+
+    it('keeps the whole branch and reports headroom when it fits', () => {
+      const { ctx, messages } = buildBranch(100_000, 1_000, 4);
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBe(4);
+      expect(usage!.breakdown.maxContextTokens).toBe(100_000);
+      expect(usage!.remainingContextTokens).toBeGreaterThan(0);
+      expect(usage!.breakdown.messageTokens).toBeGreaterThan(0);
+
+      const max = usage!.contextBudget ?? usage!.breakdown.maxContextTokens;
+      const used = max - (usage!.remainingContextTokens ?? 0);
+      expect(used).toBeLessThanOrEqual(max);
+    });
+
+    it('prunes older messages when the branch exceeds the window', () => {
+      const { ctx, messages } = buildBranch(3_000, 1_000, 6);
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBeGreaterThan(0);
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+      expect(usage!.remainingContextTokens).toBeGreaterThanOrEqual(0);
+
+      const max = usage!.contextBudget ?? usage!.breakdown.maxContextTokens;
+      expect(max - (usage!.remainingContextTokens ?? 0)).toBeLessThanOrEqual(max);
+    });
+
+    it('does not mutate the context (local pruner, no field writes)', () => {
+      const { ctx, messages } = buildBranch(3_000, 1_000, 6);
+      const mapBefore = { ...ctx.indexTokenCountMap };
+
+      expect(ctx.pruneMessages).toBeUndefined();
+      ctx.projectContextUsage(messages);
+
+      expect(ctx.pruneMessages).toBeUndefined();
+      expect(ctx.indexTokenCountMap).toEqual(mapBefore);
+    });
+
+    it('does not mutate the caller messages under context pressure', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 400;
+      const consumed = new ToolMessage({
+        content: 'x'.repeat(20_000),
+        tool_call_id: 't1',
+        name: 'tool',
+      });
+      const messages: AIMessage[] = [
+        new HumanMessage('question') as unknown as AIMessage,
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 't1', name: 'tool', args: {} }],
+        }),
+        consumed as unknown as AIMessage,
+        new AIMessage('final answer'),
+      ];
+      const originalRef = messages[2];
+      const originalContent = (messages[2] as unknown as ToolMessage).content;
+
+      ctx.projectContextUsage(messages);
+
+      expect(messages[2]).toBe(originalRef);
+      expect((messages[2] as unknown as ToolMessage).content).toBe(
+        originalContent,
+      );
+    });
+
+    it('recounts the supplied branch, ignoring a stale context token map', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 3_000;
+      // Empty/stale map — if it were reused, every message would count as 0 and
+      // nothing would prune. The fresh recount must drive pruning instead.
+      ctx.indexTokenCountMap = {};
+      const messages: AIMessage[] = [];
+      for (let i = 0; i < 6; i++) {
+        messages.push(new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage);
+      }
+
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+    });
+
+    it('uses a caller-supplied token map when provided', () => {
+      const { ctx, messages } = buildBranch(3_000, 1, 6);
+      // Each message is ~1 char, so a recount would fit all 6. The supplied map
+      // claims 1000 each, forcing a prune — proving the map is honored.
+      const indexTokenCountMap: Record<string, number> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[String(i)] = 1_000;
+      }
+
+      const usage = ctx.projectContextUsage(messages, { indexTokenCountMap });
+
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+    });
+
+    it('ignores this context live usage so projections are not recalibrated', () => {
+      const build = (): { ctx: AgentContext; messages: AIMessage[] } => {
+        const ctx = createBasicContext({ tokenCounter: countByChars });
+        ctx.maxContextTokens = 5_000;
+        const messages: AIMessage[] = [0, 1, 2].map(
+          () => new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage,
+        );
+        return { ctx, messages };
+      };
+
+      const clean = build();
+      const cleanUsage = clean.ctx.projectContextUsage(clean.messages);
+
+      const dirty = build();
+      dirty.ctx.currentUsage = {
+        input_tokens: 4_000,
+        output_tokens: 50,
+        total_tokens: 4_050,
+      };
+      dirty.ctx.updateLastCallUsage({ input_tokens: 4_000, output_tokens: 50 });
+      const dirtyUsage = dirty.ctx.projectContextUsage(dirty.messages);
+
+      expect(dirtyUsage!.remainingContextTokens).toBe(
+        cleanUsage!.remainingContextTokens,
+      );
+      expect(dirtyUsage!.calibrationRatio).toBe(cleanUsage!.calibrationRatio);
+    });
+
+    it('does not mutate AI message content arrays during projection', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-x',
+            thinking: { type: 'enabled', budget_tokens: 1024 },
+          } as never,
+        },
+        tokenCounter: countByChars,
+      });
+      ctx.maxContextTokens = 2_000;
+      const aiContent = [
+        { type: 'thinking', thinking: 'step by step', signature: 'sig' },
+        { type: 'text', text: 'the answer' },
+      ];
+      const ai = new AIMessage({ content: aiContent as never });
+      const messages: AIMessage[] = [
+        new HumanMessage('question') as unknown as AIMessage,
+        ai,
+        new HumanMessage('another') as unknown as AIMessage,
+      ];
+      const contentRef = ai.content;
+      const lenBefore = (ai.content as unknown[]).length;
+
+      ctx.projectContextUsage(messages);
+
+      expect(messages[1].content).toBe(contentRef);
+      expect((messages[1].content as unknown[]).length).toBe(lenBefore);
+    });
+
+    it('honors an explicit calibrationRatio seed', () => {
+      const base = buildBranch(100_000, 1_000, 4);
+      const baseUsage = base.ctx.projectContextUsage(base.messages);
+
+      const scaled = buildBranch(100_000, 1_000, 4);
+      const scaledUsage = scaled.ctx.projectContextUsage(scaled.messages, {
+        calibrationRatio: 3,
+      });
+
+      expect(scaledUsage!.calibrationRatio).toBe(3);
+      expect(scaledUsage!.remainingContextTokens).not.toBe(
+        baseUsage!.remainingContextTokens,
+      );
+    });
+
+    it('refreshes a stale system runnable before projecting', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'system prompt' },
+        tokenCounter: countByChars,
+      });
+      ctx.maxContextTokens = 5_000;
+      ctx.initializeSystemRunnable();
+      const systemBefore = ctx.systemMessageTokens;
+
+      // Adds a handoff preamble + marks stale, but defers the token recount.
+      ctx.setHandoffContext('PriorAgent', ['SiblingA', 'SiblingB']);
+      ctx.projectContextUsage([new HumanMessage('hi') as unknown as AIMessage]);
+
+      expect(ctx.systemMessageTokens).toBeGreaterThan(systemBefore);
     });
   });
 });

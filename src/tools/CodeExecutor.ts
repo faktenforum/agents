@@ -1,24 +1,60 @@
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
+import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { EnvVar, Constants } from '@/common';
+
+export {
+  appendCodeSessionFileSummary,
+  stripCodeSessionFileSummary,
+} from '@/tools/CodeSessionFileSummary';
 
 config();
 
-export const imageExtRegex = /\.(jpg|jpeg|png|gif|webp)$/i;
 export const getCodeBaseURL = (): string =>
   getEnvironmentVariable(EnvVar.CODE_BASEURL) ??
   Constants.OFFICIAL_CODE_BASEURL;
 
-const imageMessage = 'Image is already displayed to the user';
-const otherMessage = 'File is already downloaded by the user';
-const accessMessage =
-  'Note: Files from previous executions are automatically available and can be modified.';
-const emptyOutputMessage =
+export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
+
+export const CODE_ARTIFACT_PATH_GUIDANCE =
+  'Persist handoff artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); failed executions do not register new files; `/tmp` and odd extensions are same-call scratch only, not later-call storage.';
+
+export const BASH_SHELL_GUIDANCE =
+  'Bash: multi-line files use heredoc/printf; run Python via python3 -c/heredoc, not bare Python.';
+
+const TMP_PATH_PATTERN = /(^|[^A-Za-z0-9_])\/tmp(?:\/|\b)/;
+const MNT_DATA_PATH_PATTERN = /(^|[^A-Za-z0-9_])\/mnt\/data(?:\/|\b)/;
+
+export const TMP_SCRATCH_OUTPUT_REMINDER =
+  'Note: /tmp files are same-call scratch only and were not persisted; use /mnt/data for files needed later.';
+
+export const FAILED_EXECUTION_FILE_REMINDER =
+  'Note: any files written during this failed call were not registered for later calls; fix the error and rerun before relying on them.';
+
+export function appendTmpScratchReminder(output: string, code: string): string {
+  if (!TMP_PATH_PATTERN.test(code)) {
+    return output;
+  }
+  return `${output.trimEnd()}\n${TMP_SCRATCH_OUTPUT_REMINDER}\n`;
+}
+
+export function appendFailedExecutionFileReminder(
+  output: string,
+  code: string
+): string {
+  if (
+    !MNT_DATA_PATH_PATTERN.test(code) ||
+    output.includes(FAILED_EXECUTION_FILE_REMINDER)
+  ) {
+    return output;
+  }
+  return `${output.trimEnd()}\n${FAILED_EXECUTION_FILE_REMINDER}\n`;
+}
 
 const SUPPORTED_LANGUAGES = [
   'py',
@@ -49,8 +85,8 @@ export const CodeExecutionToolSchema = {
       type: 'string',
       description: `The complete, self-contained code to execute, without any truncation or minimization.
 - The environment is stateless; variables and imports don't persist between executions.
-- Generated files from previous executions are automatically available in "/mnt/data/".
-- Files from previous executions are automatically available and can be modified in place.
+- Prior /mnt/data files are available and can be modified in place.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
 - Input code **IS ALREADY** displayed to the user, so **DO NOT** repeat it in your response unless asked.
 - Output code **IS NOT** displayed to the user, so **DO** write all desired output explicitly.
 - IMPORTANT: You MUST explicitly print/output ALL results you want the user to see.
@@ -75,12 +111,41 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
+export async function resolveCodeApiAuthHeaders(
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeApiAuthHeaderMap> {
+  if (authHeaders == null) {
+    return {};
+  }
+  if (typeof authHeaders === 'function') {
+    return authHeaders();
+  }
+  return authHeaders;
+}
+
+export async function buildCodeApiHttpErrorMessage(
+  method: string,
+  endpoint: string,
+  response: { status: number; text: () => Promise<string> }
+): Promise<string> {
+  let responseBody = '';
+  try {
+    responseBody = await response.text();
+  } catch {
+    responseBody = '';
+  }
+  const body = responseBody.trim();
+  const bodySuffix = body === '' ? '' : `, body: ${body.slice(0, 1000)}`;
+  return `CodeAPI request failed: ${method} ${endpoint} returned ${response.status}${bodySuffix}`;
+}
+
 export const CodeExecutionToolDescription = `
 Runs code and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
 
 Usage:
 - No network access available.
 - Generated files are automatically delivered; **DO NOT** provide download links.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
 - NEVER use this tool to execute malicious code.
 `.trim();
 
@@ -93,19 +158,11 @@ export const CodeExecutionToolDefinition = {
 } as const;
 
 function createCodeExecutionTool(
-  params: t.CodeExecutionToolParams = {}
+  params: t.CodeExecutionToolParams | null = {}
 ): DynamicStructuredTool {
-  const apiKey =
-    params[EnvVar.CODE_API_KEY] ??
-    params.apiKey ??
-    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-    '';
-  if (!apiKey) {
-    throw new Error('No API key provided for code execution tool.');
-  }
-
   return tool(
     async (rawInput, config) => {
+      const { authHeaders, ...executionParams } = params ?? {};
       const { lang, code, ...rest } = rawInput as {
         lang: SupportedLanguage;
         code: string;
@@ -113,8 +170,8 @@ function createCodeExecutionTool(
       };
       /**
        * Extract session context from config.toolCall (injected by ToolNode).
-       * - session_id: For API to associate with previous session
-       * - _injected_files: File refs to pass directly (avoids /files endpoint race condition)
+       * - session_id: associates with the previous run.
+       * - _injected_files: File refs to pass directly (avoids /files endpoint race condition).
        */
       const { session_id, _injected_files } = (config.toolCall ?? {}) as {
         session_id?: string;
@@ -125,67 +182,38 @@ function createCodeExecutionTool(
         lang,
         code,
         ...rest,
-        ...params,
+        ...executionParams,
       };
 
-      /**
-       * File injection priority:
-       * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-       * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
-       */
+      /* File injection: `_injected_files` from ToolNode (set when host
+       * primes a CodeSessionContext) or `params.files` from tool
+       * factory (set by hosts that pre-resolve at construction time).
+       * The legacy `/files/<session_id>` HTTP fallback was removed —
+       * codeapi's `sessionAuth` middleware now requires kind/id query
+       * params the tool can't supply at this point, so the fetch 400'd
+       * silently and the catch swallowed the failure. */
       if (_injected_files && _injected_files.length > 0) {
         postData.files = _injected_files;
-      } else if (session_id != null && session_id.length > 0) {
-        /** Fallback: fetch from /files endpoint (may have race condition issues) */
-        try {
-          const filesEndpoint = `${baseEndpoint}/files/${session_id}?detail=full`;
-          const fetchOptions: RequestInit = {
-            method: 'GET',
-            headers: {
-              'User-Agent': 'LibreChat/1.0',
-              'X-API-Key': apiKey,
-            },
-          };
-
-          if (process.env.PROXY != null && process.env.PROXY !== '') {
-            fetchOptions.agent = new HttpsProxyAgent(process.env.PROXY);
-          }
-
-          const response = await fetch(filesEndpoint, fetchOptions);
-          if (!response.ok) {
-            throw new Error(
-              `Failed to fetch files for session: ${response.status}`
-            );
-          }
-
-          const files = await response.json();
-          if (Array.isArray(files) && files.length > 0) {
-            const fileReferences: t.CodeEnvFile[] = files.map((file) => {
-              const nameParts = file.name.split('/');
-              const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
-
-              return {
-                session_id,
-                id,
-                name: file.metadata['original-filename'],
-              };
-            });
-
-            postData.files = fileReferences;
-          }
-        } catch {
-          // eslint-disable-next-line no-console
-          console.warn(`Failed to fetch files for session: ${session_id}`);
-        }
+      } else if (
+        session_id != null &&
+        session_id.length > 0 &&
+        !Array.isArray(postData.files)
+      ) {
+        // eslint-disable-next-line no-console
+        console.debug(
+          `[CodeExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        );
       }
 
       try {
+        const resolvedAuthHeaders =
+          await resolveCodeApiAuthHeaders(authHeaders);
         const fetchOptions: RequestInit = {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            'X-API-Key': apiKey,
+            ...resolvedAuthHeaders,
           },
           body: JSON.stringify(postData),
         };
@@ -195,7 +223,9 @@ function createCodeExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(
+            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+          );
         }
 
         const result: t.ExecuteResult = await response.json();
@@ -206,35 +236,26 @@ function createCodeExecutionTool(
           formattedOutput += emptyOutputMessage;
         }
         if (result.stderr) formattedOutput += `stderr:\n${result.stderr}\n`;
-        if (result.files && result.files.length > 0) {
-          formattedOutput += 'Generated files:\n';
 
-          const fileCount = result.files.length;
-          for (let i = 0; i < fileCount; i++) {
-            const file = result.files[i];
-            const isImage = imageExtRegex.test(file.name);
-            formattedOutput += `- /mnt/data/${file.name} | ${isImage ? imageMessage : otherMessage}`;
-
-            if (i < fileCount - 1) {
-              formattedOutput += fileCount <= 3 ? ', ' : ',\n';
-            }
-          }
-
-          formattedOutput += `\n\n${accessMessage}`;
-          return [
-            formattedOutput.trim(),
-            {
-              session_id: result.session_id,
-              files: result.files,
-            },
-          ];
-        }
-
-        return [formattedOutput.trim(), { session_id: result.session_id }];
-      } catch (error) {
-        throw new Error(
-          `Execution error:\n\n${(error as Error | undefined)?.message}`
+        const outputWithReminder = appendTmpScratchReminder(
+          formattedOutput,
+          code
         );
+        const hasFiles = result.files != null && result.files.length > 0;
+        return [
+          appendCodeSessionFileSummary(outputWithReminder, result.files),
+          (hasFiles
+            ? { session_id: result.session_id, files: result.files }
+            : {
+              session_id: result.session_id,
+            }) satisfies t.CodeExecutionArtifact,
+        ];
+      } catch (error) {
+        const messageWithReminder = appendFailedExecutionFileReminder(
+          (error as Error | undefined)?.message ?? '',
+          code
+        );
+        throw new Error(`Execution error:\n\n${messageWithReminder}`);
       }
     },
     {

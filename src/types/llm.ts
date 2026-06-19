@@ -1,27 +1,27 @@
 // src/types/llm.ts
 import { ChatMistralAI } from '@langchain/mistralai';
 import type {
-  BindToolsInput,
-  BaseChatModelParams,
-} from '@langchain/core/language_models/chat_models';
-import type {
   OpenAIChatInput,
   ChatOpenAIFields,
   AzureOpenAIInput,
   ClientOptions as OAIClientOptions,
 } from '@langchain/openai';
+import type {
+  BindToolsInput,
+  BaseChatModelParams,
+} from '@langchain/core/language_models/chat_models';
 import type { GoogleGenerativeAIChatInput } from '@langchain/google-genai';
 import type { ChatVertexAIInput } from '@langchain/google-vertexai';
-import type { ChatDeepSeekCallOptions } from '@langchain/deepseek';
-import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { ChatMistralAIInput } from '@langchain/mistralai';
+import type { ChatDeepSeekInput } from '@langchain/deepseek';
 import type { RequestOptions } from '@google/generative-ai';
 import type { StructuredTool } from '@langchain/core/tools';
 import type { AnthropicInput } from '@langchain/anthropic';
 import type { Runnable } from '@langchain/core/runnables';
 import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
+import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import {
   AzureChatOpenAI,
   ChatDeepSeek,
@@ -45,7 +45,20 @@ export type AzureClientOptions = Partial<OpenAIChatInput> &
   } & BaseChatModelParams & {
     configuration?: OAIClientOptions;
   };
-export type ThinkingConfig = AnthropicInput['thinking'];
+/**
+ * Controls whether Claude's reasoning content is returned in adaptive
+ * thinking responses. Added for Claude Opus 4.7, which omits thinking by
+ * default unless the caller opts in with `'summarized'`.
+ * @see https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#thinking-content-omitted-by-default
+ */
+export type ThinkingDisplay = 'summarized' | 'omitted';
+export type ThinkingConfigAdaptive = {
+  type: 'adaptive';
+  display?: ThinkingDisplay;
+};
+export type ThinkingConfig =
+  | NonNullable<AnthropicInput['thinking']>
+  | ThinkingConfigAdaptive;
 export type ChatOpenAIToolType =
   | BindToolsInput
   | OpenAIClient.ChatCompletionTool;
@@ -57,10 +70,11 @@ export type AnthropicReasoning = {
 export type GoogleThinkingConfig = {
   thinkingBudget?: number;
   includeThoughts?: boolean;
-  thinkingLevel?: string;
+  thinkingLevel?: 'THINKING_LEVEL_UNSPECIFIED' | 'LOW' | 'MEDIUM' | 'HIGH';
 };
 export type OpenAIClientOptions = ChatOpenAIFields;
-export type AnthropicClientOptions = AnthropicInput & {
+export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
+  thinking?: ThinkingConfig;
   promptCache?: boolean;
 };
 export type MistralAIClientOptions = ChatMistralAIInput;
@@ -73,13 +87,14 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
     AnthropicReasoning;
   promptCache?: boolean;
 };
-export type BedrockConverseClientOptions = ChatBedrockConverseInput;
+export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
   thinkingConfig?: GoogleThinkingConfig;
+  includeServerSideToolInvocations?: boolean;
 };
-export type DeepSeekClientOptions = ChatDeepSeekCallOptions;
+export type DeepSeekClientOptions = Partial<ChatDeepSeekInput>;
 export type XAIClientOptions = ChatXAIInput;
 
 export type ClientOptions =
@@ -114,7 +129,7 @@ export type ProviderOptionsMap = {
   [Providers.MISTRALAI]: MistralAIClientOptions;
   [Providers.MISTRAL]: MistralAIClientOptions;
   [Providers.OPENROUTER]: ChatOpenRouterCallOptions;
-  [Providers.BEDROCK]: BedrockConverseClientOptions;
+  [Providers.BEDROCK]: BedrockAnthropicClientOptions;
   [Providers.XAI]: XAIClientOptions;
   [Providers.MOONSHOT]: OpenAIClientOptions;
 };

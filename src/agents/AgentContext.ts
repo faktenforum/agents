@@ -1,24 +1,46 @@
 /* eslint-disable no-console */
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import type {
   UsageMetadata,
   BaseMessage,
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
-import type { createPruneMessages } from '@/messages';
 import type * as t from '@/types';
 import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
+  Constants,
   Providers,
 } from '@/common';
+import {
+  addTailCacheControl,
+  addCacheControlToStablePrefixMessages,
+  cloneMessage,
+} from '@/messages/cache';
 import { createSchemaOnlyTools } from '@/tools/schema';
-import { addCacheControl } from '@/messages/cache';
-import { DEFAULT_RESERVE_RATIO } from '@/messages';
+import { apportionTokenCounts } from '@/utils/tokens';
+import {
+  DEFAULT_RESERVE_RATIO,
+  createPruneMessages,
+  syncBudgetDerivedFields,
+} from '@/messages';
+import { isThinkingEnabled } from '@/llm/request';
 import { toJsonSchema } from '@/utils/schema';
+
+type AgentSystemTextBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+};
+
+type AgentSystemContentBlock =
+  | AgentSystemTextBlock
+  | { cachePoint: { type: 'default' } };
+
+type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -37,6 +59,7 @@ export class AgentContext {
       name,
       provider,
       clientOptions,
+      langfuse,
       tools,
       toolMap,
       toolEnd,
@@ -56,6 +79,8 @@ export class AgentContext {
       contextPruningConfig,
       maxToolResultChars,
       toolSchemaTokens,
+      subagentConfigs,
+      maxSubagentDepth,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -63,6 +88,7 @@ export class AgentContext {
       name: name ?? agentId,
       provider,
       clientOptions,
+      langfuse,
       maxContextTokens,
       streamBuffer,
       tools,
@@ -83,6 +109,10 @@ export class AgentContext {
       contextPruningConfig,
       maxToolResultChars,
     });
+
+    agentContext._sourceInputs = agentConfig;
+    agentContext.subagentConfigs = subagentConfigs;
+    agentContext.maxSubagentDepth = maxSubagentDepth;
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setInitialSummary(
@@ -129,6 +159,8 @@ export class AgentContext {
   provider: Providers;
   /** Client options for this agent */
   clientOptions?: t.ClientOptions;
+  /** Per-agent Langfuse tracing configuration. */
+  langfuse?: t.LangfuseConfig;
   /** Token count map indexed by message position */
   indexTokenCountMap: Record<string, number | undefined> = {};
   /** Canonical pre-run token map used to restore token accounting on reset */
@@ -163,8 +195,15 @@ export class AgentContext {
   tokenCounter?: t.TokenCounter;
   /** Token count for the system message (instructions text). */
   systemMessageTokens: number = 0;
+  /** Token count for instruction text emitted outside the system message. */
+  dynamicInstructionTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
+  /** Per-tool schema token counts (post-multiplier), keyed by tool name.
+   *  `undefined` when not calculated (e.g. cached aggregate schema tokens). */
+  toolTokenCounts?: Record<string, number>;
+  /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
+  deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
@@ -176,7 +215,12 @@ export class AgentContext {
   get instructionTokens(): number {
     const summaryOverhead =
       this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
-    return this.systemMessageTokens + this.toolSchemaTokens + summaryOverhead;
+    return (
+      this.systemMessageTokens +
+      this.dynamicInstructionTokens +
+      this.toolSchemaTokens +
+      summaryOverhead
+    );
   }
   /** The amount of time that should pass before another consecutive API call */
   streamBuffer?: number;
@@ -200,6 +244,12 @@ export class AgentContext {
   toolDefinitions?: t.LCTool[];
   /** Set of tool names discovered via tool search (to be loaded) */
   discoveredToolNames: Set<string> = new Set();
+  /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
+  _sourceInputs?: t.AgentInputs;
+  /** Subagent configurations for hierarchical delegation. */
+  subagentConfigs?: t.SubagentConfig[];
+  /** Maximum subagent nesting depth. */
+  maxSubagentDepth?: number;
   /** Instructions for this agent */
   instructions?: string;
   /** Additional instructions for this agent */
@@ -239,7 +289,7 @@ export class AgentContext {
   private summaryTokenCount: number = 0;
   /**
    * Where the summary should be injected:
-   * - `'system_prompt'`: cross-run summary, included in `buildInstructionsString`
+   * - `'system_prompt'`: cross-run summary, included in the dynamic system tail
    * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
    * - `'none'`: no summary present
    */
@@ -281,6 +331,7 @@ export class AgentContext {
     name,
     provider,
     clientOptions,
+    langfuse,
     maxContextTokens,
     streamBuffer,
     tokenCounter,
@@ -305,6 +356,7 @@ export class AgentContext {
     name?: string;
     provider: Providers;
     clientOptions?: t.ClientOptions;
+    langfuse?: t.LangfuseConfig;
     maxContextTokens?: number;
     streamBuffer?: number;
     tokenCounter?: t.TokenCounter;
@@ -329,6 +381,7 @@ export class AgentContext {
     this.name = name;
     this.provider = provider;
     this.clientOptions = clientOptions;
+    this.langfuse = langfuse;
     this.maxContextTokens = maxContextTokens;
     this.streamBuffer = streamBuffer;
     this.tokenCounter = tokenCounter;
@@ -365,7 +418,7 @@ export class AgentContext {
   /**
    * Builds instructions text for tools that are ONLY callable via programmatic code execution.
    * These tools cannot be called directly by the LLM but are available through the
-   * run_tools_with_code tool.
+   * configured programmatic tool.
    *
    * Includes:
    * - Code_execution-only tools that are NOT deferred
@@ -392,6 +445,7 @@ export class AgentContext {
 
     if (programmaticOnlyTools.length === 0) return '';
 
+    const programmaticTool = this.getProgrammaticToolInstructionTarget();
     const toolDescriptions = programmaticOnlyTools
       .map((tool) => {
         let desc = `- **${tool.name}**`;
@@ -407,15 +461,46 @@ export class AgentContext {
 
     return (
       '\n\n## Programmatic-Only Tools\n\n' +
-      'The following tools are available exclusively through the `run_tools_with_code` tool. ' +
-      'You cannot call these tools directly; instead, use `run_tools_with_code` with Python code that invokes them.\n\n' +
+      `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
+      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.language} code that invokes them.\n\n` +
       toolDescriptions
     );
   }
 
+  private getProgrammaticToolInstructionTarget(): {
+    name: string;
+    language: 'bash' | 'Python';
+    } {
+    if (this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING)) {
+      return {
+        name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+        language: 'bash',
+      };
+    }
+
+    if (this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING)) {
+      return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
+    }
+
+    return { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING, language: 'bash' };
+  }
+
+  private hasAvailableTool(name: string): boolean {
+    if (this.toolDefinitions?.some((tool) => tool.name === name) === true)
+      return true;
+    if (
+      this.tools?.some((tool) => 'name' in tool && tool.name === name) === true
+    ) {
+      return true;
+    }
+    if (this.toolMap?.has(name) === true) return true;
+    return this.toolRegistry?.has(name) === true;
+  }
+
   /**
    * Gets the system runnable, creating it lazily if needed.
-   * Includes instructions, additional instructions, and programmatic-only tools documentation.
+   * Includes stable instructions, dynamic additional instructions, and
+   * programmatic-only tools documentation.
    * Only rebuilds when marked stale (via markToolsAsDiscovered).
    */
   get systemRunnable():
@@ -429,8 +514,10 @@ export class AgentContext {
       return this.cachedSystemRunnable;
     }
 
-    const instructionsString = this.buildInstructionsString();
-    this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+    this.cachedSystemRunnable = this.buildSystemRunnable({
+      stableInstructions: this.buildStableInstructionsString(),
+      dynamicInstructions: this.buildDynamicInstructionsString(),
+    });
     this.systemRunnableStale = false;
     return this.cachedSystemRunnable;
   }
@@ -441,17 +528,19 @@ export class AgentContext {
    */
   initializeSystemRunnable(): void {
     if (this.systemRunnableStale || this.cachedSystemRunnable === undefined) {
-      const instructionsString = this.buildInstructionsString();
-      this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+      this.cachedSystemRunnable = this.buildSystemRunnable({
+        stableInstructions: this.buildStableInstructionsString(),
+        dynamicInstructions: this.buildDynamicInstructionsString(),
+      });
       this.systemRunnableStale = false;
     }
   }
 
   /**
-   * Builds the raw instructions string (without creating SystemMessage).
+   * Builds the cacheable instructions string (without creating SystemMessage).
    * Includes agent identity preamble and handoff context when available.
    */
-  private buildInstructionsString(): string {
+  private buildStableInstructionsString(): string {
     const parts: string[] = [];
 
     const identityPreamble = this.buildIdentityPreamble();
@@ -463,6 +552,22 @@ export class AgentContext {
       parts.push(this.instructions);
     }
 
+    const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
+    if (programmaticToolsDoc) {
+      parts.push(programmaticToolsDoc);
+    }
+
+    return parts.join('\n\n');
+  }
+
+  /**
+   * Builds the dynamic system-tail string (without creating SystemMessage).
+   * Keep this out of prompt-cache-marked content so volatile context does not
+   * invalidate the stable prefix.
+   */
+  private buildDynamicInstructionsString(): string {
+    const parts: string[] = [];
+
     if (
       this.additionalInstructions != null &&
       this.additionalInstructions !== ''
@@ -470,14 +575,10 @@ export class AgentContext {
       parts.push(this.additionalInstructions);
     }
 
-    const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
-    if (programmaticToolsDoc) {
-      parts.push(programmaticToolsDoc);
-    }
-
-    // Cross-run summary: include in system prompt so the model has context
-    // from the prior run.  Mid-run summaries are injected as a HumanMessage
-    // on the post-compaction clean slate instead (see buildSystemRunnable).
+    // Cross-run summary: include in the system tail so the model has context
+    // from the prior run without invalidating the cacheable prefix. Mid-run
+    // summaries are injected as a HumanMessage on the post-compaction clean
+    // slate instead (see buildSystemRunnable).
     if (
       this._summaryLocation === 'system_prompt' &&
       this.summaryText != null &&
@@ -521,9 +622,13 @@ export class AgentContext {
    * Build system runnable from pre-built instructions string.
    * Only called when content has actually changed.
    */
-  private buildSystemRunnable(
-    instructionsString: string
-  ):
+  private buildSystemRunnable({
+    stableInstructions,
+    dynamicInstructions,
+  }: {
+    stableInstructions: string;
+    dynamicInstructions: string;
+  }):
     | Runnable<
         BaseMessage[],
         (BaseMessage | SystemMessage)[],
@@ -535,39 +640,30 @@ export class AgentContext {
       this.summaryText != null &&
       this.summaryText !== '';
 
-    if (!instructionsString && !hasMidRunSummary) {
+    if (!stableInstructions && !dynamicInstructions && !hasMidRunSummary) {
       this.systemMessageTokens = 0;
+      this.dynamicInstructionTokens = 0;
       return undefined;
     }
 
-    let finalInstructions: string | BaseMessageFields = instructionsString;
-
-    let usePromptCache = false;
-    if (this.provider === Providers.ANTHROPIC) {
-      const anthropicOptions = this.clientOptions as
-        | t.AnthropicClientOptions
-        | undefined;
-      if (anthropicOptions?.promptCache === true) {
-        usePromptCache = true;
-        finalInstructions = {
-          content: [
-            {
-              type: 'text',
-              text: instructionsString,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
-        };
-      }
-    }
-
-    const systemMessage = instructionsString
-      ? new SystemMessage(finalInstructions)
-      : undefined;
+    const promptCacheProvider = this.getPromptCacheProvider();
+    const shouldMoveDynamicInstructions =
+      promptCacheProvider != null &&
+      stableInstructions !== '' &&
+      dynamicInstructions !== '';
+    const systemMessage = this.buildSystemMessage({
+      stableInstructions,
+      dynamicInstructions,
+      promptCacheProvider,
+      shouldMoveDynamicInstructions,
+    });
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
         ? this.tokenCounter(systemMessage)
+        : 0;
+      this.dynamicInstructionTokens = shouldMoveDynamicInstructions
+        ? this.tokenCounter(new HumanMessage(dynamicInstructions))
         : 0;
     }
 
@@ -582,35 +678,234 @@ export class AgentContext {
         this.summaryText != null &&
         this.summaryText !== '';
 
-      let body: BaseMessage[];
-      if (hasSummaryBody) {
-        const wrappedSummary =
-          '<summary>\n' +
-          (this.summaryText as string) +
-          '\n</summary>\n\n' +
-          'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+      const bodyWithSummary =
+        hasSummaryBody && promptCacheProvider == null
+          ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
+          : messages;
+      const dynamicTail = this.buildPromptCacheDynamicTail({
+        dynamicInstructions,
+        hasSummaryBody,
+        promptCacheProvider,
+        shouldMoveDynamicInstructions,
+      });
+      let body = this.buildBodyWithPromptCacheDynamicTail(
+        bodyWithSummary,
+        dynamicTail,
+        promptCacheProvider
+      );
 
-        const summaryMsg = usePromptCache
-          ? new HumanMessage({
-            content: [
-              {
-                type: 'text',
-                text: wrappedSummary,
-                cache_control: { type: 'ephemeral' },
-              },
-            ],
-          })
-          : new HumanMessage(wrappedSummary);
-        body = [summaryMsg, ...messages];
-      } else {
-        body = messages;
-      }
-
-      if (usePromptCache && body.length >= 2) {
-        body = addCacheControl(body);
+      if (
+        promptCacheProvider != null &&
+        dynamicTail.length === 0 &&
+        body.length >= 2
+      ) {
+        body = addTailCacheControl(body);
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
+  }
+
+  private buildSummaryHumanMessage(
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): HumanMessage {
+    const wrappedSummary =
+      '<summary>\n' +
+      (this.summaryText as string) +
+      '\n</summary>\n\n' +
+      'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+
+    if (promptCacheProvider !== Providers.ANTHROPIC) {
+      return new HumanMessage(wrappedSummary);
+    }
+
+    return new HumanMessage({
+      content: [
+        {
+          type: 'text',
+          text: wrappedSummary,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    });
+  }
+
+  private buildPromptCacheDynamicTail({
+    dynamicInstructions,
+    hasSummaryBody,
+    promptCacheProvider,
+    shouldMoveDynamicInstructions,
+  }: {
+    dynamicInstructions: string;
+    hasSummaryBody: boolean;
+    promptCacheProvider: PromptCacheProvider | undefined;
+    shouldMoveDynamicInstructions: boolean;
+  }): BaseMessage[] {
+    if (promptCacheProvider == null) {
+      return [];
+    }
+
+    const dynamicTail = shouldMoveDynamicInstructions
+      ? [new HumanMessage(dynamicInstructions)]
+      : [];
+
+    if (!hasSummaryBody) {
+      return dynamicTail;
+    }
+
+    return [...dynamicTail, this.buildSummaryHumanMessage(undefined)];
+  }
+
+  private buildBodyWithPromptCacheDynamicTail(
+    messages: BaseMessage[],
+    tail: BaseMessage[],
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): BaseMessage[] {
+    if (tail.length === 0) {
+      return messages;
+    }
+
+    const tailIndex = this.getPromptCacheDynamicTailIndex(
+      messages,
+      promptCacheProvider
+    );
+    const stablePrefix = messages.slice(0, tailIndex);
+    const trailingMessages = messages.slice(tailIndex);
+    const cacheablePrefix = this.addStablePromptCacheMarkers(stablePrefix);
+
+    return [...cacheablePrefix, ...tail, ...trailingMessages];
+  }
+
+  private getPromptCacheDynamicTailIndex(
+    messages: BaseMessage[],
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): number {
+    const lastIndex = messages.length - 1;
+
+    if (lastIndex < 0) {
+      return 0;
+    }
+
+    if (promptCacheProvider === Providers.OPENROUTER && messages.length === 1) {
+      return messages.length;
+    }
+
+    for (let index = lastIndex; index >= 0; index--) {
+      if (messages[index].getType() === 'human') {
+        if (promptCacheProvider === Providers.OPENROUTER && index === 0) {
+          return 1;
+        }
+        return index;
+      }
+    }
+
+    return messages.length;
+  }
+
+  private addStablePromptCacheMarkers(messages: BaseMessage[]): BaseMessage[] {
+    if (messages.length <= 1) {
+      return messages;
+    }
+
+    return [
+      messages[0],
+      ...addCacheControlToStablePrefixMessages(messages.slice(1), 2),
+    ];
+  }
+
+  private getPromptCacheProvider(): PromptCacheProvider | undefined {
+    if (this.provider === Providers.ANTHROPIC) {
+      const anthropicOptions = this.clientOptions as
+        | t.AnthropicClientOptions
+        | undefined;
+      return anthropicOptions?.promptCache === true
+        ? Providers.ANTHROPIC
+        : undefined;
+    }
+
+    if (this.provider === Providers.OPENROUTER) {
+      const openRouterOptions = this.clientOptions as
+        | t.ProviderOptionsMap[Providers.OPENROUTER]
+        | undefined;
+      return openRouterOptions?.promptCache === true
+        ? Providers.OPENROUTER
+        : undefined;
+    }
+
+    return undefined;
+  }
+
+  private hasBedrockPromptCache(): boolean {
+    if (this.provider !== Providers.BEDROCK) {
+      return false;
+    }
+    const bedrockOptions = this.clientOptions as
+      | t.BedrockAnthropicClientOptions
+      | undefined;
+    return bedrockOptions?.promptCache === true;
+  }
+
+  private buildSystemMessage({
+    stableInstructions,
+    dynamicInstructions,
+    promptCacheProvider,
+    shouldMoveDynamicInstructions,
+  }: {
+    stableInstructions: string;
+    dynamicInstructions: string;
+    promptCacheProvider: PromptCacheProvider | undefined;
+    shouldMoveDynamicInstructions: boolean;
+  }): SystemMessage | undefined {
+    if (!stableInstructions && !dynamicInstructions) {
+      return undefined;
+    }
+
+    if (promptCacheProvider === Providers.ANTHROPIC) {
+      const content: AgentSystemContentBlock[] = [];
+      if (stableInstructions) {
+        content.push({
+          type: 'text',
+          text: stableInstructions,
+          cache_control: { type: 'ephemeral' },
+        });
+      }
+      if (dynamicInstructions && !shouldMoveDynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
+      }
+      return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    if (promptCacheProvider === Providers.OPENROUTER && !stableInstructions) {
+      return new SystemMessage(dynamicInstructions);
+    }
+
+    if (promptCacheProvider === Providers.OPENROUTER) {
+      return new SystemMessage({
+        content: [
+          {
+            type: 'text',
+            text: stableInstructions,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      } as BaseMessageFields);
+    }
+
+    if (this.hasBedrockPromptCache() && stableInstructions) {
+      const content: AgentSystemContentBlock[] = [
+        { type: 'text', text: stableInstructions },
+        { cachePoint: { type: 'default' } },
+      ];
+      if (dynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
+      }
+      return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    return new SystemMessage(
+      [stableInstructions, dynamicInstructions]
+        .filter((part) => part !== '')
+        .join('\n\n')
+    );
   }
 
   /**
@@ -618,7 +913,10 @@ export class AgentContext {
    */
   reset(): void {
     this.systemMessageTokens = 0;
+    this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
+    this.toolTokenCounts = undefined;
+    this.deferredToolNames = [];
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
@@ -674,6 +972,54 @@ export class AgentContext {
     this.indexTokenCountMap = { ...baseTokenMap };
   }
 
+  /** Active tool definitions for token accounting (excludes deferred-and-undiscovered entries). */
+  private getActiveToolDefinitions(): t.LCTool[] {
+    if (!this.toolDefinitions) {
+      return [];
+    }
+    /**
+     * Mirror `getEventDrivenToolsForBinding`'s gate: a definition is only
+     * bound to the model when its `allowed_callers` include `'direct'` and
+     * (if deferred) it has been discovered. Filtering by `defer_loading`
+     * alone left programmatic-only definitions counted in
+     * `toolSchemaTokens` even though they were never bound.
+     */
+    return this.toolDefinitions.filter((def) => {
+      const allowedCallers = def.allowed_callers ?? ['direct'];
+      if (!allowedCallers.includes('direct')) {
+        return false;
+      }
+      return (
+        def.defer_loading !== true || this.discoveredToolNames.has(def.name)
+      );
+    });
+  }
+
+  /**
+   * Single source of truth for "which entries of `this.tools` should be
+   * treated as actually bound". Callers:
+   *   - `getToolsForBinding` (non-event-driven branch)
+   *   - `getEventDrivenToolsForBinding` (appends instance tools alongside
+   *     schema-only definitions)
+   *   - `calculateInstructionTokens` (counts schema bytes for accounting)
+   *
+   * In event-driven mode (`toolDefinitions` present) instance tools are
+   * appended unfiltered; outside event-driven mode they pass through
+   * `filterToolsForBinding`. Centralizing the decision here prevents the
+   * accounting/binding paths from drifting apart, which was the root
+   * cause of the original miscount.
+   */
+  private getEffectiveInstanceTools(): t.GraphTools | undefined {
+    if (!this.tools) {
+      return undefined;
+    }
+    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
+    if (isEventDriven || !this.toolRegistry) {
+      return this.tools;
+    }
+    return this.filterToolsForBinding(this.tools);
+  }
+
   /**
    * Calculate tool tokens and add to instruction tokens
    * Note: System message tokens are calculated during systemRunnable creation
@@ -683,9 +1029,33 @@ export class AgentContext {
   ): Promise<void> {
     let toolTokens = 0;
     const countedToolNames = new Set<string>();
+    /** Prototype-free: external tool names like `toString` must not hit
+     *  inherited properties during accumulation */
+    const rawToolTokenCounts: Record<string, number> = Object.create(null);
+    const deferredCountedNames = new Set<string>();
 
-    if (this.tools && this.tools.length > 0) {
-      for (const tool of this.tools) {
+    /**
+     * Iterate both `tools` (user-provided instance tools) and `graphTools`
+     * (graph-managed tools like handoff + subagent). `graphTools` is often
+     * populated after `fromConfig()` kicks off the initial calculation, so
+     * callers that mutate `graphTools` must re-trigger this method to
+     * refresh `toolSchemaTokens`.
+     *
+     * Use `getEffectiveInstanceTools()` so accounting reflects exactly the
+     * subset that `getToolsForBinding` would emit — preventing the
+     * worst-case-ceiling miscount that triggered spurious `empty_messages`
+     * preflight rejections at low `maxContextTokens`. Deferred and
+     * non-`'direct'` `toolDefinitions` are excluded by
+     * `getActiveToolDefinitions()` below.
+     */
+    const instanceTools: t.GraphTools = [
+      ...((this.getEffectiveInstanceTools() as t.GenericTool[] | undefined) ??
+        []),
+      ...((this.graphTools as t.GenericTool[] | undefined) ?? []),
+    ];
+
+    if (instanceTools.length > 0) {
+      for (const tool of instanceTools) {
         const genericTool = tool as Record<string, unknown>;
         if (
           genericTool.schema != null &&
@@ -697,30 +1067,40 @@ export class AgentContext {
             toolName,
             (genericTool.description as string | undefined) ?? ''
           );
-          toolTokens += tokenCounter(
+          const schemaTokens = tokenCounter(
             new SystemMessage(JSON.stringify(jsonSchema))
           );
+          toolTokens += schemaTokens;
           if (toolName) {
             countedToolNames.add(toolName);
+            rawToolTokenCounts[toolName] =
+              (rawToolTokenCounts[toolName] ?? 0) + schemaTokens;
           }
         }
       }
     }
 
-    if (this.toolDefinitions && this.toolDefinitions.length > 0) {
-      for (const def of this.toolDefinitions) {
-        if (countedToolNames.has(def.name)) {
-          continue;
-        }
-        const schema = {
-          type: 'function',
-          function: {
-            name: def.name,
-            description: def.description ?? '',
-            parameters: def.parameters ?? {},
-          },
-        };
-        toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
+    for (const def of this.getActiveToolDefinitions()) {
+      if (countedToolNames.has(def.name)) {
+        continue;
+      }
+      const schema = {
+        type: 'function',
+        function: {
+          name: def.name,
+          description: def.description ?? '',
+          parameters: def.parameters ?? {},
+        },
+      };
+      const schemaTokens = tokenCounter(
+        new SystemMessage(JSON.stringify(schema))
+      );
+      toolTokens += schemaTokens;
+      countedToolNames.add(def.name);
+      rawToolTokenCounts[def.name] =
+        (rawToolTokenCounts[def.name] ?? 0) + schemaTokens;
+      if (def.defer_loading === true) {
+        deferredCountedNames.add(def.name);
       }
     }
 
@@ -736,6 +1116,25 @@ export class AgentContext {
       ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
       : DEFAULT_TOOL_TOKEN_MULTIPLIER;
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
+
+    /** Largest-remainder apportionment keeps the per-tool counts summing
+     *  exactly to the aggregate despite per-entry rounding */
+    const toolTokenCounts = apportionTokenCounts(
+      rawToolTokenCounts,
+      toolTokenMultiplier,
+      this.toolSchemaTokens
+    );
+    const deferredToolNames: string[] = [];
+    for (const name of Object.keys(rawToolTokenCounts)) {
+      if (
+        deferredCountedNames.has(name) ||
+        this.toolRegistry?.get(name)?.defer_loading === true
+      ) {
+        deferredToolNames.push(name);
+      }
+    }
+    this.toolTokenCounts = toolTokenCounts;
+    this.deferredToolNames = deferredToolNames;
   }
 
   /**
@@ -870,11 +1269,22 @@ export class AgentContext {
   /**
    * Returns a structured breakdown of how the context token budget is consumed.
    * Useful for diagnostics when context overflow or pruning issues occur.
+   *
+   * Note: `markToolsAsDiscovered` re-triggers `calculateInstructionTokens`,
+   * so `toolSchemaTokens`/`toolTokenCounts` refresh before the next call.
    */
   getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
     const maxContextTokens = this.maxContextTokens ?? 0;
-    const toolCount =
-      (this.tools?.length ?? 0) + (this.toolDefinitions?.length ?? 0);
+    /**
+     * Derive `toolCount` from `getToolsForBinding()` so the diagnostic stays
+     * aligned with what is actually bound to the model — and with what
+     * `calculateInstructionTokens` counts into `toolSchemaTokens`. Using raw
+     * `this.tools.length` would inflate the count whenever the registry
+     * marks instance tools as deferred-undiscovered or non-`'direct'`,
+     * producing the same misleading "N tools" diagnostic this fix is meant
+     * to eliminate.
+     */
+    const toolCount = this.getToolsForBinding()?.length ?? 0;
     const messageCount = messages?.length ?? 0;
 
     let messageTokens = 0;
@@ -885,7 +1295,14 @@ export class AgentContext {
       }
     }
 
-    const reserveTokens = Math.round(maxContextTokens * DEFAULT_RESERVE_RATIO);
+    /** Mirror the pruner's reserve math so availableForMessages agrees
+     *  with the contextBudget computed during pruning */
+    const reserveRatio =
+      this.summarizationConfig?.reserveRatio ?? DEFAULT_RESERVE_RATIO;
+    const reserveTokens =
+      reserveRatio > 0 && reserveRatio < 1
+        ? Math.round(maxContextTokens * reserveRatio)
+        : 0;
     const availableForMessages = Math.max(
       0,
       maxContextTokens - reserveTokens - this.instructionTokens
@@ -895,12 +1312,19 @@ export class AgentContext {
       maxContextTokens,
       instructionTokens: this.instructionTokens,
       systemMessageTokens: this.systemMessageTokens,
+      dynamicInstructionTokens: this.dynamicInstructionTokens,
       toolSchemaTokens: this.toolSchemaTokens,
       summaryTokens: this.summaryTokenCount,
       toolCount,
       messageCount,
       messageTokens,
       availableForMessages,
+      toolTokenCounts:
+        this.toolTokenCounts != null ? { ...this.toolTokenCounts } : undefined,
+      deferredToolNames:
+        this.deferredToolNames.length > 0
+          ? [...this.deferredToolNames]
+          : undefined,
     };
   }
 
@@ -913,12 +1337,108 @@ export class AgentContext {
     const lines = [
       'Token budget breakdown:',
       `  maxContextTokens:    ${b.maxContextTokens}`,
-      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
+      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, dynamic: ${b.dynamicInstructionTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
       `  summaryTokens:       ${b.summaryTokens}`,
       `  messageTokens:       ${b.messageTokens} (${b.messageCount} messages)`,
       `  availableForMessages: ${b.availableForMessages}`,
     ];
     return lines.join('\n');
+  }
+
+  /**
+   * Projects the context-usage snapshot for an arbitrary message set WITHOUT
+   * invoking the model — the pre-send / page-load / window-switch counterpart to
+   * the live `ON_CONTEXT_USAGE` snapshot. Runs the same pruner + budget math the
+   * graph uses (`createPruneMessages` → `getTokenBudgetBreakdown` →
+   * `syncBudgetDerivedFields`) so projected numbers match a real call. Returns
+   * null when the context lacks the tokenizer or window needed to prune. Omits
+   * the live post-format reconciliation (provider-specific, invoke-time) — a
+   * small, acceptable delta for a pre-send estimate.
+   *
+   * Safe to call off the hot path: the supplied `messages` are never mutated
+   * (each is passed as a clone — the pruner both replaces tool-result slots and
+   * unshifts reasoning blocks into AI content arrays in place), and this
+   * context's own state is untouched apart from refreshing stale instruction
+   * counts (idempotent, exactly what a real call does). Token counts are
+   * recounted for the supplied messages (the context's `indexTokenCountMap` is
+   * keyed to the live run's branch and would missum an arbitrary branch) unless
+   * the caller passes a map it guarantees matches. Calibration is NOT re-derived
+   * from this context's live usage (a fresh pruner would compare the prior
+   * call's provider input against the whole projected branch); the learned
+   * `calibrationRatio` is applied as a static seed, and callers may override it
+   * with a persisted ratio via `opts.calibrationRatio`.
+   */
+  projectContextUsage(
+    messages: BaseMessage[],
+    opts?: {
+      runId?: string;
+      agentId?: string;
+      calibrationRatio?: number;
+      indexTokenCountMap?: Record<string, number | undefined>;
+    }
+  ): t.ContextUsageEvent | null {
+    const tokenCounter = this.tokenCounter;
+    if (tokenCounter == null || this.maxContextTokens == null) {
+      return null;
+    }
+    /** Refresh stale system overhead (handoff/summary changes) so instruction
+     *  tokens match the prompt a real call would send. */
+    this.initializeSystemRunnable();
+    /** Clone array-content messages: the pruner unshifts reasoning blocks into
+     *  AI content arrays in place, which would otherwise corrupt the caller's
+     *  history. (Slot replacements land on the mapped array, not the caller's.) */
+    const projected = messages.map((message) =>
+      Array.isArray(message.content)
+        ? cloneMessage(message, [...message.content])
+        : message
+    );
+    let indexTokenCountMap = opts?.indexTokenCountMap;
+    if (indexTokenCountMap == null) {
+      indexTokenCountMap = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[String(i)] = tokenCounter(messages[i]);
+      }
+    }
+    const prune = createPruneMessages({
+      startIndex: 0,
+      provider: this.provider,
+      tokenCounter,
+      maxTokens: this.maxContextTokens,
+      thinkingEnabled: isThinkingEnabled(this.provider, this.clientOptions),
+      indexTokenCountMap,
+      contextPruningConfig: this.contextPruningConfig,
+      summarizationEnabled: this.summarizationEnabled,
+      reserveRatio: this.summarizationConfig?.reserveRatio,
+      calibrationRatio: opts?.calibrationRatio ?? this.calibrationRatio,
+      getInstructionTokens: () => this.instructionTokens,
+    });
+    const {
+      context,
+      prePruneContextTokens,
+      remainingContextTokens,
+      contextBudget,
+      effectiveInstructionTokens,
+      calibrationRatio,
+    } = prune({
+      messages: projected,
+      usageMetadata: undefined,
+      lastCallUsage: undefined,
+      totalTokensFresh: false,
+    });
+    const breakdown = this.getTokenBudgetBreakdown(messages);
+    breakdown.messageCount = context.length;
+    const usage: t.ContextUsageEvent = {
+      runId: opts?.runId,
+      agentId: opts?.agentId,
+      breakdown,
+      contextBudget,
+      effectiveInstructionTokens,
+      prePruneContextTokens,
+      remainingContextTokens,
+      calibrationRatio,
+    };
+    syncBudgetDerivedFields(usage);
+    return usage;
   }
 
   /**
@@ -970,6 +1490,14 @@ export class AgentContext {
     }
     if (hasNewDiscoveries) {
       this.systemRunnableStale = true;
+      /** Refresh schema token accounting so the next call's budget and
+       *  per-tool breakdown include the newly discovered tools; awaited
+       *  via tokenCalculationPromise before the next model call */
+      if (this.tokenCounter) {
+        this.tokenCalculationPromise = this.calculateInstructionTokens(
+          this.tokenCounter
+        );
+      }
     }
     return hasNewDiscoveries;
   }
@@ -987,10 +1515,7 @@ export class AgentContext {
       return this.getEventDrivenToolsForBinding();
     }
 
-    const filtered =
-      !this.tools || !this.toolRegistry
-        ? this.tools
-        : this.filterToolsForBinding(this.tools);
+    const filtered = this.getEffectiveInstanceTools();
 
     if (this.graphTools && this.graphTools.length > 0) {
       return [...(filtered ?? []), ...this.graphTools];
@@ -1005,21 +1530,9 @@ export class AgentContext {
       return this.graphTools ?? [];
     }
 
-    const defsToInclude = this.toolDefinitions.filter((def) => {
-      const allowedCallers = def.allowed_callers ?? ['direct'];
-      if (!allowedCallers.includes('direct')) {
-        return false;
-      }
-      if (
-        def.defer_loading === true &&
-        !this.discoveredToolNames.has(def.name)
-      ) {
-        return false;
-      }
-      return true;
-    });
-
-    const schemaTools = createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+    const schemaTools = createSchemaOnlyTools(
+      this.getActiveToolDefinitions()
+    ) as t.GraphTools;
 
     const allTools = [...schemaTools];
 
@@ -1027,8 +1540,9 @@ export class AgentContext {
       allTools.push(...this.graphTools);
     }
 
-    if (this.tools && this.tools.length > 0) {
-      allTools.push(...this.tools);
+    const instanceTools = this.getEffectiveInstanceTools();
+    if (instanceTools && instanceTools.length > 0) {
+      allTools.push(...instanceTools);
     }
 
     return allTools;

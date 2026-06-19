@@ -1,12 +1,12 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment */
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
 import { type OpenAI as OpenAIClient } from 'openai';
-import type {
-  ChatCompletionContentPartText,
-  ChatCompletionContentPartImage,
-  ChatCompletionContentPartInputAudio,
-  ChatCompletionContentPart,
-} from 'openai/resources/chat/completions';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import {
+  convertLangChainToolCallToOpenAI,
+  makeInvalidToolCall,
+  parseToolCall,
+} from '@langchain/core/output_parsers/openai_tools';
 import {
   AIMessage,
   AIMessageChunk,
@@ -16,7 +16,7 @@ import {
   isAIMessage,
   type UsageMetadata,
   type BaseMessageFields,
-  type MessageContent,
+  type MessageContentComplex,
   type InvalidToolCall,
   type MessageContentImageUrl,
   StandardContentBlockConverter,
@@ -25,18 +25,24 @@ import {
   convertToProviderContentBlock,
   isDataContentBlock,
 } from '@langchain/core/messages';
-import { ChatGenerationChunk } from '@langchain/core/outputs';
-import {
-  convertLangChainToolCallToOpenAI,
-  makeInvalidToolCall,
-  parseToolCall,
-} from '@langchain/core/output_parsers/openai_tools';
-import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type {
+  ChatCompletionContentPartText,
+  ChatCompletionContentPartImage,
+  ChatCompletionContentPartInputAudio,
+  ChatCompletionContentPart,
+} from 'openai/resources/chat/completions';
 import type {
   OpenAICallOptions,
   OpenAIChatInput,
   ChatOpenAIReasoningSummary,
 } from '@langchain/openai';
+import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
+import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };
 
@@ -326,6 +332,45 @@ function filterImagePartsIfNeeded(
     : [{ type: 'text' as const, text: IMAGE_OMITTED_PLACEHOLDER }];
 }
 
+/**
+ * Strips image content parts from messages for non-vision models, at the message
+ * level (mirrors filterImagePartsIfNeeded). Used as the single choke point before
+ * delegating to the base streaming so images never reach a model that would reject
+ * them ("model is not a multimodal model" / "No endpoints found that support image
+ * input"). Returns the input unchanged when visionCapable is true.
+ */
+export function stripImagesFromMessages(
+  messages: BaseMessage[],
+  visionCapable: boolean
+): BaseMessage[] {
+  if (visionCapable) {
+    return messages;
+  }
+  return messages.map((msg) => {
+    if (!Array.isArray(msg.content)) {
+      return msg;
+    }
+    const hasImage = msg.content.some(
+      (part) =>
+        part != null &&
+        typeof part === 'object' &&
+        (part as { type?: string }).type === 'image_url'
+    );
+    if (!hasImage) {
+      return msg;
+    }
+    const clone = Object.assign(
+      Object.create(Object.getPrototypeOf(msg)),
+      msg
+    ) as BaseMessage;
+    clone.content = filterImagePartsIfNeeded(
+      msg.content,
+      false
+    ) as BaseMessage['content'];
+    return clone;
+  });
+}
+
 // Used in LangSmith, export is important here
 export function _convertMessagesToOpenAIParams(
   messages: BaseMessage[],
@@ -333,7 +378,7 @@ export function _convertMessagesToOpenAIParams(
   options?: ConvertMessagesOptions
 ): OpenAICompletionParam[] {
   const visionCapable = options?.visionCapable ?? true;
-
+  let hasReasoningToolCallContext = false;
   // TODO: Function messages do not support array content, fix cast
   return messages.flatMap((message) => {
     let role = messageToOpenAIRole(message);
@@ -404,6 +449,8 @@ export function _convertMessagesToOpenAIParams(
       role,
       content,
     };
+    let messageHasToolCalls = false;
+    let messageIsToolResult = false;
     if (message.name != null) {
       completionParam.name = message.name;
     }
@@ -412,17 +459,11 @@ export function _convertMessagesToOpenAIParams(
       completionParam.content = '';
     }
     if (isAIMessage(message) && !!message.tool_calls?.length) {
+      messageHasToolCalls = true;
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToOpenAI
       );
       completionParam.content = hasAnthropicThinkingBlock ? content : '';
-      if (
-        options?.includeReasoningContent === true &&
-        message.additional_kwargs.reasoning_content != null
-      ) {
-        completionParam.reasoning_content =
-          message.additional_kwargs.reasoning_content;
-      }
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null
@@ -470,14 +511,10 @@ export function _convertMessagesToOpenAIParams(
       }
     } else {
       if (message.additional_kwargs.tool_calls != null) {
+        messageHasToolCalls =
+          !Array.isArray(message.additional_kwargs.tool_calls) ||
+          message.additional_kwargs.tool_calls.length > 0;
         completionParam.tool_calls = message.additional_kwargs.tool_calls;
-        if (
-          options?.includeReasoningContent === true &&
-          message.additional_kwargs.reasoning_content != null
-        ) {
-          completionParam.reasoning_content =
-            message.additional_kwargs.reasoning_content;
-        }
         if (
           options?.includeReasoningDetails === true &&
           message.additional_kwargs.reasoning_details != null
@@ -525,8 +562,24 @@ export function _convertMessagesToOpenAIParams(
         }
       }
       if ((message as ToolMessage).tool_call_id != null) {
+        messageIsToolResult = true;
         completionParam.tool_call_id = (message as ToolMessage).tool_call_id;
       }
+    }
+
+    if (
+      options?.includeReasoningContent === true &&
+      isAIMessage(message) &&
+      (hasReasoningToolCallContext || messageHasToolCalls) &&
+      typeof message.additional_kwargs.reasoning_content === 'string' &&
+      message.additional_kwargs.reasoning_content !== ''
+    ) {
+      completionParam.reasoning_content =
+        message.additional_kwargs.reasoning_content;
+    }
+
+    if (messageHasToolCalls || messageIsToolResult) {
+      hasReasoningToolCallContext = true;
     }
 
     if (
@@ -594,6 +647,9 @@ export function _convertMessagesToOpenAIResponsesParams(
           type?: string;
           refusal?: string;
         };
+      const responseMetadata = lcMsg.response_metadata as {
+        output?: ResponsesInputItem[];
+      };
 
       let role = messageToOpenAIRole(lcMsg);
       if (role === 'system' && isReasoningModel(model)) role = 'developer';
@@ -688,12 +744,12 @@ export function _convertMessagesToOpenAIResponsesParams(
         // if we have the original response items, just reuse them
         if (
           !zdrEnabled &&
-          lcMsg.response_metadata.output != null &&
-          Array.isArray(lcMsg.response_metadata.output) &&
-          lcMsg.response_metadata.output.length > 0 &&
-          lcMsg.response_metadata.output.every((item) => 'type' in item)
+          responseMetadata.output != null &&
+          Array.isArray(responseMetadata.output) &&
+          responseMetadata.output.length > 0 &&
+          responseMetadata.output.every((item) => 'type' in item)
         ) {
-          return lcMsg.response_metadata.output;
+          return responseMetadata.output;
         }
 
         // otherwise, try to reconstruct the response from what we have
@@ -709,7 +765,13 @@ export function _convertMessagesToOpenAIResponsesParams(
         }
 
         // ai content
-        let { content } = lcMsg;
+        let content = lcMsg.content as
+          | string
+          | Array<
+              | MessageContentComplex
+              | OpenAIClient.Responses.ResponseOutputText
+              | OpenAIClient.Responses.ResponseOutputRefusal
+            >;
         if (additional_kwargs.refusal) {
           if (typeof content === 'string') {
             content = [{ type: 'output_text', text: content, annotations: [] }];
@@ -731,11 +793,13 @@ export function _convertMessagesToOpenAIResponsesParams(
               ? content
               : content.flatMap((item) => {
                 if (item.type === 'text') {
+                  const textItem = item as MessageContentComplex & {
+                      annotations?: unknown[];
+                    };
                   return {
                     type: 'output_text',
                     text: item.text,
-                    // @ts-expect-error TODO: add types for `annotations`
-                    annotations: item.annotations ?? [],
+                    annotations: textItem.annotations ?? [],
                   };
                 }
 
@@ -745,7 +809,7 @@ export function _convertMessagesToOpenAIResponsesParams(
 
                 return [];
               }),
-        });
+        } as ResponsesInputItem);
 
         const functionCallIds = additional_kwargs[_FUNCTION_CALL_IDS_MAP_KEY];
 
@@ -776,12 +840,9 @@ export function _convertMessagesToOpenAIResponsesParams(
         }
 
         const toolOutputs =
-          ((
-            lcMsg.response_metadata.output as
-              | Array<ResponsesInputItem>
-              | undefined
-          )?.length ?? 0) > 0
-            ? lcMsg.response_metadata.output
+          ((responseMetadata.output as Array<ResponsesInputItem> | undefined)
+            ?.length ?? 0) > 0
+            ? responseMetadata.output
             : additional_kwargs.tool_outputs;
 
         const fallthroughCallTypes: ResponsesInputItem['type'][] = [
@@ -811,70 +872,63 @@ export function _convertMessagesToOpenAIResponsesParams(
         }
 
         const messages: ResponsesInputItem[] = [];
-        const content = lcMsg.content.flatMap((item) => {
-          if (item.type === 'mcp_approval_response') {
-            messages.push({
-              // @ts-ignore
-              type: 'mcp_approval_response',
-              approval_request_id: item.approval_request_id,
-              approve: item.approve,
-            });
-          }
-          if (isDataContentBlock(item)) {
-            return convertToProviderContentBlock(
-              item,
-              completionsApiContentBlockConverter
-            );
-          }
-          if (item.type === 'text') {
-            return {
-              type: 'input_text',
-              text: item.text,
-            };
-          }
-          if (item.type === 'image_url') {
-            if (!visionCapable) {
-              return [];
+        const content = (lcMsg.content as MessageContentComplex[]).flatMap(
+          (item) => {
+            if (item.type === 'mcp_approval_response') {
+              const approvalResponse = item as MessageContentComplex & {
+                approval_request_id: string;
+                approve: boolean;
+              };
+              messages.push({
+                // @ts-ignore
+                type: 'mcp_approval_response',
+                approval_request_id: approvalResponse.approval_request_id,
+                approve: approvalResponse.approve,
+              });
             }
-            // Normalize image_url to ensure correct format
-            const imageUrl = item.image_url;
-            const imageUrlValue =
-              typeof imageUrl === 'string'
-                ? imageUrl
-                : (imageUrl?.url ?? String(imageUrl));
-            const detailValue =
-              typeof imageUrl === 'string'
-                ? 'auto'
-                : (imageUrl?.detail ?? 'auto');
-            return {
-              type: 'input_image',
-              image_url: imageUrlValue,
-              detail: detailValue,
-            };
+            if (isDataContentBlock(item)) {
+              return convertToProviderContentBlock(
+                item,
+                completionsApiContentBlockConverter
+              );
+            }
+            if (item.type === 'text') {
+              return {
+                type: 'input_text',
+                text: item.text,
+              };
+            }
+            if (item.type === 'image_url') {
+              const imageItem = item as MessageContentImageUrl;
+              return {
+                type: 'input_image',
+                image_url:
+                  typeof imageItem.image_url === 'string'
+                    ? imageItem.image_url
+                    : imageItem.image_url.url,
+                detail:
+                  typeof imageItem.image_url === 'string'
+                    ? 'auto'
+                    : imageItem.image_url.detail,
+              };
+            }
+            if (
+              item.type === 'input_text' ||
+              item.type === 'input_image' ||
+              item.type === 'input_file'
+            ) {
+              return item;
+            }
+            return [];
           }
-          if (
-            item.type === 'input_text' ||
-            item.type === 'input_image' ||
-            item.type === 'input_file'
-          ) {
-            return item;
-          }
-          return [];
-        });
+        );
 
-        const finalContent =
-          content.length > 0
-            ? content
-            : !visionCapable
-              ? [
-                {
-                  type: 'input_text' as const,
-                  text: IMAGE_OMITTED_PLACEHOLDER,
-                },
-              ]
-              : content;
-        if (finalContent.length > 0) {
-          messages.push({ type: 'message', role, content: finalContent });
+        if (content.length > 0) {
+          messages.push({
+            type: 'message',
+            role,
+            content,
+          } as ResponsesInputItem);
         }
         return messages;
       }
@@ -902,7 +956,7 @@ function _convertOpenAIResponsesMessageToBaseMessage(
   }
 
   let messageId: string | undefined;
-  const content: MessageContent = [];
+  const content: MessageContentComplex[] = [];
   const tool_calls: ToolCall[] = [];
   const invalid_tool_calls: InvalidToolCall[] = [];
   const response_metadata: Record<string, unknown> = {
@@ -988,7 +1042,7 @@ function _convertOpenAIResponsesMessageToBaseMessage(
 
   return new AIMessage({
     id: messageId,
-    content,
+    content: toLangChainContent(content),
     tool_calls,
     invalid_tool_calls,
     usage_metadata: response.usage,
@@ -1000,7 +1054,7 @@ function _convertOpenAIResponsesMessageToBaseMessage(
 export function _convertOpenAIResponsesDeltaToBaseMessageChunk(
   chunk: ResponseReturnStreamEvents
 ) {
-  const content: Record<string, unknown>[] = [];
+  const content: MessageContentComplex[] = [];
   let generationInfo: Record<string, unknown> = {};
   let usage_metadata: UsageMetadata | undefined;
   const tool_call_chunks: ToolCallChunk[] = [];
@@ -1036,6 +1090,8 @@ export function _convertOpenAIResponsesDeltaToBaseMessageChunk(
     chunk.type === 'response.output_item.added' &&
     chunk.item.type === 'function_call'
   ) {
+    response_metadata[STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY] =
+      OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER;
     tool_call_chunks.push({
       type: 'tool_call_chunk',
       name: chunk.item.name,
@@ -1076,9 +1132,24 @@ export function _convertOpenAIResponsesDeltaToBaseMessageChunk(
       if (key !== 'id') response_metadata[key] = value;
     }
   } else if (chunk.type === 'response.function_call_arguments.delta') {
+    response_metadata[STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY] =
+      OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER;
     tool_call_chunks.push({
       type: 'tool_call_chunk',
       args: chunk.delta,
+      index: chunk.output_index,
+    });
+  } else if (chunk.type === 'response.function_call_arguments.done') {
+    response_metadata[STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY] =
+      OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER;
+    response_metadata[STREAMED_TOOL_CALL_SEAL_METADATA_KEY] = {
+      kind: 'single',
+      index: chunk.output_index,
+    };
+    tool_call_chunks.push({
+      type: 'tool_call_chunk',
+      name: chunk.name,
+      args: chunk.arguments,
       index: chunk.output_index,
     });
   } else if (
@@ -1138,10 +1209,10 @@ export function _convertOpenAIResponsesDeltaToBaseMessageChunk(
 
   return new ChatGenerationChunk({
     // Legacy reasons, `onLLMNewToken` should pulls this out
-    text: content.map((part) => part.text).join(''),
+    text: content.map((part) => ('text' in part ? part.text : '')).join(''),
     message: new AIMessageChunk({
       id,
-      content,
+      content: toLangChainContent(content),
       tool_call_chunks,
       usage_metadata,
       additional_kwargs,

@@ -18,9 +18,12 @@ import {
   preFlightTruncateToolCallInputs,
   repairOrphanedToolMessages,
   sanitizeOrphanToolBlocks,
+  enforceOriginalContentCap,
+  ORIGINAL_CONTENT_MAX_CHARS,
   createPruneMessages,
 } from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
+import { ensureThinkingBlockInMessages } from '@/messages/format';
 import { Providers, ContentTypes } from '@/common';
 import { Run } from '@/run';
 
@@ -467,6 +470,53 @@ describe('Prune Messages Tests', () => {
       expect(Array.isArray(result.messagesToRefine)).toBe(true);
       expect(result.messagesToRefine?.length).toBe(2);
       expect(typeof result.remainingContextTokens).toBe('number');
+    });
+
+    it('should return remaining tokens in calibrated units when pruning with calibration', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages = [
+        new SystemMessage('System instruction'),
+        new HumanMessage('Message 1'),
+        new AIMessage('Response 1'),
+        new HumanMessage('Message 2'),
+        new AIMessage('Response 2'),
+      ];
+
+      const indexTokenCountMap = {
+        0: tokenCounter(messages[0]),
+        1: tokenCounter(messages[1]),
+        2: tokenCounter(messages[2]),
+        3: tokenCounter(messages[3]),
+        4: tokenCounter(messages[4]),
+      };
+
+      const calibrationRatio = 2;
+      const maxTokens = 80;
+      const pruneMessages = createPruneMessages({
+        maxTokens,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        reserveRatio: 0,
+        calibrationRatio,
+      });
+
+      const result = pruneMessages({ messages });
+
+      expect(result.messagesToRefine?.length).toBeGreaterThan(0);
+
+      /** Pruning selects within rawSpaceBudget = maxTokens / ratio (raw units,
+       *  minus the 3-token assistant label); the returned remaining must be
+       *  scaled back so `budget - remaining` reflects provider-space usage */
+      const keptRaw = result.context.reduce(
+        (sum, msg) => sum + tokenCounter(msg),
+        0
+      );
+      const rawSpaceBudget = Math.round(maxTokens / calibrationRatio);
+      const expectedRemaining =
+        (rawSpaceBudget - keptRaw - 3) * calibrationRatio;
+      expect(result.remainingContextTokens).toBe(expectedRemaining);
+      expect(result.contextBudget).toBe(maxTokens);
     });
 
     it('should respect startType parameter', () => {
@@ -1394,7 +1444,10 @@ describe('Prune Messages Tests', () => {
       expect(result.context).toEqual([]);
       expect(result.messagesToRefine).toEqual([]);
       expect(result.prePruneContextTokens).toBe(0);
-      expect(result.remainingContextTokens).toBe(8000);
+      /** Reserve-adjusted budget (8000 − 5%) minus instruction overhead */
+      expect(result.contextBudget).toBe(7600);
+      expect(result.effectiveInstructionTokens).toBe(4000);
+      expect(result.remainingContextTokens).toBe(3600);
     });
   });
 
@@ -1531,6 +1584,43 @@ describe('Prune Messages Tests', () => {
       const finalMessages = run.getRunMessages();
       expect(finalMessages).toBeDefined();
       expect(finalMessages?.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('enforceOriginalContentCap', () => {
+    it('is a no-op when total chars are below the cap', () => {
+      const map = new Map<number, string>([
+        [0, 'a'.repeat(100)],
+        [1, 'b'.repeat(200)],
+      ]);
+      enforceOriginalContentCap(map);
+      expect(map.size).toBe(2);
+      expect(map.get(0)?.length).toBe(100);
+      expect(map.get(1)?.length).toBe(200);
+    });
+
+    it('evicts oldest entries (by Map insertion order) until under the cap', () => {
+      const map = new Map<number, string>();
+      // Insert 4 entries totaling well over the cap, in insertion order
+      // 0, 1, 2, 3.  Each entry is roughly 700_000 chars (>1/3 of cap).
+      const big = 'x'.repeat(700_000);
+      map.set(0, big);
+      map.set(1, big);
+      map.set(2, big);
+      map.set(3, big);
+
+      // 4 * 700_000 = 2_800_000 > 2_000_000 cap.  Eviction should drop
+      // the oldest entry (key 0) — leaving 3 * 700_000 = 2_100_000 still
+      // > cap, so key 1 is also dropped — 2 * 700_000 = 1_400_000 ≤ cap.
+      enforceOriginalContentCap(map);
+      expect(map.has(0)).toBe(false);
+      expect(map.has(1)).toBe(false);
+      expect(map.has(2)).toBe(true);
+      expect(map.has(3)).toBe(true);
+    });
+
+    it('exposes the cap as a constant for callers', () => {
+      expect(ORIGINAL_CONTENT_MAX_CHARS).toBe(2_000_000);
     });
   });
 });
@@ -1928,5 +2018,610 @@ describe('prunedMemory ordering with thinking enabled', () => {
     if (evalAiIdx >= 0 && evalToolIdx >= 0) {
       expect(evalAiIdx).toBeLessThan(evalToolIdx);
     }
+  });
+});
+
+describe('thinking enabled — tail tool_use without a thinking block (issue #115)', () => {
+  it('does not throw when the trailing AI message issued a tool call without a thinking block', () => {
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('first turn'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'thinking about the first response',
+            signature: 'sig0',
+          },
+          { type: 'text', text: 'first reply' },
+        ],
+      }),
+      new HumanMessage('please read this doc and tell me X'),
+      // Anthropic may emit a tool_use without an accompanying thinking block —
+      // valid API behavior that the pruner must tolerate.
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'a'.repeat(8000), // huge tool result that pushes us past budget
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    expect(() =>
+      realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200, // tight budget so pruning actually runs
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        reasoningType: ContentTypes.THINKING,
+      })
+    ).not.toThrow();
+  });
+
+  it('returns a prunable context for the [AI tool_use, Tool] tail without a thinking block', () => {
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('please read this doc'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'b'.repeat(6000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    const result = realGetMessagesWithinTokenLimit({
+      messages,
+      maxContextTokens: 200,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      tokenCounter,
+      reasoningType: ContentTypes.THINKING,
+    });
+
+    expect(result.context).toBeDefined();
+    expect(result.messagesToRefine.length).toBeGreaterThan(0);
+    expect(result.thinkingStartIndex).toBeUndefined();
+  });
+
+  it('handles consecutive tool calls without any thinking block in the tail', () => {
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('do two things'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_1',
+            name: 'tool_a',
+            input: { x: 1 },
+          },
+        ],
+        tool_calls: [
+          { id: 'tc_1', name: 'tool_a', args: { x: 1 }, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'result_a',
+        tool_call_id: 'tc_1',
+        name: 'tool_a',
+      }),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_2',
+            name: 'tool_b',
+            input: { y: 2 },
+          },
+        ],
+        tool_calls: [
+          { id: 'tc_2', name: 'tool_b', args: { y: 2 }, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'd'.repeat(6000),
+        tool_call_id: 'tc_2',
+        name: 'tool_b',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    const result = realGetMessagesWithinTokenLimit({
+      messages,
+      maxContextTokens: 200,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      tokenCounter,
+      reasoningType: ContentTypes.THINKING,
+    });
+    expect(result.thinkingStartIndex).toBeUndefined();
+  });
+
+  it('honors prior runThinkingStartIndex carry-over when the next call has a no-thinking tail', () => {
+    // First call's tight budget forces pruning, which makes the closure
+    // record the AI(thinking) message's index in runThinkingStartIndex.
+    // Second call's tail is AI(tool_use) without a thinking block; the
+    // pre-loaded thinkingBlock from the carry-over keeps the new guard
+    // dormant and the existing reattachment path runs. Verifies the fix
+    // doesn't disturb the carry-over interaction.
+    const tokenCounter = createTestTokenCounter();
+    const firstTurn: BaseMessage[] = [
+      new HumanMessage('h'.repeat(120)),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'planning the response',
+            signature: 'sig-prior',
+          },
+          { type: 'text', text: 'hi' },
+        ],
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < firstTurn.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(firstTurn[i]);
+    }
+
+    const pruneMessages = createPruneMessages({
+      maxTokens: 68,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      reserveRatio: 0,
+    });
+
+    const firstResult = pruneMessages({ messages: firstTurn });
+    expect(firstResult.messagesToRefine?.length).toBeGreaterThan(0);
+    expect(firstResult.context.some((m) => m.getType() === 'ai')).toBe(true);
+
+    const secondTurn: BaseMessage[] = [
+      ...firstTurn,
+      new HumanMessage('please read the doc'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'e'.repeat(40),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    let secondResult: ReturnType<typeof pruneMessages> | undefined;
+    expect(() => {
+      secondResult = pruneMessages({ messages: secondTurn });
+    }).not.toThrow();
+
+    // Carry-over reattachment: even though the trailing AI(tool_use) has
+    // no thinking block of its own, the closure's runThinkingStartIndex
+    // points at the prior AI(thinking) and that block gets prepended to
+    // the surviving AI message in context.
+    const trailingAi = secondResult!.context.find(
+      (m) =>
+        m.getType() === 'ai' &&
+        Array.isArray(m.content) &&
+        (m.content as t.ExtendedMessageContent[]).some(
+          (c) => typeof c === 'object' && c.type === 'tool_use'
+        )
+    );
+    expect(trailingAi).toBeDefined();
+    expect(
+      (trailingAi!.content as t.ExtendedMessageContent[]).some(
+        (c) => typeof c === 'object' && c.type === ContentTypes.THINKING
+      )
+    ).toBe(true);
+  });
+
+  it('integrates with ensureThinkingBlockInMessages so the API-bound payload stays valid', () => {
+    // Models the full Graph.ts pipeline: pruner runs first, then
+    // ensureThinkingBlockInMessages on the pruned context. The pruner used
+    // to throw on the issue #115 tail; with the fix it returns the
+    // messages, and ensureThinkingBlockInMessages folds the orphan
+    // AI(tool_use)+Tool tail into a `[Previous agent context]`
+    // HumanMessage. The Tool size is tuned so the trailing sequence
+    // actually survives pruning — otherwise the assertions would be
+    // vacuous.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('please read this doc and tell me X'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'f'.repeat(100),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    const pruneResult = realGetMessagesWithinTokenLimit({
+      messages,
+      maxContextTokens: 300,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      tokenCounter,
+      reasoningType: ContentTypes.THINKING,
+    });
+
+    expect(pruneResult.context.length).toBe(3);
+
+    const finalMessages = ensureThinkingBlockInMessages(
+      pruneResult.context,
+      Providers.ANTHROPIC
+    );
+
+    // ensureThinkingBlockInMessages should fold the orphan AI(tool_use)+Tool
+    // into a synthetic HumanMessage carrying the `[Previous agent context]`
+    // marker, leaving no AI(tool_use) in the outgoing payload.
+    expect(finalMessages.length).toBe(2);
+    expect(finalMessages[0]).toBeInstanceOf(HumanMessage);
+    expect(finalMessages[1]).toBeInstanceOf(HumanMessage);
+
+    const folded = finalMessages[1] as HumanMessage;
+    const foldedContent = folded.content;
+    const foldedText = Array.isArray(foldedContent)
+      ? (foldedContent as t.ExtendedMessageContent[])
+        .filter((c) => typeof c === 'object' && c.type === 'text')
+        .map((c) => String(c.text ?? ''))
+        .join('\n')
+      : String(foldedContent);
+    expect(foldedText).toContain('[Previous agent context]');
+
+    const hasOrphanToolUse = finalMessages.some((m) => {
+      if (m.getType() !== 'ai') {
+        return false;
+      }
+      const content = (m as AIMessage).content;
+      if (!Array.isArray(content)) {
+        return false;
+      }
+      return content.some(
+        (c) => typeof c === 'object' && c.type === 'tool_use'
+      );
+    });
+    expect(hasOrphanToolUse).toBe(false);
+  });
+
+  it('still preserves the thinking block when the trailing AI message has one', () => {
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'older thinking',
+            signature: 'sig-old',
+          },
+          { type: 'text', text: 'older reply' },
+        ],
+      }),
+      new HumanMessage('please read this doc'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'I will fetch the doc',
+            signature: 'sig-new',
+          },
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'c'.repeat(6000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    const result = realGetMessagesWithinTokenLimit({
+      messages,
+      maxContextTokens: 200,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      tokenCounter,
+      reasoningType: ContentTypes.THINKING,
+    });
+
+    expect(result.thinkingStartIndex).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('thinking enabled — non-Anthropic reasoning_content blocks (issue #191)', () => {
+  it('locates a trailing reasoning_content block even when reasoningType defaults to THINKING (DeepSeek/Qwen)', () => {
+    // DeepSeek-R1 and DashScope/Qwen-thinking route through the non-Bedrock
+    // branch, so the caller passes reasoningType: THINKING — but their blocks
+    // are tagged `reasoning_content` and are not normalized upstream. With a
+    // system prompt at index 0 and an all-AI/tool tail, the consume loop never
+    // pops a human to clear thinkingEndIndex (the issue #116 escape hatch), so
+    // searching only for `thinking` missed the present block and threw a fatal
+    // that permanently bricked the thread. The pruner must find the block by
+    // its actual shape instead.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new SystemMessage('you are a helpful assistant'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              text: 'I will fetch the doc',
+              signature: 'sig-new',
+            },
+          },
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'c'.repeat(6000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    let result: ReturnType<typeof realGetMessagesWithinTokenLimit> | undefined;
+    expect(() => {
+      result = realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200,
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        reasoningType: ContentTypes.THINKING,
+      });
+    }).not.toThrow();
+
+    // thinkingStartIndex is only set when the reasoning block is actually
+    // located — isolating the find fix (B) from the graceful-degradation
+    // safety net (C), which would swallow the throw without finding anything.
+    expect(result!.thinkingStartIndex).toBeGreaterThanOrEqual(0);
+  });
+
+  it('does not throw when a carried-over thinking sequence has no locatable block', () => {
+    // Models a stale runThinkingStartIndex carry-over pointing at an assistant
+    // message that has no reasoning block. The pruner cannot find a block, but
+    // a trailing AI/tool sequence keeps thinkingEndIndex set, so it used to
+    // reach the fatal "no thinking block found" throw. Defense in depth: a
+    // misconfiguration upstream of the pruner must not be able to brick the
+    // thread — degrade to the partially-pruned context instead.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('h'.repeat(100)),
+      new AIMessage({
+        content: [{ type: 'text', text: 'a reply with no reasoning block' }],
+      }),
+      new HumanMessage('please read the doc'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'x'.repeat(150),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    let result: ReturnType<typeof realGetMessagesWithinTokenLimit> | undefined;
+    expect(() => {
+      result = realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200,
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        thinkingStartIndex: 1,
+        reasoningType: ContentTypes.THINKING,
+      });
+    }).not.toThrow();
+
+    expect(result!.context.length).toBeGreaterThan(0);
+    expect(result!.messagesToRefine.length).toBeGreaterThan(0);
+    // The stale carried-over index must NOT be propagated: createPruneMessages
+    // persists it as runThinkingStartIndex, and a stale value would suppress
+    // the trailing scan on later turns and miss a real reasoning block.
+    expect(result!.thinkingStartIndex).toBeUndefined();
+  });
+
+  it('does not match an Anthropic thinking block for a Bedrock (reasoning_content) run', () => {
+    // The cross-type fallback is one-directional: REASONING_CONTENT (Bedrock)
+    // must not match a `thinking` block, since the Bedrock input converter
+    // rejects `thinking` blocks and reattaching one would break the request.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new SystemMessage('you are a helpful assistant'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'inherited Anthropic-style reasoning',
+            signature: 'sig-anthropic',
+          },
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'c'.repeat(6000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    let result: ReturnType<typeof realGetMessagesWithinTokenLimit> | undefined;
+    expect(() => {
+      result = realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200,
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        reasoningType: ContentTypes.REASONING_CONTENT,
+      });
+    }).not.toThrow();
+
+    // The thinking block is intentionally not located for a Bedrock run, so no
+    // index is reported and nothing gets reattached.
+    expect(result!.thinkingStartIndex).toBeUndefined();
   });
 });

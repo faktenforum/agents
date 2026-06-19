@@ -1,10 +1,22 @@
-import { ChatOpenRouter } from './index';
-import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
 import type { OpenAIChatInput } from '@langchain/openai';
+import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
+import { ChatOpenRouter } from './index';
 
 type CreateRouterOptions = Partial<
-  ChatOpenRouterCallOptions & Pick<OpenAIChatInput, 'model' | 'apiKey'>
+  ChatOpenRouterCallOptions &
+    Pick<OpenAIChatInput, 'model' | 'apiKey' | 'streamUsage'>
 >;
+
+type RuntimeInvocationParams = {
+  reasoning?: OpenRouterReasoning;
+  reasoning_effort?: string;
+};
+
+class RuntimeInspectableChatOpenRouter extends ChatOpenRouter {
+  getRuntimeInvocationParams(): RuntimeInvocationParams {
+    return this.completions.invocationParams() as RuntimeInvocationParams;
+  }
+}
 
 function createRouter(overrides: CreateRouterOptions = {}): ChatOpenRouter {
   return new ChatOpenRouter({
@@ -90,11 +102,39 @@ describe('ChatOpenRouter reasoning handling', () => {
       expect(params.reasoning_effort).toBeUndefined();
     });
 
+    it('passes reasoning to the runtime completions delegate', () => {
+      const router = new RuntimeInspectableChatOpenRouter({
+        model: 'openrouter/test-model',
+        apiKey: 'test-key',
+        reasoning: { max_tokens: 1024 },
+      });
+      const params = router.getRuntimeInvocationParams();
+      expect(params.reasoning).toEqual({ max_tokens: 1024 });
+      expect(params.reasoning_effort).toBeUndefined();
+    });
+
+    it('passes legacy include_reasoning to the runtime completions delegate', () => {
+      const router = new RuntimeInspectableChatOpenRouter({
+        model: 'openrouter/test-model',
+        apiKey: 'test-key',
+        include_reasoning: true,
+      });
+      const params = router.getRuntimeInvocationParams();
+      expect(params.reasoning).toEqual({ enabled: true });
+      expect(params.reasoning_effort).toBeUndefined();
+    });
+
     it('does not include reasoning when none is configured', () => {
       const router = createRouter();
       const params = router.invocationParams();
       expect(params.reasoning).toBeUndefined();
       expect(params.reasoning_effort).toBeUndefined();
+    });
+
+    it('preserves streaming extras from parent invocation params', () => {
+      const router = createRouter({ streamUsage: true });
+      const params = router.invocationParams(undefined, { streaming: true });
+      expect(params.stream_options).toEqual({ include_usage: true });
     });
   });
 

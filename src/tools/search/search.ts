@@ -2,6 +2,7 @@ import axios from 'axios';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
+import { createTavilyAPI } from './tavily-search';
 import { BaseReranker } from './rerankers';
 
 const chunker = {
@@ -65,6 +66,25 @@ const chunker = {
   },
 };
 
+const DEFAULT_MAX_CONTENT_LENGTH = 50000;
+
+/** Resolves the per-source scraped content cap from config, the
+ * `SEARCH_MAX_CONTENT_LENGTH` env var, or the default (50,000 chars) */
+function resolveMaxContentLength(maxContentLength?: number): number {
+  if (maxContentLength != null && maxContentLength > 0) {
+    return maxContentLength;
+  }
+  const envValue = Number(process.env.SEARCH_MAX_CONTENT_LENGTH);
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return envValue;
+  }
+  return DEFAULT_MAX_CONTENT_LENGTH;
+}
+
+function truncateContent(content: string, maxLength: number): string {
+  return content.length > maxLength ? content.slice(0, maxLength) : content;
+}
+
 function createSourceUpdateCallback(sourceMap: Map<string, t.ValidSource>) {
   return (link: string, update?: Partial<t.ValidSource>): void => {
     const source = sourceMap.get(link);
@@ -82,12 +102,14 @@ const getHighlights = async ({
   content,
   reranker,
   topResults = 5,
+  maxContentLength = DEFAULT_MAX_CONTENT_LENGTH,
   logger,
 }: {
   content: string;
   query: string;
   reranker?: BaseReranker;
   topResults?: number;
+  maxContentLength?: number;
   logger?: t.Logger;
 }): Promise<t.Highlight[] | undefined> => {
   const logger_ = logger || createDefaultLogger();
@@ -102,7 +124,9 @@ const getHighlights = async ({
   }
 
   try {
-    const documents = await chunker.splitText(content);
+    const documents = await chunker.splitText(
+      truncateContent(content, maxContentLength)
+    );
     if (Array.isArray(documents)) {
       return await reranker.rerank(query, documents, topResults);
     } else {
@@ -418,15 +442,20 @@ export const createSearchAPI = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilySearchUrl,
+    tavilySearchOptions,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
     return createSerperAPI(serperApiKey);
   } else if (searchProvider.toLowerCase() === 'searxng') {
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
+  } else if (searchProvider.toLowerCase() === 'tavily') {
+    return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper' or 'searxng'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
     );
   }
 };
@@ -451,8 +480,60 @@ export const createSourceProcessor = (
     logger,
   } = config;
 
+  const maxContentLength = resolveMaxContentLength(config.maxContentLength);
   const logger_ = logger || createDefaultLogger();
   const scraper = scraperInstance;
+
+  const processResponse = (
+    url: string,
+    response: t.AnyScraperResponse
+  ): t.ScrapeResult => {
+    const rawMetadata = scraper.extractMetadata(response);
+    const metadata =
+      Object.keys(rawMetadata).length > 0 ? rawMetadata : undefined;
+    const attribution = getAttribution(url, metadata, logger_);
+
+    if (response.success && response.data) {
+      const [content, references] = scraper.extractContent(response);
+      return {
+        url,
+        references,
+        attribution,
+        content: truncateContent(chunker.cleanText(content), maxContentLength),
+      };
+    }
+
+    logger_.error(
+      `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
+    );
+    return { url, attribution, error: true, content: '' };
+  };
+
+  const addHighlights = async (
+    result: t.ScrapeResult,
+    query: string,
+    onGetHighlights: t.SearchToolConfig['onGetHighlights']
+  ): Promise<t.ScrapeResult> => {
+    if (result.error != null) {
+      return result;
+    }
+    try {
+      const highlights = await getHighlights({
+        query,
+        reranker,
+        content: result.content,
+        maxContentLength,
+        logger: logger_,
+      });
+      if (onGetHighlights) {
+        onGetHighlights(result.url);
+      }
+      return { ...result, highlights };
+    } catch (error) {
+      logger_.error('Error processing scraped content:', error);
+      return result;
+    }
+  };
 
   const webScraper = {
     scrapeMany: async ({
@@ -465,80 +546,34 @@ export const createSourceProcessor = (
       onGetHighlights: t.SearchToolConfig['onGetHighlights'];
     }): Promise<Array<t.ScrapeResult>> => {
       logger_.debug(`Scraping ${links.length} links`);
-      const promises: Array<Promise<t.ScrapeResult>> = [];
       try {
-        for (let i = 0; i < links.length; i++) {
-          const currentLink = links[i];
-          const promise: Promise<t.ScrapeResult> = scraper
-            .scrapeUrl(currentLink, {})
-            .then(([url, response]) => {
-              const attribution = getAttribution(
-                url,
-                response.data?.metadata,
-                logger_
-              );
-              if (response.success && response.data) {
-                const [content, references] = scraper.extractContent(response);
-                return {
-                  url,
-                  references,
-                  attribution,
-                  content: chunker.cleanText(content),
-                } as t.ScrapeResult;
-              } else {
-                logger_.error(
-                  `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
-                );
-              }
+        let responses: Array<[string, t.AnyScraperResponse]>;
 
-              return {
-                url,
-                attribution,
-                error: true,
-                content: '',
-              } as t.ScrapeResult;
-            })
-            .then(async (result) => {
-              try {
-                if (result.error != null) {
-                  logger_.error(
-                    `Error scraping ${result.url}: ${result.content}`
-                  );
-                  return {
-                    ...result,
-                  };
-                }
-                const highlights = await getHighlights({
-                  query,
-                  reranker,
-                  content: result.content,
-                  logger: logger_,
-                });
-                if (onGetHighlights) {
-                  onGetHighlights(result.url);
-                }
-                return {
-                  ...result,
-                  highlights,
-                };
-              } catch (error) {
-                logger_.error('Error processing scraped content:', error);
-                return {
-                  ...result,
-                };
-              }
-            })
-            .catch((error) => {
-              logger_.error(`Error scraping ${currentLink}:`, error);
-              return {
-                url: currentLink,
-                error: true,
-                content: '',
-              };
-            });
-          promises.push(promise);
+        if (scraper.scrapeUrls) {
+          responses = await scraper.scrapeUrls(links);
+        } else {
+          responses = await Promise.all(
+            links.map((link) =>
+              scraper
+                .scrapeUrl(link, {})
+                .catch((error): [string, t.AnyScraperResponse] => {
+                  logger_.error(`Error scraping ${link}:`, error);
+                  return [link, { success: false, error: String(error) }];
+                })
+            )
+          );
         }
-        return await Promise.all(promises);
+
+        const withHighlights = await Promise.all(
+          responses.map(([url, response]) =>
+            addHighlights(
+              processResponse(url, response),
+              query,
+              onGetHighlights
+            )
+          )
+        );
+        return withHighlights;
       } catch (error) {
         logger_.error('Error in scrapeMany:', error);
         return [];
@@ -596,7 +631,20 @@ export const createSourceProcessor = (
           images: [],
           relatedSearches: [],
         };
-      } else if (!result.data.organic) {
+      }
+
+      if (
+        result.data.topStories != null &&
+        result.data.topStories.length > numElements
+      ) {
+        /** Merged news results can far exceed the requested source count;
+         * every entry is formatted into the LLM output, so cap them up
+         * front — before any early return below and before scraping
+         * entries the cap would discard */
+        result.data.topStories = result.data.topStories.slice(0, numElements);
+      }
+
+      if (!result.data.organic) {
         return result.data;
       }
 

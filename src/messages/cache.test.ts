@@ -1,10 +1,11 @@
 import {
   AIMessage,
   BaseMessage,
-  ToolMessage,
   HumanMessage,
-  MessageContentComplex,
+  SystemMessage,
+  ToolMessage,
 } from '@langchain/core/messages';
+import type { MessageContentComplex } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
 import {
@@ -12,8 +13,16 @@ import {
   stripBedrockCacheControl,
   addBedrockCacheControl,
   addCacheControl,
+  addCacheControlToStablePrefixMessages,
 } from './cache';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
+import { toLangChainContent } from './langchain';
+import { formatAgentMessages } from './format';
 import { ContentTypes } from '@/common/enum';
+
+type CacheControlBlock = MessageContentComplex & {
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' };
+};
 
 describe('addCacheControl', () => {
   test('should add cache control to the last two user messages with array content', () => {
@@ -280,23 +289,28 @@ type TestMsg = {
 };
 
 describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
-  it('returns input when not enough messages', () => {
+  it('returns empty input unchanged and caches a single user message', () => {
     const empty: TestMsg[] = [];
     expect(addBedrockCacheControl(empty)).toEqual(empty);
     const single: TestMsg[] = [{ role: 'user', content: 'only' }];
-    expect(addBedrockCacheControl(single)).toEqual(single);
+    expect(addBedrockCacheControl(single)[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'only' },
+      { cachePoint: { type: 'default' } },
+    ]);
   });
 
-  it('wraps string content and appends separate cachePoint block', () => {
+  it('wraps latest user string content and appends separate cachePoint block', () => {
     const messages: TestMsg[] = [
       { role: 'user', content: 'Hello' },
       { role: 'assistant', content: [{ type: ContentTypes.TEXT, text: 'Hi' }] },
     ];
     const result = addBedrockCacheControl(messages);
-    const last = result[1].content as MessageContentComplex[];
-    expect(Array.isArray(last)).toBe(true);
-    expect(last[0]).toEqual({ type: ContentTypes.TEXT, text: 'Hi' });
-    expect(last[1]).toEqual({ cachePoint: { type: 'default' } });
+    const user = result[0].content as MessageContentComplex[];
+    const assistant = result[1].content as MessageContentComplex[];
+    expect(Array.isArray(user)).toBe(true);
+    expect(user[0]).toEqual({ type: ContentTypes.TEXT, text: 'Hello' });
+    expect(user[1]).toEqual({ cachePoint: { type: 'default' } });
+    expect(assistant).toEqual([{ type: ContentTypes.TEXT, text: 'Hi' }]);
   });
 
   it('inserts cachePoint after the last text when multiple text blocks exist', () => {
@@ -338,20 +352,21 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
 
     expect(second[0]).toEqual({ type: ContentTypes.TEXT, text: 'Reply A' });
     expect(second[1]).toEqual({ type: ContentTypes.TEXT, text: 'Reply B' });
-    expect(second[2]).toEqual({ cachePoint: { type: 'default' } });
+    expect(second).toHaveLength(2);
   });
 
-  it('skips adding cachePoint when content is an empty array', () => {
+  it('skips empty arrays and caches the latest non-empty user message', () => {
     const messages: TestMsg[] = [
       { role: 'user', content: [] },
       { role: 'assistant', content: [] },
-      { role: 'user', content: 'ignored because only last two are modified' },
+      { role: 'user', content: 'latest cacheable user message' },
     ];
 
     const result = addBedrockCacheControl(messages);
 
     const first = result[0].content as MessageContentComplex[];
     const second = result[1].content as MessageContentComplex[];
+    const third = result[2].content as MessageContentComplex[];
 
     expect(Array.isArray(first)).toBe(true);
     expect(first.length).toBe(0);
@@ -359,39 +374,51 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(Array.isArray(second)).toBe(true);
     expect(second.length).toBe(0);
     expect(second[0]).not.toEqual({ cachePoint: { type: 'default' } });
+
+    expect(third).toEqual([
+      { type: ContentTypes.TEXT, text: 'latest cacheable user message' },
+      { cachePoint: { type: 'default' } },
+    ]);
   });
 
-  it('skips adding cachePoint when content is an empty string', () => {
+  it('skips empty strings and caches the latest non-empty user message', () => {
     const messages: TestMsg[] = [
       { role: 'user', content: '' },
       { role: 'assistant', content: '' },
-      { role: 'user', content: 'ignored because only last two are modified' },
+      { role: 'user', content: 'latest cacheable user message' },
     ];
 
     const result = addBedrockCacheControl(messages);
 
     expect(result[0].content).toBe('');
     expect(result[1].content).toBe('');
+    expect(result[2].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'latest cacheable user message' },
+      { cachePoint: { type: 'default' } },
+    ]);
   });
 
   /** (I don't think this will ever occur in actual use, but its the only branch left uncovered so I'm covering it */
-  it('skips messages with non-string, non-array content and still modifies the previous to reach two edits', () => {
+  it('skips messages with non-string, non-array content', () => {
     const messages: TestMsg[] = [
       {
         role: 'user',
-        content: [{ type: ContentTypes.TEXT, text: 'Will be modified' }],
+        content: [{ type: ContentTypes.TEXT, text: 'Older user message' }],
       },
       { role: 'assistant', content: undefined },
       {
         role: 'user',
-        content: [{ type: ContentTypes.TEXT, text: 'Also modified' }],
+        content: [{ type: ContentTypes.TEXT, text: 'Latest user message' }],
       },
     ];
 
     const result = addBedrockCacheControl(messages);
 
     const last = result[2].content as MessageContentComplex[];
-    expect(last[0]).toEqual({ type: ContentTypes.TEXT, text: 'Also modified' });
+    expect(last[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Latest user message',
+    });
     expect(last[1]).toEqual({ cachePoint: { type: 'default' } });
 
     expect(result[1].content).toBeUndefined();
@@ -399,12 +426,112 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     const first = result[0].content as MessageContentComplex[];
     expect(first[0]).toEqual({
       type: ContentTypes.TEXT,
-      text: 'Will be modified',
+      text: 'Older user message',
     });
     expect(first[1]).toEqual({ cachePoint: { type: 'default' } });
   });
 
-  it('works with the example from the langchain pr (with multi-turn behavior)', () => {
+  it('preserves LangChain system message content unchanged', () => {
+    const systemContent = [
+      { type: ContentTypes.TEXT, text: 'Stable system text' },
+      { cachePoint: { type: 'default' } },
+      { type: ContentTypes.TEXT, text: 'Dynamic system text' },
+    ] as MessageContentComplex[];
+    const messages: BaseMessage[] = [
+      new SystemMessage({ content: toLangChainContent(systemContent) }),
+      new HumanMessage('Hello'),
+      new AIMessage('Hi'),
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0]).toBe(messages[0]);
+    expect(result[0].content).toEqual(systemContent);
+  });
+
+  it('preserves serialized system message content unchanged', () => {
+    const systemContent = [
+      { type: ContentTypes.TEXT, text: 'Stable system text' },
+      { cachePoint: { type: 'default' } },
+      { type: ContentTypes.TEXT, text: 'Dynamic system text' },
+    ] as MessageContentComplex[];
+    const messages: TestMsg[] = [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0]).toBe(messages[0]);
+    expect(result[0].content).toEqual(systemContent);
+  });
+
+  it('strips Anthropic cache_control from LangChain system messages without moving cache points', () => {
+    const systemContent = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Stable system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+      { cachePoint: { type: 'default' } },
+      {
+        type: ContentTypes.TEXT,
+        text: 'Dynamic system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+    ] as MessageContentComplex[];
+    const messages: BaseMessage[] = [
+      new SystemMessage({ content: toLangChainContent(systemContent) }),
+      new HumanMessage('Hello'),
+      new AIMessage('Hi'),
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0]).not.toBe(messages[0]);
+    expect(result[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Stable system text' },
+      { cachePoint: { type: 'default' } },
+      { type: ContentTypes.TEXT, text: 'Dynamic system text' },
+    ]);
+    expect(systemContent[0]).toHaveProperty('cache_control');
+    expect(systemContent[2]).toHaveProperty('cache_control');
+  });
+
+  it('strips Anthropic cache_control from serialized system messages without moving cache points', () => {
+    const systemContent = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Stable system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+      { cachePoint: { type: 'default' } },
+      {
+        type: ContentTypes.TEXT,
+        text: 'Dynamic system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+    ] as MessageContentComplex[];
+    const messages: TestMsg[] = [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0]).not.toBe(messages[0]);
+    expect(result[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Stable system text' },
+      { cachePoint: { type: 'default' } },
+      { type: ContentTypes.TEXT, text: 'Dynamic system text' },
+    ]);
+    expect(systemContent[0]).toHaveProperty('cache_control');
+    expect(systemContent[2]).toHaveProperty('cache_control');
+  });
+
+  it('skips serialized system messages while adding a cache point to the latest user turn', () => {
     const messages: TestMsg[] = [
       {
         role: 'system',
@@ -429,7 +556,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
       type: ContentTypes.TEXT,
       text: 'You\'re an advanced AI assistant.',
     });
-    expect(system[1]).toEqual({ cachePoint: { type: 'default' } });
+    expect(system).toHaveLength(1);
     expect(user[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'What is the capital of France?',
@@ -468,7 +595,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
       type: ContentTypes.TEXT,
       text: 'Sure! The capital of France is Paris.',
     });
-    expect(assistant[1]).toEqual({ cachePoint: { type: 'default' } });
+    expect(assistant).toHaveLength(1);
   });
 
   it('is idempotent - calling multiple times does not add duplicate cache points', () => {
@@ -494,12 +621,11 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     });
     expect(firstContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
-    expect(secondContent.length).toBe(2);
+    expect(secondContent.length).toBe(1);
     expect(secondContent[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'First response',
     });
-    expect(secondContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
     const result2 = addBedrockCacheControl(result1);
     const firstContentAfter = result2[0].content as MessageContentComplex[];
@@ -512,15 +638,14 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     });
     expect(firstContentAfter[1]).toEqual({ cachePoint: { type: 'default' } });
 
-    expect(secondContentAfter.length).toBe(2);
+    expect(secondContentAfter.length).toBe(1);
     expect(secondContentAfter[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'First response',
     });
-    expect(secondContentAfter[1]).toEqual({ cachePoint: { type: 'default' } });
   });
 
-  it('skips messages that already have cache points in multi-agent scenarios', () => {
+  it('strips stale cache points and caches the latest user messages in multi-agent scenarios', () => {
     const messages: TestMsg[] = [
       {
         role: 'user',
@@ -540,8 +665,16 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     ];
 
     const result = addBedrockCacheControl(messages);
+    const firstContent = result[0].content as MessageContentComplex[];
     const lastContent = result[2].content as MessageContentComplex[];
     const secondLastContent = result[1].content as MessageContentComplex[];
+
+    expect(firstContent.length).toBe(2);
+    expect(firstContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hello',
+    });
+    expect(firstContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
     expect(lastContent.length).toBe(2);
     expect(lastContent[0]).toEqual({
@@ -550,12 +683,11 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     });
     expect(lastContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
-    expect(secondLastContent.length).toBe(2);
+    expect(secondLastContent.length).toBe(1);
     expect(secondLastContent[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'Response from agent 1',
     });
-    expect(secondLastContent[1]).toEqual({ cachePoint: { type: 'default' } });
   });
 
   it('skips cachePoint on AI messages with only whitespace text and reasoning (tool-call scenario)', () => {
@@ -597,6 +729,163 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(userContent[userContent.length - 1]).toEqual({
       cachePoint: { type: 'default' },
     });
+  });
+
+  it('keeps cachePoint on the stable user boundary through tool loops', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Use the stable prompt context.'),
+      new AIMessage({
+        content: 'I will call the first tool.',
+        tool_calls: [{ id: 'call_1', name: 'lookup', args: { step: 1 } }],
+      }),
+      new ToolMessage({
+        content: 'volatile tool result 1',
+        tool_call_id: 'call_1',
+      }),
+      new AIMessage({
+        content: 'I will call the second tool.',
+        tool_calls: [{ id: 'call_2', name: 'lookup', args: { step: 2 } }],
+      }),
+      new ToolMessage({
+        content: 'volatile tool result 2',
+        tool_call_id: 'call_2',
+      }),
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    const userContent = result[0].content as MessageContentComplex[];
+    expect(userContent[userContent.length - 1]).toEqual({
+      cachePoint: { type: 'default' },
+    });
+
+    for (const message of result.slice(1)) {
+      const content = message.content;
+      expect(
+        Array.isArray(content) && content.some((block) => 'cachePoint' in block)
+      ).toBe(false);
+    }
+  });
+});
+
+describe('synthetic skill/meta messages are not cache-anchored', () => {
+  const hasAnthropicMarker = (m: BaseMessage): boolean =>
+    Array.isArray(m.content) &&
+    m.content.some((block) => 'cache_control' in block);
+
+  const hasBedrockCachePoint = (m: BaseMessage): boolean =>
+    Array.isArray(m.content) &&
+    m.content.some((block) => 'cachePoint' in block);
+
+  const skillBody = (skillName: string, content = 'SKILL BODY'): HumanMessage =>
+    new HumanMessage({
+      content,
+      additional_kwargs: { isMeta: true, source: 'skill', skillName },
+    });
+
+  it('Anthropic: skips a trailing synthetic skill message; markers land on the real user messages', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('First real question'),
+      new AIMessage('Answer'),
+      new HumanMessage('Second real question'),
+      skillBody('pdf-analyzer'),
+    ];
+
+    const result = addCacheControl<BaseMessage>(messages);
+
+    expect(hasAnthropicMarker(result[3])).toBe(false);
+    expect(hasAnthropicMarker(result[2])).toBe(true);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+
+  it('Anthropic: strips a stale marker from a synthetic skill message without re-adding one', () => {
+    const stale = new HumanMessage({
+      content: toLangChainContent([
+        {
+          type: 'text',
+          text: 'SKILL BODY',
+          cache_control: { type: 'ephemeral' },
+        } as MessageContentComplex,
+      ]),
+      additional_kwargs: {
+        isMeta: true,
+        source: 'skill',
+        skillName: 'pdf-analyzer',
+      },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('Real question'),
+      new AIMessage('Answer'),
+      stale,
+    ];
+
+    const result = addCacheControl<BaseMessage>(messages);
+
+    expect(hasAnthropicMarker(result[2])).toBe(false);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+
+  it('Anthropic: detects skill messages by additional_kwargs.source even without isMeta', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Real question'),
+      new AIMessage('Answer'),
+      new HumanMessage({
+        content: 'SKILL BODY',
+        additional_kwargs: { source: 'skill', skillName: 'pdf-analyzer' },
+      }),
+    ];
+
+    const result = addCacheControl<BaseMessage>(messages);
+
+    expect(hasAnthropicMarker(result[2])).toBe(false);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+
+  it('Bedrock: skips a trailing synthetic skill message; cachePoints land on the real user messages', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('First real question'),
+      new AIMessage('Answer'),
+      new HumanMessage('Second real question'),
+      skillBody('pdf-analyzer'),
+    ];
+
+    const result = addBedrockCacheControl<BaseMessage>(messages);
+
+    expect(hasBedrockCachePoint(result[3])).toBe(false);
+    expect(hasBedrockCachePoint(result[2])).toBe(true);
+    expect(hasBedrockCachePoint(result[0])).toBe(true);
+  });
+
+  it('stable-prefix fallback: anchors the real user message, not a synthetic skill message', () => {
+    // Mirrors AgentContext's dynamic-tail path: the only assistant message is a
+    // skill-only tool call (no text), so the assistant-only pass adds no marker
+    // and the cacheable fallback runs. It must skip the reconstructed skill
+    // HumanMessage and anchor the real user message instead.
+    const messages: BaseMessage[] = [
+      new HumanMessage('Real stable question'),
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'tool_use',
+            id: 'call_1',
+            name: 'skill',
+            input: { skillName: 'pdf-analyzer' },
+          } as MessageContentComplex,
+        ]),
+        tool_calls: [
+          { id: 'call_1', name: 'skill', args: { skillName: 'pdf-analyzer' } },
+        ],
+      }),
+      skillBody('pdf-analyzer'),
+    ];
+
+    const result = addCacheControlToStablePrefixMessages<BaseMessage>(
+      messages,
+      2
+    );
+
+    expect(hasAnthropicMarker(result[2])).toBe(false);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
   });
 });
 
@@ -840,7 +1129,7 @@ describe('Multi-agent provider interoperability', () => {
     expect('cache_control' in secondContent[0]).toBe(false);
 
     expect(firstContent.some((b) => 'cachePoint' in b)).toBe(true);
-    expect(secondContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(secondContent.some((b) => 'cachePoint' in b)).toBe(false);
   });
 
   it('strips Bedrock cache using separate function (backwards compat)', () => {
@@ -1035,7 +1324,7 @@ describe('Immutability - addBedrockCacheControl does not mutate original message
     expect(typeof originalMessages[1].content).toBe('string');
 
     expect(Array.isArray(result[0].content)).toBe(true);
-    expect(Array.isArray(result[1].content)).toBe(true);
+    expect(result[1].content).toBe('Hi there');
   });
 
   it('should not mutate original messages when adding cache points to array content', () => {
@@ -1071,9 +1360,9 @@ describe('Immutability - addBedrockCacheControl does not mutate original message
     const resultFirstContent = result[0].content as MessageContentComplex[];
     const resultSecondContent = result[1].content as MessageContentComplex[];
     expect(resultFirstContent.length).toBe(originalFirstContentLength + 1);
-    expect(resultSecondContent.length).toBe(originalSecondContentLength + 1);
+    expect(resultSecondContent.length).toBe(originalSecondContentLength);
     expect(resultFirstContent.some((b) => 'cachePoint' in b)).toBe(true);
-    expect(resultSecondContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(resultSecondContent.some((b) => 'cachePoint' in b)).toBe(false);
   });
 
   it('should not mutate original messages when stripping existing cache control', () => {
@@ -1232,13 +1521,13 @@ describe('Multi-turn cache cleanup', () => {
     const lastContent = result[3].content as MessageContentComplex[];
     const secondLastContent = result[2].content as MessageContentComplex[];
 
-    expect(lastContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(lastContent.some((b) => 'cachePoint' in b)).toBe(false);
     expect(secondLastContent.some((b) => 'cachePoint' in b)).toBe(true);
 
     const firstContent = result[0].content as MessageContentComplex[];
     const secondContent = result[1].content as MessageContentComplex[];
 
-    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(true);
     expect(secondContent.some((b) => 'cachePoint' in b)).toBe(false);
   });
 
@@ -1308,6 +1597,27 @@ describe('Multi-turn cache cleanup', () => {
 });
 
 describe('LangChain message type preservation', () => {
+  it('preserves direct roles for formatted LangChain messages after addCacheControl', () => {
+    const { messages } = formatAgentMessages([
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi there' },
+      { role: 'user', content: 'Thanks' },
+    ]);
+
+    const result = addCacheControl(messages);
+
+    expect(result.map((message) => message.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(result[0]).not.toBe(messages[0]);
+    expect(Object.keys(result[0])).not.toContain('role');
+    expect(result[1]).toBe(messages[1]);
+    expect(result[2]).not.toBe(messages[2]);
+  });
+
   it('should preserve instanceof for LangChain messages after addCacheControl', () => {
     const messages: BaseMessage[] = [
       new HumanMessage({ content: [{ type: 'text', text: 'Hello' }] }),
@@ -1379,5 +1689,127 @@ describe('LangChain message type preservation', () => {
     // Verify tool_calls are preserved
     expect((result[1] as AIMessage).tool_calls).toHaveLength(1);
     expect((result[1] as AIMessage).tool_calls![0].name).toBe('navigate');
+  });
+});
+
+describe('OpenRouter prompt caching (reuses addCacheControl)', () => {
+  it('adds cache_control to LangChain messages for OpenRouter (same format as Anthropic)', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({ content: [{ type: 'text', text: 'System context' }] }),
+      new AIMessage({ content: [{ type: 'text', text: 'Acknowledged' }] }),
+      new HumanMessage({ content: [{ type: 'text', text: 'User query' }] }),
+    ];
+
+    const result = addCacheControl(messages);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+    const lastContent = result[2].content as MessageContentComplex[];
+
+    expect((firstContent[0] as CacheControlBlock).cache_control).toEqual({
+      type: 'ephemeral',
+    });
+    expect((lastContent[0] as CacheControlBlock).cache_control).toEqual({
+      type: 'ephemeral',
+    });
+  });
+
+  it('preserves cache_control through OpenAI message conversion used by OpenRouter', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({
+        content: [
+          {
+            type: 'text',
+            text: 'Hello',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      }),
+      new AIMessage({ content: 'Hi there' }),
+      new HumanMessage({
+        content: [
+          {
+            type: 'text',
+            text: 'Follow-up',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      }),
+    ];
+
+    const converted = _convertMessagesToOpenAIParams(messages);
+
+    const firstUserContent = converted[0].content as CacheControlBlock[];
+    const lastUserContent = converted[2].content as CacheControlBlock[];
+
+    expect(firstUserContent[0]).toHaveProperty('cache_control');
+    expect(firstUserContent[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(lastUserContent[0]).toHaveProperty('cache_control');
+    expect(lastUserContent[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('end-to-end: addCacheControl then convert preserves breakpoints for OpenRouter', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({ content: 'First message with context' }),
+      new AIMessage({ content: 'Response' }),
+      new HumanMessage({ content: 'Second question' }),
+    ];
+
+    const cached = addCacheControl(messages);
+    const converted = _convertMessagesToOpenAIParams(
+      cached,
+      'anthropic/claude-sonnet-4-20250514'
+    );
+
+    const firstUser = converted[0];
+    const lastUser = converted[2];
+
+    expect(Array.isArray(firstUser.content)).toBe(true);
+    expect((firstUser.content as CacheControlBlock[])[0]).toHaveProperty(
+      'cache_control'
+    );
+
+    expect(Array.isArray(lastUser.content)).toBe(true);
+    expect((lastUser.content as CacheControlBlock[])[0]).toHaveProperty(
+      'cache_control'
+    );
+  });
+
+  it('strips Bedrock cache before applying OpenRouter/Anthropic cache', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          { type: ContentTypes.TEXT, text: 'First message' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Response' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Follow-up' }],
+      },
+    ];
+
+    /** @ts-expect-error - Testing cross-provider compatibility */
+    const result = addCacheControl(messages);
+
+    for (const msg of result) {
+      if (Array.isArray(msg.content)) {
+        expect(
+          (msg.content as MessageContentComplex[]).some(
+            (b) => 'cachePoint' in b
+          )
+        ).toBe(false);
+      }
+    }
+
+    const lastContent = result[2].content as MessageContentComplex[];
+    expect('cache_control' in lastContent[0]).toBe(true);
   });
 });

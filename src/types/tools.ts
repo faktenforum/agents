@@ -2,8 +2,11 @@
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { ToolErrorData } from './stream';
-import { EnvVar } from '@/common';
+import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { MessageContentComplex, ToolErrorData } from './stream';
+import type { HumanInTheLoopConfig } from './hitl';
+import type { LangfuseConfig } from './graph';
+import type { HookRegistry } from '@/hooks';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
 export type CustomToolCall = {
@@ -27,9 +30,52 @@ export type ToolRefs = {
 
 export type ToolRefGenerator = (tool_calls: ToolCall[]) => ToolRefs;
 
+export type EagerEventToolExecutionConfig = {
+  /**
+   * When enabled, event-driven tool calls may be started from the
+   * streaming layer as soon as the SDK observes a complete tool call.
+   * Results are still held until ToolNode materializes the final
+   * ToolMessages so provider message ordering is preserved.
+   */
+  enabled?: boolean;
+};
+
+export type EagerEventToolExecutionOutcome =
+  | { results: ToolExecuteResult[]; error?: undefined }
+  | { results?: undefined; error: Error };
+
+export type EagerEventToolExecution = {
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  request: ToolCallRequest;
+  promise: Promise<EagerEventToolExecutionOutcome>;
+  /**
+   * True when the streaming eager path already emitted the user-visible
+   * ON_RUN_STEP_COMPLETED event for this call. ToolNode still consumes the
+   * result later to mutate graph state in provider-safe order, but skips
+   * duplicate completion emission.
+   */
+  completionDispatched?: boolean;
+};
+
+export type EagerEventToolCallChunkState = {
+  id?: string;
+  name?: string;
+  argsText: string;
+  index?: number;
+  lastArgsFragment?: string;
+};
+
 export type ToolNodeOptions = {
   name?: string;
   tags?: string[];
+  /** Enables LangChain/LangGraph tracing for this ToolNode. Defaults to false. */
+  trace?: boolean;
+  /** Run-level Langfuse config used to scope ToolNode trace redaction. */
+  runLangfuse?: LangfuseConfig;
+  /** Agent-level Langfuse config used to scope ToolNode trace redaction. */
+  agentLangfuse?: LangfuseConfig;
   handleToolErrors?: boolean;
   loadRuntimeTools?: ToolRefGenerator;
   toolCallStepIds?: Map<string, string>;
@@ -47,8 +93,48 @@ export type ToolNodeOptions = {
   toolDefinitions?: Map<string, LCTool>;
   /** Agent ID for event-driven mode (used to identify which agent's context to use) */
   agentId?: string;
+  /** ID of the agent that owns this tool node, surfaced to hooks as `executingAgentId`
+   * so a batch can be attributed to a specific agent even where `agentId` is undefined. */
+  executingAgentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
+  /** Opt-in eager execution for event-driven tool calls. */
+  eagerEventToolExecution?: EagerEventToolExecutionConfig;
+  /** Shared per-run eager execution registry populated by the stream handler. */
+  eagerEventToolExecutions?: Map<string, EagerEventToolExecution>;
+  /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
+  eagerEventToolUsageCount?: Map<string, number>;
+  /**
+   * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
+   * PermissionDenied lifecycle hooks. Fires for **every** tool the
+   * ToolNode invokes — both event-dispatched tools (via
+   * `dispatchToolEvents`) and direct-path tools (via
+   * `runDirectToolWithLifecycleHooks`). The pre-existing limitation
+   * that direct-path tools "bypass hook dispatch entirely" was
+   * lifted in a follow-up to the HITL surface; both paths now route
+   * through the same hook lifecycle.
+   */
+  hookRegistry?: HookRegistry;
+  /**
+   * Run-scoped HITL config. **HITL is OFF by default** — omitting this
+   * field (or passing `{ enabled: false }`) keeps the pre-HITL
+   * fail-closed behavior where a `PreToolUse` `ask` decision collapses
+   * into a blocked `ToolMessage`. Hosts opt in with
+   * `{ enabled: true }` once their UI can render and resolve a
+   * `tool_approval` interrupt; that engages the interrupt path where
+   * `ask` raises a real LangGraph `interrupt()` carrying a
+   * `HumanInterruptPayload` and the host resumes with
+   * `Run.resume(decisions)`.
+   *
+   * Mirrors `RunConfig.humanInTheLoop` (which is the canonical place
+   * to set this); the Graph threads it down to every ToolNode it
+   * compiles. The interrupt path is wired into both the event
+   * dispatch (`dispatchToolEvents`) and the direct path
+   * (`runDirectToolWithLifecycleHooks`) — direct tools no longer
+   * bypass HITL. See `HumanInTheLoopConfig` for the resume re-execution
+   * contract that applies equally to both paths.
+   */
+  humanInTheLoop?: HumanInTheLoopConfig;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */
   maxContextTokens?: number;
   /**
@@ -56,6 +142,41 @@ export type ToolNodeOptions = {
    * When provided, takes precedence over the value computed from maxContextTokens.
    */
   maxToolResultChars?: number;
+  /**
+   * Run-scoped tool output reference configuration. When `enabled` is
+   * `true`, ToolNode registers successful outputs and substitutes
+   * `{{tool<idx>turn<turn>}}` placeholders found in string args.
+   *
+   * Ignored when `toolOutputRegistry` is also provided (host-supplied
+   * registry wins).
+   */
+  toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * Pre-constructed registry instance shared across ToolNodes for the
+   * run. Graphs pass the same registry to every ToolNode they compile
+   * so cross-agent `{{tool<i>turn<n>}}` substitutions resolve. Takes
+   * precedence over `toolOutputReferences` when both are set.
+   */
+  toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /**
+   * Selects where built-in code execution tools run. Defaults to the
+   * remote LibreChat Code API sandbox; `local` swaps those same tool names
+   * to process-based local executors at ToolNode construction time.
+   */
+  toolExecution?: ToolExecutionConfig;
+  /**
+   * Pre-constructed file checkpointer shared across every ToolNode in
+   * a Run so `Run.rewindFiles()` (and direct
+   * `Run.getFileCheckpointer()` callers) sees a single unified
+   * snapshot store. The Graph layer creates one per Run when
+   * `toolExecution.local.fileCheckpointing === true` and threads it
+   * to every ToolNode it compiles; without this shared instance,
+   * multi-agent graphs would each get their own private checkpointer
+   * and the host couldn't reach any of them. Wins over the
+   * auto-created bundle checkpointer in
+   * `resolveLocalExecutionTools`.
+   */
+  fileCheckpointer?: LocalFileCheckpointer;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -68,35 +189,144 @@ export type ToolEndEvent = {
   /** The content index of the tool call */
   index: number;
   type?: 'tool_call';
+  /** True when the stream eager path surfaced this completion before ToolNode finalized graph state. */
+  eager?: boolean;
 };
 
-export type CodeEnvFile = {
+/**
+ * Closed set of resource kinds for sandbox file caching. Defined as a
+ * `as const` tuple so the runtime list and the TypeScript union can't
+ * drift on future additions — adding a new kind to the tuple updates
+ * both at once.
+ *
+ * - `skill`: shared per skill identity. Cross-user-within-tenant
+ *   sharing. Codeapi sessionKey omits the user dimension. `version`
+ *   is required (skill's monotonic counter scopes cache per revision).
+ * - `agent`: shared per agent identity. Same sharing semantic as
+ *   skills.
+ * - `user`: user-private. Codeapi sessionKey is keyed by the
+ *   requesting user from auth context. Used for chat attachments
+ *   and code-output files.
+ */
+export const CODE_ENV_KINDS = ['skill', 'agent', 'user'] as const;
+export type CodeEnvKind = (typeof CODE_ENV_KINDS)[number];
+
+type CodeEnvFileBase = {
+  /**
+   * **Storage file id** — the per-file uuid the file_server returns
+   * at upload time. Identifies the bytes at
+   * `<storage_session_id>/<id>` in the object bucket; used by the
+   * worker to fetch the file and by codeapi's auth layer for the
+   * upload-existence check.
+   *
+   * Distinct from `resource_id` below — that's the entity that owns
+   * this file's storage session (skill `_id`, agent id, etc.), used
+   * for sessionKey resolution. Conflating the two caused
+   * shared-kind authorization to fail because the sessionKey
+   * re-derivation used the storage nanoid where the resource id was
+   * required. See codeapi #1455 review.
+   */
   id: string;
+  /**
+   * **Resource id** — the entity that owns this file's storage
+   * session. Skill `_id` for `kind: 'skill'`, agent id for `'agent'`,
+   * informational only for `'user'` (codeapi resolves user identity
+   * from auth context). Kept on the type for shape uniformity across
+   * kinds.
+   *
+   * Drives codeapi's `resolveSessionKey` switch — the sessionKey
+   * embeds this value (`<tenant>:<kind>:<resource_id>[:v:<version>]`)
+   * so cross-user-within-tenant sharing for shared kinds is a
+   * designed property of the kind switch.
+   */
+  resource_id: string;
   name: string;
-  session_id: string;
+  /**
+   * Storage session — the long-lived bucket where this file's bytes
+   * live in object storage. Distinct from the (transient) execution
+   * session id that appears at the top level of an execute response;
+   * the two used to share the field name `session_id` and the
+   * conflation caused real bugs. See codeapi #1455 / agents #148.
+   */
+  storage_session_id: string;
 };
+
+/**
+ * `CodeEnvFile` is a discriminated union on `kind`. `version` is
+ * statically required for `kind: 'skill'` and statically forbidden
+ * for `agent` / `user` — the constraint holds at compile time on
+ * every consumer, not just on codeapi's runtime validator.
+ *
+ * Codeapi switches on `kind` to derive the sessionKey for cache
+ * scoping (`<tenant>:<kind>:<id>[:v:<version>]`). Cross-user sharing
+ * for `kind: 'skill'` / `'agent'` is a designed property of the
+ * kind switch.
+ */
+export type CodeEnvFile =
+  | (CodeEnvFileBase & { kind: 'skill'; version: number })
+  | (CodeEnvFileBase & { kind: 'agent' })
+  | (CodeEnvFileBase & { kind: 'user' });
 
 export type CodeExecutionToolParams =
   | undefined
   | {
+      /** Execution session — see `CodeSessionContext.session_id`. */
       session_id?: string;
       user_id?: string;
-      apiKey?: string;
       files?: CodeEnvFile[];
-      [EnvVar.CODE_API_KEY]?: string;
+      /** Optional host-supplied Code API auth headers. */
+      authHeaders?: CodeApiAuthHeaders;
     };
 
+export type CodeApiAuthHeaderMap = Record<string, string>;
+
+export type CodeApiAuthHeaders =
+  | CodeApiAuthHeaderMap
+  | (() => CodeApiAuthHeaderMap | Promise<CodeApiAuthHeaderMap>);
+
 export type FileRef = {
+  /**
+   * Storage file id (the per-file uuid). See `CodeEnvFile.id` for
+   * the full motivation behind the storage-vs-resource split.
+   */
   id: string;
+  /**
+   * Resource id — the entity that owns this file's storage session.
+   * Optional on `FileRef` (post-execute artifact refs may not carry
+   * resource provenance for outputs); required on `CodeEnvFile`
+   * (the input wire shape).
+   */
+  resource_id?: string;
   name: string;
   path?: string;
-  /** Session ID this file belongs to (for multi-session file tracking) */
-  session_id?: string;
+  /**
+   * Storage session this file lives in. See `CodeEnvFile.storage_session_id`
+   * for the full motivation.
+   */
+  storage_session_id?: string;
+  /** Resource kind — see `CodeEnvFile.kind`. */
+  kind?: CodeEnvKind;
+  /** Resource version — see `CodeEnvFile.version`. Only meaningful when
+   *  `kind === 'skill'`. */
+  version?: number;
+  /**
+   * `true` when the codeapi sandbox echoed this entry as an unchanged
+   * passthrough of an input the caller already owns (skill files,
+   * downloaded inputs whose hash matched the baseline, inherited
+   * `.dirkeep` markers). The host can use this flag to skip
+   * post-processing work for files the caller already owns.
+   */
+  inherited?: true;
 };
 
 export type FileRefs = FileRef[];
 
 export type ExecuteResult = {
+  /**
+   * Execution session id — the (transient) sandbox run that produced
+   * this output. Distinct from per-file `storage_session_id` on the
+   * files array.
+   */
   session_id: string;
   stdout: string;
   stderr: string;
@@ -163,6 +393,7 @@ export type ToolCallRequest = {
   turn?: number;
   /** Code execution session context for session continuity in event-driven mode */
   codeSessionContext?: {
+    /** Execution session — see `CodeSessionContext.session_id`. */
     session_id: string;
     files?: CodeEnvFile[];
   };
@@ -184,6 +415,36 @@ export type ToolExecuteBatchRequest = {
   resolve: (results: ToolExecuteResult[]) => void;
   /** Promise rejector - handler calls this on fatal error */
   reject: (error: Error) => void;
+  /**
+   * Optional per-call result channel. When present, the handler MAY invoke
+   * this as each tool call settles (before the final `resolve`) so the
+   * graph can emit that call's completion event without waiting for the
+   * slowest call in the batch. Purely an emission fast-path: the handler
+   * must still pass every result to `resolve`, which remains the
+   * authoritative batch outcome. Only provided when no post-tool hooks or
+   * human-in-the-loop flows could change a result after execution.
+   */
+  onResult?: (result: ToolExecuteResult) => void;
+};
+
+/**
+ * A message injected into graph state by any tool execution handler.
+ * Generic mechanism: any tool returning `injectedMessages` in its `ToolExecuteResult`
+ * will have these appended to state after the ToolMessage for this call.
+ */
+export type InjectedMessage = {
+  /** 'user' for skill body injection, 'system' for context hints.
+   *  Both are converted to HumanMessage at runtime; the original role
+   *  is preserved in additional_kwargs.role. */
+  role: 'user' | 'system';
+  /** Message content: string for simple text, array for complex multi-part content */
+  content: string | MessageContentComplex[];
+  /** When true, the message is framework-internal: not shown in UI, not counted as a user turn */
+  isMeta?: boolean;
+  /** Origin tag for downstream consumers (UI, pruner, compaction) */
+  source?: 'skill' | 'hook' | 'system';
+  /** Only set when source is 'skill', for compaction preservation */
+  skillName?: string;
 };
 
 /** Result for a single tool call in event-driven execution */
@@ -198,12 +459,529 @@ export type ToolExecuteResult = {
   status: 'success' | 'error';
   /** Error message if status is 'error' */
   errorMessage?: string;
+  /**
+   * Messages to inject into graph state after the ToolMessage for this call.
+   * Placed after tool results to respect provider message ordering (tool_call -> tool_result adjacency).
+   * The host's message formatter may merge injected user messages with the preceding tool_result turn.
+   * Generic mechanism: any tool execution handler can use this.
+   */
+  injectedMessages?: InjectedMessage[];
 };
 
 /** Map of tool names to tool definitions */
 export type LCToolRegistry = Map<string, LCTool>;
 
-export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
+/**
+ * Run-scoped configuration for tool output references.
+ *
+ * When enabled, each successful tool result is registered under a stable
+ * key (`tool<idx>turn<turn>`). Later tool calls can pipe a previous
+ * output into their arguments by including the literal placeholder
+ * `{{tool<idx>turn<turn>}}` anywhere in a string argument; ToolNode
+ * substitutes it with the stored output immediately before invoking
+ * the tool.
+ *
+ * The registry stores the *raw, untruncated* tool output (subject to
+ * its own size caps) so a later substitution can pipe the full payload
+ * into the next tool even when the LLM only saw a head+tail-truncated
+ * preview in `ToolMessage.content`. Size limits are decoupled from the
+ * LLM-visible truncation budget and default to 5 MB total.
+ *
+ * Known limitations:
+ *  - Tools that return a `ToolMessage` with array-type content
+ *    (multi-part content blocks such as text + image) are not
+ *    registered and cannot be cited via `{{tool<i>turn<n>}}`. A
+ *    warning is logged so the missing reference is visible.
+ *  - When a `PostToolUse` hook replaces `ToolMessage.content`, the
+ *    *post-hook* content is what gets stored in the registry (and
+ *    what the model sees), so `{{…}}` substitutions deliver the
+ *    hooked output rather than the raw tool return. This matches the
+ *    hook's "authoritative" role for output shaping.
+ */
+export type ToolOutputReferencesConfig = {
+  /** Enable the registry and placeholder substitution. Defaults to `false`. */
+  enabled?: boolean;
+  /**
+   * Maximum characters stored (and substituted) per registered output.
+   * Applied to the *raw* output before storage. Defaults to
+   * `HARD_MAX_TOOL_RESULT_CHARS` (~400 KB) — matching the
+   * LLM-visible tool-result truncation budget, which is also a safe
+   * payload size for shell `ARG_MAX` limits when a `{{…}}` expansion
+   * gets piped into a bash `command`. Hosts that want to preserve
+   * fuller fidelity (for example for non-bash API consumers) can
+   * raise this up to `maxTotalSize` (defaults to 5 MB) — be aware
+   * that large single-output substitutions may exceed shell
+   * argument-size limits on typical Linux/macOS.
+   */
+  maxOutputSize?: number;
+  /**
+   * Hard cap on total characters retained across all registered outputs
+   * for the run. When exceeded, the oldest entries are evicted FIFO
+   * until the total fits. The effective per-output cap is
+   * `min(maxOutputSize, maxTotalSize)` so a single stored output can
+   * never exceed the aggregate bound. Defaults to
+   * `calculateMaxTotalToolOutputSize(maxOutputSize)` (5 MB).
+   */
+  maxTotalSize?: number;
+};
+
+export type ToolExecutionEngine = 'sandbox' | 'local' | 'cloudflare-sandbox';
+
+/**
+ * Records pre-write file contents so callers can rewind edits/writes
+ * made by local-compatible coding-tool engines. Implementations live
+ * in `src/tools/local`.
+ */
+export interface LocalFileCheckpointer {
+  /**
+   * Captures the current contents of `absolutePath` before a write or
+   * edit. Idempotent: capturing the same path twice keeps the first
+   * snapshot. Records "did not exist" so creates can be undone with
+   * deletion.
+   */
+  captureBeforeWrite(absolutePath: string): Promise<void>;
+  /** Restores all captured snapshots. Returns the number of files restored. */
+  rewind(): Promise<number>;
+  /** Returns paths that have been captured during this run. */
+  capturedPaths(): string[];
+}
+
+/**
+ * Pluggable process launcher used by the local execution engine. When
+ * provided, the engine calls this in place of `child_process.spawn`,
+ * letting callers route shell commands through SSH, containers, or
+ * remote runners without forking the engine. The implementation must
+ * return a `ChildProcess`-shaped value whose `stdout`/`stderr` streams
+ * emit `data` events and that resolves a `close` event when finished.
+ */
+export type LocalSpawn = (
+  command: string,
+  args: string[],
+  options: import('child_process').SpawnOptions
+) => import('child_process').ChildProcessWithoutNullStreams;
+
+/** Bash command-validation strictness for the local engine. */
+export type LocalBashAstMode = 'auto' | 'off' | 'strict';
+
+export type LocalSandboxConfig = {
+  /**
+   * Enable Anthropic Sandbox Runtime wrapping for local process tools.
+   * Defaults to false; requires @anthropic-ai/sandbox-runtime to be installed.
+   */
+  enabled?: boolean;
+  /** Throw when native sandbox dependencies are unavailable. Defaults to false. */
+  failIfUnavailable?: boolean;
+  filesystem?: {
+    denyRead?: string[];
+    allowRead?: string[];
+    allowWrite?: string[];
+    denyWrite?: string[];
+    allowGitConfig?: boolean;
+  };
+  network?: {
+    allowedDomains?: string[];
+    deniedDomains?: string[];
+    allowUnixSockets?: string[];
+    allowAllUnixSockets?: boolean;
+    allowLocalBinding?: boolean;
+    allowMachLookup?: string[];
+  };
+};
+
+/**
+ * Workspace boundary the local-coding tools clamp file operations to.
+ *
+ * `root` is the canonical "project directory" — every file tool that
+ * accepts a path resolves it relative to `root` and refuses to touch
+ * paths outside it (after symlink resolution). `additionalRoots` lets
+ * monorepos extend the boundary to sibling directories without
+ * disabling clamping entirely.
+ *
+ * `allowReadOutside` and `allowWriteOutside` are escape hatches that
+ * disable clamping for read- and write-shaped tools respectively.
+ * Most hosts shouldn't need them — prefer wiring
+ * `createWorkspacePolicyHook` if you want "ask the user" semantics
+ * via the existing PreToolUse / HITL machinery instead of an
+ * unconditional bypass.
+ */
+export type LocalWorkspaceConfig = {
+  /** Required. The canonical workspace root. */
+  root: string;
+  /**
+   * Sibling roots that also count as inside the workspace. Useful in
+   * monorepos where a project legitimately needs to reach a paired
+   * directory without disabling clamping.
+   */
+  additionalRoots?: readonly string[];
+  /** When true, disable the read-outside-workspace clamp. */
+  allowReadOutside?: boolean;
+  /** When true, disable the write-outside-workspace clamp. */
+  allowWriteOutside?: boolean;
+};
+
+/**
+ * Engine-agnostic execution seam. Default uses Node's
+ * `child_process.spawn` and `fs/promises`. A future engine (e.g.
+ * stateful remote sandbox) supplies its own `spawn` and `fs` and
+ * inherits every tool factory unchanged.
+ *
+ * **Important — pair `spawn` and `fs` together.** Most file-touching
+ * surfaces in the local engine route through `getWorkspaceFS(config)`
+ * so a host can transparently swap in a remote/in-memory FS. A small
+ * set of helpers — currently the `execute_code` non-bash temp-file
+ * write (Codex P2 [48]) — still uses host `fs/promises` directly to
+ * stage source on disk before invoking the spawn. If you override
+ * `spawn` to point at a remote runtime (SSH, container, etc.) you
+ * MUST also override `fs` with the corresponding remote
+ * implementation; otherwise temp source files written to the host
+ * `/tmp` won't be visible to the remote interpreter and `py`/`js`/
+ * `ts`/etc. executions will fail. (Bash-style executions go through
+ * `executeLocalBash` which doesn't stage temp files, so they're
+ * unaffected.)
+ *
+ * Threat-model note: the regex-based command validators
+ * (`dangerousCommandPatterns`, `quotedDestructivePatterns`, etc.) and
+ * the workspace policy hook are documented as best-effort tripwires.
+ * The hard security boundary is `local.sandbox.enabled: true` (which
+ * wraps execution in `@anthropic-ai/sandbox-runtime`); for adversarial-
+ * model threat models, do NOT rely on the regex layer alone.
+ */
+export type LocalExecConfig = {
+  /** Pluggable spawn (for SSH, container, remote workers, etc.). */
+  spawn?: LocalSpawn;
+  /**
+   * Pluggable filesystem (for remote-workspace engines). Pair with
+   * `spawn` — see the type-level note above on why both should be
+   * overridden together for non-host engines.
+   */
+  fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
+  /**
+   * Set by custom execution backends that already provide their own
+   * sandbox boundary. Suppresses the local host-sandbox warning while
+   * preserving the warning for plain host `child_process` execution.
+   */
+  sandboxed?: boolean;
+};
+
+export type LocalExecutionConfig = {
+  /**
+   * Working directory for local commands. Defaults to process.cwd().
+   * Back-compat shorthand for `workspace.root`.
+   *
+   * @deprecated Prefer `workspace.root`. Kept for backward
+   *   compatibility with pre-workspace configs.
+   */
+  cwd?: string;
+  /**
+   * Workspace boundary configuration. When omitted, the implementation
+   * derives `{ root: cwd ?? process.cwd() }` so existing call sites
+   * keep working.
+   */
+  workspace?: LocalWorkspaceConfig;
+  /**
+   * Execution seam (spawn + fs). When omitted, defaults to Node-host
+   * child_process and fs/promises. Same back-compat: a top-level
+   * `spawn` field is honoured if `exec.spawn` isn't set.
+   */
+  exec?: LocalExecConfig;
+  /** Shell executable for bash-style tools. Defaults to `bash`. */
+  shell?: string;
+  /** Default timeout for local processes, in milliseconds. */
+  timeoutMs?: number;
+  /** Maximum stdout/stderr characters surfaced to the model. */
+  maxOutputChars?: number;
+  /**
+   * Hard cap on total bytes a single child process can stream across
+   * stdout+stderr before its process tree is killed. Independent from
+   * `maxOutputChars` (which controls what the model sees); this is the
+   * OOM backstop for noisy / runaway commands (`yes`, `cat /dev/urandom`,
+   * a verbose build that loops). Defaults to 50 MiB. Set higher for
+   * legitimately large logs; setting to 0 disables the cap and risks
+   * an OOM crash on the host.
+   */
+  maxSpawnedBytes?: number;
+  /** Extra environment variables merged over process.env. */
+  env?: NodeJS.ProcessEnv;
+  /** Optional process sandboxing via @anthropic-ai/sandbox-runtime. */
+  sandbox?: LocalSandboxConfig;
+  /**
+   * When true, block obviously mutating shell commands before execution.
+   * Useful for read-only agent modes and dry-run workflows.
+   */
+  readOnly?: boolean;
+  /** Permit dangerous commands that the validator otherwise blocks. */
+  allowDangerousCommands?: boolean;
+  /**
+   * Permit file tools to resolve paths outside `cwd`. Defaults to false.
+   *
+   * @deprecated Prefer the granular
+   *   `workspace.allowReadOutside` / `workspace.allowWriteOutside`.
+   *   Kept for backward compatibility; setting either of the
+   *   workspace fields takes precedence over this flag.
+   */
+  allowOutsideWorkspace?: boolean;
+  /**
+   * Add the built-in local coding suite (`read_file`, `write_file`,
+   * `edit_file`, `grep_search`, `glob_search`, `list_directory`, plus local
+   * code/bash execution tools) when `engine` is `local`. Defaults to true.
+   */
+  includeCodingTools?: boolean;
+  /**
+   * Override the process launcher. When set, replaces
+   * `child_process.spawn` for every local tool invocation, allowing
+   * SSH/container delegation. Default: native spawn.
+   */
+  spawn?: LocalSpawn;
+  /**
+   * Tree-sitter-bash AST validation pass on bash commands.
+   * - `'off'` skips AST validation (regex + `bash -n` only — current behavior).
+   * - `'auto'` runs the AST validator when `tree-sitter` modules are
+   *   available; falls back silently otherwise.
+   * - `'strict'` requires the AST validator and fails closed when
+   *   parsing is unavailable or the command is too complex to verify.
+   * Default: `'off'` to preserve historical behavior.
+   */
+  bashAst?: LocalBashAstMode;
+  /**
+   * Enable per-Run file checkpointing for `edit_file` / `write_file`
+   * so callers can rewind file changes after a failed batch. When
+   * true and the run is constructed via `Run.create(...)`, the host
+   * can call `Run.rewindFiles()` (or `Run.getFileCheckpointer()` for
+   * the raw checkpointer). Defaults to false.
+   */
+  fileCheckpointing?: boolean;
+  /**
+   * Maximum bytes to read in `read_file` before returning a stub.
+   * Defaults to 10 MiB.
+   */
+  maxReadBytes?: number;
+  /**
+   * Controls whether `read_file` returns binary files as inline
+   * `MessageContentComplex[]` attachments (so vision-capable models
+   * see them) or as a textual stub.
+   *
+   *   - `'off'`        : never embed; current binary-stub behavior.
+   *   - `'images-only'`: embed images (png/jpeg/gif/webp) as
+   *     `image_url` blocks; other binaries get the stub.
+   *   - `'images-and-pdf'` : also embed PDFs as `image_url` data URLs
+   *     (Anthropic accepts these in tool_result; other providers may
+   *     degrade to JSON).
+   *
+   * Defaults to `'off'` to preserve current behavior.
+   */
+  attachReadAttachments?: 'off' | 'images-only' | 'images-and-pdf';
+  /**
+   * Maximum pre-encoding byte size to embed inline. Anything larger
+   * degrades to an `<oversize>` stub. Defaults to 5 MiB to bound the
+   * post-base64 token cost.
+   */
+  maxAttachmentBytes?: number;
+  /**
+   * Run a fast per-file syntax check after every successful
+   * `edit_file` / `write_file`. When the checker finds an error,
+   * the diagnostics are appended to the tool result so the model
+   * can self-correct without a separate read round-trip.
+   *
+   *   - `'off'` (default) : skip; current behavior.
+   *   - `'auto'`          : run the checker for known file types
+   *     when the corresponding tool is on PATH. Silently skip
+   *     otherwise.
+   *   - `'strict'`        : same as `'auto'`, plus fail the tool
+   *     call with the error so the model is forced to react. Use
+   *     when you don't trust the model to read a non-blocking
+   *     advisory.
+   *
+   * Built-in checkers: Node `node --check` for `.js/.mjs/.cjs`,
+   * Python `py_compile` for `.py`, `JSON.parse` for `.json`,
+   * `bash -n` for `.sh/.bash`. TypeScript falls back to `compile_check`
+   * (project-level) since per-file `.ts` syntax check requires the
+   * `typescript` package; the host can wire a per-file checker via
+   * `local.spawn` if desired.
+   */
+  postEditSyntaxCheck?: 'off' | 'auto' | 'strict';
+  /**
+   * Configuration for the `compile_check` tool. When `engine` is
+   * `local` and `includeCodingTools` is on, the SDK exposes a
+   * `compile_check` tool that runs the project's standard
+   * type/lint command (`tsc --noEmit`, `cargo check`, etc.).
+   */
+  compileCheck?: {
+    /**
+     * Override the auto-detected command. Runs verbatim from `cwd`
+     * via the local engine's standard spawn pipeline (sandbox / AST
+     * validation / output overflow all apply).
+     */
+    command?: string;
+    /** Default timeout for `compile_check`, in milliseconds. Defaults to 120s. */
+    timeoutMs?: number;
+  };
+};
+
+export type CloudflareSandboxExecOptions = {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  timeout?: number;
+  stream?: boolean;
+  onOutput?: (stream: 'stdout' | 'stderr', data: string) => void;
+  signal?: AbortSignal;
+};
+
+export type CloudflareSandboxExecResult = {
+  success?: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  command?: string;
+  duration?: number;
+  timestamp?: string;
+};
+
+export type CloudflareSandboxReadFileResult =
+  | string
+  | Buffer
+  | Uint8Array
+  | {
+      content: string | Buffer | Uint8Array | ReadableStream<Uint8Array>;
+      size?: number;
+      mimeType?: string;
+      encoding?: 'utf-8' | 'utf8' | 'base64';
+      isBinary?: boolean;
+    };
+
+export type CloudflareSandboxListFilesOptions = {
+  recursive?: boolean;
+  includeHidden?: boolean;
+};
+
+export type CloudflareSandboxFileInfo = {
+  name: string;
+  absolutePath?: string;
+  relativePath?: string;
+  type?: 'file' | 'directory' | 'symlink' | 'other';
+  size?: number;
+  modifiedAt?: string;
+  mode?: string;
+};
+
+export type CloudflareSandboxListFilesResult =
+  | CloudflareSandboxFileInfo[]
+  | {
+      files: CloudflareSandboxFileInfo[];
+      count?: number;
+      path?: string;
+      success?: boolean;
+    };
+
+export interface CloudflareSandboxRuntime {
+  /**
+   * True when this runtime can consume AbortSignal values in exec options.
+   * Native Cloudflare Sandbox Durable Object RPC cannot clone AbortSignal,
+   * but HTTP bridge runtimes can use it to abort the underlying fetch.
+   */
+  supportsExecSignal?: boolean;
+  exec(
+    command: string,
+    options?: CloudflareSandboxExecOptions
+  ): Promise<CloudflareSandboxExecResult>;
+  readFile(
+    path: string,
+    options?: { encoding?: string }
+  ): Promise<CloudflareSandboxReadFileResult>;
+  writeFile(
+    path: string,
+    content: string | ReadableStream<Uint8Array>,
+    options?: { encoding?: string }
+  ): Promise<unknown>;
+  mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
+  listFiles(
+    path: string,
+    options?: CloudflareSandboxListFilesOptions
+  ): Promise<CloudflareSandboxListFilesResult>;
+  deleteFile(path: string): Promise<unknown>;
+}
+
+export type CloudflareSandboxExecutionConfig = {
+  sandbox:
+    | CloudflareSandboxRuntime
+    | (() => CloudflareSandboxRuntime | Promise<CloudflareSandboxRuntime>);
+  /** Working directory inside the sandbox. Defaults to `/workspace`. */
+  workspaceRoot?: string;
+  /** Extra environment variables merged into sandbox command executions. */
+  env?: Record<string, string | undefined>;
+  /** Default timeout for sandbox commands, in milliseconds. */
+  timeoutMs?: number;
+  /** Maximum stdout/stderr characters surfaced to the model. */
+  maxOutputChars?: number;
+  /**
+   * Add the built-in coding suite when `engine` is `cloudflare-sandbox`.
+   * Defaults to true, matching the local execution backend.
+   */
+  includeCodingTools?: boolean;
+  /**
+   * Optional exact coding-tool names to expose when `includeCodingTools`
+   * is on. Defaults to the full local-parity Cloudflare bundle. Use this
+   * to publish a bash-only sandbox surface, for example file/search tools
+   * plus `bash_tool` and `run_tools_with_bash`, without exposing
+   * `execute_code`.
+   */
+  codingToolNames?: readonly string[];
+  /** Optional shell executable for bash-style tools. Defaults to `bash`. */
+  shell?: string;
+  /**
+   * Optional project-level compile check configuration. Mirrors the local
+   * execution backend.
+   */
+  compileCheck?: LocalExecutionConfig['compileCheck'];
+  /** Optional read-only guard for mutating coding tools. */
+  readOnly?: boolean;
+  /** Permit dangerous commands that the validator otherwise blocks. */
+  allowDangerousCommands?: LocalExecutionConfig['allowDangerousCommands'];
+  /** Tree-sitter-bash AST validation pass for bash commands. */
+  bashAst?: LocalExecutionConfig['bashAst'];
+  /**
+   * Enable per-Run file checkpointing for `edit_file` / `write_file`
+   * against the Cloudflare Sandbox workspace.
+   */
+  fileCheckpointing?: LocalExecutionConfig['fileCheckpointing'];
+  /** Maximum bytes to read in `read_file` before returning a stub. */
+  maxReadBytes?: LocalExecutionConfig['maxReadBytes'];
+  /** Controls whether `read_file` returns binary files as attachments. */
+  attachReadAttachments?: LocalExecutionConfig['attachReadAttachments'];
+  /** Maximum pre-encoding byte size to embed inline. */
+  maxAttachmentBytes?: LocalExecutionConfig['maxAttachmentBytes'];
+  /** Run a fast per-file syntax check after successful edits/writes. */
+  postEditSyntaxCheck?: LocalExecutionConfig['postEditSyntaxCheck'];
+};
+
+export type ToolExecutionConfig = {
+  /** `sandbox` preserves the remote Code API behavior and is the default. */
+  engine?: ToolExecutionEngine;
+  /** Local process execution settings used when `engine` is `local`. */
+  local?: LocalExecutionConfig;
+  /** Cloudflare Sandbox execution settings used when `engine` is `cloudflare-sandbox`. */
+  cloudflare?: CloudflareSandboxExecutionConfig;
+};
+
+export type ProgrammaticCache = {
+  toolMap: ToolMap;
+  toolDefs: LCTool[];
+  /**
+   * Hook context plumbed through by ToolNode for the local
+   * programmatic-tool path so the in-process bridge can run
+   * `PreToolUse` hooks (deny / updatedInput) for inner tool calls.
+   * Not present for non-local (remote-engine) programmatic calling
+   * which dispatches inner tools through the host's own pipeline.
+   */
+  hookContext?: ProgrammaticHookContext;
+};
+
+export type ProgrammaticHookContext = {
+  registry: import('@/hooks').HookRegistry | undefined;
+  runId: string;
+  threadId?: string;
+  agentId?: string;
+  executingAgentId?: string;
+};
 
 /** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */
 export type ToolSearchMode = 'code_interpreter' | 'local';
@@ -213,7 +991,6 @@ export type McpNameFormat = 'full' | 'base';
 
 /** Parameters for creating a Tool Search tool */
 export type ToolSearchParams = {
-  apiKey?: string;
   toolRegistry?: LCToolRegistry;
   onlyDeferred?: boolean;
   baseUrl?: string;
@@ -223,7 +1000,6 @@ export type ToolSearchParams = {
   mcpServer?: string | string[];
   /** Format for MCP tool names: 'full' (tool_mcp_server) or 'base' (tool only). Default: 'full' */
   mcpNameFormat?: McpNameFormat;
-  [key: string]: unknown;
 };
 
 /** Simplified tool metadata for search purposes */
@@ -270,9 +1046,9 @@ export type PTCToolCall = {
   id: string;
   /** Tool name */
   name: string;
-  /** Input parameters */
+  /** Input parameters. Some bridges may serialize object input as JSON text. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  input: Record<string, any>;
+  input: Record<string, any> | string;
 };
 
 /**
@@ -295,6 +1071,7 @@ export type PTCToolResult = {
  */
 export type ProgrammaticExecutionResponse = {
   status: 'tool_call_required' | 'completed' | 'error' | unknown;
+  /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
 
   /** Present when status='tool_call_required' */
@@ -314,26 +1091,33 @@ export type ProgrammaticExecutionResponse = {
  * Artifact returned by the PTC tool
  */
 export type ProgrammaticExecutionArtifact = {
+  /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
 };
+
+/** Parameters for creating a bash execution tool (same API as CodeExecutor, bash-only) */
+export type BashExecutionToolParams = CodeExecutionToolParams;
+
+/** Parameters for creating a bash programmatic tool calling tool (same API as PTC, bash-only) */
+export type BashProgrammaticToolCallingParams = ProgrammaticToolCallingParams;
 
 /**
  * Initialization parameters for the PTC tool
  */
 export type ProgrammaticToolCallingParams = {
-  /** Code API key (or use CODE_API_KEY env var) */
-  apiKey?: string;
   /** Code API base URL (or use CODE_BASEURL env var) */
   baseUrl?: string;
   /** Safety limit for round-trips (default: 20) */
   maxRoundTrips?: number;
+  /** Maximum per-sandbox-run timeout for PTC's legacy `timeout` field. */
+  runTimeoutMs?: number;
   /** HTTP proxy URL */
   proxy?: string;
   /** Enable debug logging (or set PTC_DEBUG=true env var) */
   debug?: boolean;
-  /** Environment variable key for API key */
-  [key: string]: unknown;
+  /** Optional host-supplied Code API auth headers. */
+  authHeaders?: CodeApiAuthHeaders;
 };
 
 // ============================================================================
@@ -345,7 +1129,12 @@ export type ProgrammaticToolCallingParams = {
  * Stored in Graph.sessions and injected into subsequent tool invocations.
  */
 export type CodeSessionContext = {
-  /** Session ID from the code execution environment */
+  /**
+   * Execution session id — the (transient) sandbox run id. Used by
+   * ToolNode to thread session continuity into the next code-execution
+   * tool call. Distinct from per-file `storage_session_id` carried on
+   * `files`.
+   */
   session_id: string;
   /** Files generated in this session (for context/tracking) */
   files?: FileRefs;
@@ -358,6 +1147,7 @@ export type CodeSessionContext = {
  * Used to extract session context after tool completion.
  */
 export type CodeExecutionArtifact = {
+  /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
 };

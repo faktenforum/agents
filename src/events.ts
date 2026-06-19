@@ -4,8 +4,8 @@ import type {
   BaseMessageFields,
   UsageMetadata,
 } from '@langchain/core/messages';
-import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { Logger } from 'winston';
+import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import { Constants } from '@/common';
 
@@ -19,6 +19,35 @@ export class HandlerRegistry {
   getHandler(eventType: string): t.EventHandler | undefined {
     return this.handlers.get(eventType);
   }
+}
+
+export function composeEventHandlers(
+  ...handlerSets: Array<Record<string, t.EventHandler> | undefined>
+): Record<string, t.EventHandler> {
+  const composed: Partial<Record<string, t.EventHandler>> = {};
+
+  for (const handlerSet of handlerSets) {
+    if (!handlerSet) {
+      continue;
+    }
+    for (const [eventType, handler] of Object.entries(handlerSet)) {
+      const previous = composed[eventType];
+      if (previous === undefined) {
+        composed[eventType] = handler;
+        continue;
+      }
+      composed[eventType] = {
+        handle: async (
+          ...args: Parameters<t.EventHandler['handle']>
+        ): Promise<void> => {
+          await previous.handle(...args);
+          await handler.handle(...args);
+        },
+      };
+    }
+  }
+
+  return composed as Record<string, t.EventHandler>;
 }
 
 export class ModelEndHandler implements t.EventHandler {
@@ -90,7 +119,10 @@ export class ToolEndHandler implements t.EventHandler {
         return;
       }
 
-      if (metadata[Constants.PROGRAMMATIC_TOOL_CALLING] === true) {
+      if (
+        metadata[Constants.PROGRAMMATIC_TOOL_CALLING] === true ||
+        metadata[Constants.BASH_PROGRAMMATIC_TOOL_CALLING] === true
+      ) {
         return;
       }
 

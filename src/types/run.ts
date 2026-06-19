@@ -1,12 +1,17 @@
 // src/types/run.ts
-import type * as z from 'zod';
+import type { Callbacks } from '@langchain/core/callbacks/manager';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { StructuredTool } from '@langchain/core/tools';
-import type { RunnableConfig } from '@langchain/core/runnables';
+import type * as z from 'zod';
 import type {
-  BaseCallbackHandler,
-  CallbackHandlerMethods,
-} from '@langchain/core/callbacks/base';
+  ToolSessionMap,
+  ToolExecutionConfig,
+  ToolOutputReferencesConfig,
+  EagerEventToolExecutionConfig,
+} from '@/types/tools';
+import type { HumanInTheLoopConfig } from '@/types/hitl';
+import type { HookRegistry } from '@/hooks';
 import type * as s from '@/types/stream';
 import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
@@ -73,7 +78,9 @@ export interface AgentStateChannels {
   messages: BaseMessage[];
   next: string;
   [key: string]: unknown;
+  /** Stable/cacheable system instructions. */
   instructions?: string;
+  /** Dynamic system tail appended after stable instructions. */
   additional_instructions?: string;
 }
 
@@ -111,7 +118,34 @@ export type StandardGraphConfig = Omit<
 export type RunConfig = {
   runId: string;
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
+  /**
+   * Run-scoped Langfuse configuration. Per-agent `AgentInputs.langfuse`
+   * takes precedence for agent-specific spans; this object supplies defaults
+   * for run-wide tracing controls such as tool-output redaction.
+   */
+  langfuse?: g.LangfuseConfig;
   customHandlers?: Record<string, g.EventHandler>;
+  /**
+   * Receives token usage for every model call made inside subagent child
+   * runs (including nested subagents). Child graphs execute via `invoke()`
+   * outside this run's `streamEvents` loop, so their model-end events never
+   * reach `customHandlers` — without this sink, child usage is invisible to
+   * the host. Parent-graph calls are not reported here; they flow through
+   * the registered `CHAT_MODEL_END` handler as usual.
+   */
+  subagentUsageSink?: g.SubagentUsageSink;
+  /**
+   * Pre-constructed hook registry for this run. Hooks fire at lifecycle
+   * points in `processStream` (RunStart, UserPromptSubmit, Stop,
+   * StopFailure) and around tool calls (PreToolUse, PostToolUse,
+   * PostToolUseFailure, PermissionDenied).
+   *
+   * Pass `undefined` (the default) to skip all hook dispatch. When a
+   * registry is provided, the run attaches it to the `Graph` so internal
+   * nodes can fire hooks too, and clears the session in the `finally`
+   * block to prevent leaks.
+   */
+  hooks?: HookRegistry;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
@@ -126,11 +160,72 @@ export type RunConfig = {
   calibrationRatio?: number;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
+  /**
+   * Initial session state to seed the Graph's ToolSessionMap.
+   * Used to carry over code environment sessions from skill file priming
+   * at run start, so ToolNode can inject session_id + files into tool calls.
+   */
+  initialSessions?: ToolSessionMap;
+  /**
+   * Run-scoped tool output reference configuration. When `enabled` is
+   * `true`, tool outputs are registered under stable keys
+   * (`tool<idx>turn<turn>`) and subsequent tool calls can pipe previous
+   * outputs into their arguments via `{{tool<idx>turn<turn>}}`
+   * placeholders. Disabled by default so existing runs are unaffected.
+   */
+  toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * Opt-in latency optimization for event-driven tools. When enabled,
+   * the streaming layer may start a tool call as soon as it sees a
+   * complete, parseable tool call; ToolNode still waits for the final
+   * assistant message before appending ToolMessages, preserving provider
+   * ordering. The SDK automatically falls back to normal batch dispatch
+   * when hooks, HITL, output references, or ambiguous stream shapes make
+   * eager dispatch unsafe.
+   */
+  eagerEventToolExecution?: EagerEventToolExecutionConfig;
+  /**
+   * Selects the execution backend for built-in code tools. Omit this to keep
+   * the remote LibreChat Code API sandbox. Set `{ engine: 'local' }` to run
+   * code execution locally and auto-bind the local coding tool suite unless
+   * `local.includeCodingTools` is set to `false`.
+   */
+  toolExecution?: ToolExecutionConfig;
+  /**
+   * First-class human-in-the-loop (HITL) flow for this run.
+   *
+   * **HITL is OFF by default.** Omitting this field — or passing
+   * `{ enabled: false }` — keeps the pre-HITL fail-closed semantics
+   * where `ask` decisions collapse into a synchronous deny. Hosts opt
+   * in explicitly with `{ enabled: true }` once their UI can render
+   * and resolve `tool_approval` interrupts (otherwise the run just
+   * pauses with no resolver, which surfaces to end users as a hung
+   * tool-call card).
+   *
+   * Plan of record: the default flips back to ON in a future minor
+   * once the consumer ecosystem (notably LibreChat) ships HITL UI
+   * end-to-end. See `HumanInTheLoopConfig` JSDoc.
+   *
+   * When enabled (`{ enabled: true }`):
+   *   - `PreToolUse` hooks returning `decision: 'ask'` raise a real
+   *     LangGraph `interrupt()` instead of being treated as a synchronous
+   *     deny. The graph pauses and the run exits cleanly.
+   *   - If `graphConfig.compileOptions.checkpointer` is missing, the SDK
+   *     installs an in-memory `MemorySaver` as a fallback so scripts and
+   *     tests can resume without external infrastructure. Production
+   *     hosts should always provide a durable checkpointer.
+   *   - Hosts inspect the pending interrupt via `run.getInterrupt()` and
+   *     continue with `Run.resume(decisions)` against a Run rebuilt with
+   *     the same `thread_id` and checkpointer.
+   *
+   * When disabled (the default): `ask` decisions remain fail-closed
+   * (blocked with an error `ToolMessage`) and no checkpointer is
+   * implicitly attached.
+   */
+  humanInTheLoop?: HumanInTheLoopConfig;
 };
 
-export type ProvidedCallbacks =
-  | (BaseCallbackHandler | CallbackHandlerMethods)[]
-  | undefined;
+export type ProvidedCallbacks = Callbacks | undefined;
 
 export type TokenCounter = (message: BaseMessage) => number;
 
@@ -142,6 +237,8 @@ export type TokenBudgetBreakdown = {
   instructionTokens: number;
   /** Tokens from the system message text alone. */
   systemMessageTokens: number;
+  /** Tokens from instruction text emitted outside the system message. */
+  dynamicInstructionTokens: number;
   /** Tokens from tool schema definitions. */
   toolSchemaTokens: number;
   /** Tokens from the conversation summary. */
@@ -154,6 +251,10 @@ export type TokenBudgetBreakdown = {
   messageTokens: number;
   /** Tokens available for messages after instructions. */
   availableForMessages: number;
+  /** Per-tool schema token counts (post-multiplier), keyed by tool name. */
+  toolTokenCounts?: Record<string, number>;
+  /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
+  deferredToolNames?: string[];
 };
 
 export type EventStreamOptions = {
