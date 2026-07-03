@@ -1,5 +1,8 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
-import { _convertMessagesToOpenAIParams } from './index';
+import {
+  _convertMessagesToOpenAIParams,
+  stripImagesFromMessages,
+} from './index';
 
 describe('_convertMessagesToOpenAIParams', () => {
   it('includes reasoning_content for assistant messages in tool-call context when requested', () => {
@@ -155,5 +158,55 @@ describe('_convertMessagesToOpenAIParams', () => {
         reasoning_content: 'The prior calculator result is available.',
       })
     );
+  });
+});
+
+describe('stripImagesFromMessages', () => {
+  const textPart = { type: 'text' as const, text: 'Is this image real?' };
+  const imageUrlPart = {
+    type: 'image_url' as const,
+    image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' },
+  };
+  // A LangChain standard data content block (how uploaded images can arrive).
+  const imageDataBlock = {
+    type: 'image' as const,
+    source_type: 'base64' as const,
+    mime_type: 'image/png',
+    data: 'iVBORw0KGgo=',
+  };
+
+  it('removes image_url parts for non-vision models', () => {
+    const [msg] = stripImagesFromMessages(
+      [new HumanMessage({ content: [textPart, imageUrlPart] })],
+      false
+    );
+    expect(msg.content).toEqual([textPart]);
+  });
+
+  it('removes image data content blocks for non-vision models', () => {
+    const [msg] = stripImagesFromMessages(
+      [new HumanMessage({ content: [textPart, imageDataBlock] })],
+      false
+    );
+    expect(msg.content).toEqual([textPart]);
+  });
+
+  it('substitutes a placeholder when only image content remains', () => {
+    const [msg] = stripImagesFromMessages(
+      [new HumanMessage({ content: [imageDataBlock] })],
+      false
+    );
+    expect(msg.content).toEqual([
+      { type: 'text', text: expect.stringContaining('Image content omitted') },
+    ]);
+  });
+
+  it('leaves messages untouched for vision-capable models', () => {
+    const content = [textPart, imageDataBlock];
+    const [msg] = stripImagesFromMessages(
+      [new HumanMessage({ content })],
+      true
+    );
+    expect(msg.content).toEqual(content);
   });
 });
