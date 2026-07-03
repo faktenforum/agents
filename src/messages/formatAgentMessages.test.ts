@@ -6,11 +6,12 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
-import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import {
   convertMessagesToContent,
   formatAnthropicArtifactContent,
+  formatArtifactPayload,
 } from './core';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
 import { formatAgentMessages } from './format';
 
@@ -1570,6 +1571,109 @@ describe('formatAgentMessages', () => {
       { type: ContentTypes.TEXT, text: '' },
       { type: ContentTypes.TEXT, text: 'artifact text' },
     ]);
+  });
+
+  describe('formatArtifactPayload (OpenAI-compatible providers)', () => {
+    const imagePart = {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AAAA' },
+    };
+
+    const buildMessages = () => [
+      new HumanMessage({ content: 'draw a red square' }),
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_img',
+            name: 'generate_image',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'Image generated successfully.',
+        tool_call_id: 'call_img',
+        name: 'generate_image',
+        additional_kwargs: { artifact: { content: [imagePart] } },
+      }),
+    ];
+
+    it('moves the image into a user message behind an assistant bridge when vision-capable', () => {
+      const result = formatArtifactPayload(buildMessages(), true);
+
+      // Two messages appended after the (unchanged) tool result.
+      expect(result).toHaveLength(5);
+
+      const toolMsg = result[2] as ToolMessage;
+      expect(toolMsg.content).toBe('Image generated successfully.');
+
+      const bridge = result[3] as AIMessage;
+      expect(bridge._getType()).toBe('ai');
+      expect(typeof bridge.content).toBe('string');
+
+      const userMsg = result[4] as HumanMessage;
+      expect(userMsg._getType()).toBe('human');
+      expect(userMsg.content).toEqual([
+        { type: ContentTypes.TEXT, text: expect.any(String) },
+        imagePart,
+      ]);
+    });
+
+    it('drops the image and appends nothing when not vision-capable', () => {
+      const messages = buildMessages();
+      const result = formatArtifactPayload(messages, false);
+
+      expect(result).toHaveLength(3);
+      expect(result).toBe(messages);
+      const toolMsg = result[2] as ToolMessage;
+      expect(toolMsg.content).toBe('Image generated successfully.');
+    });
+
+    it('never leaves an image_url part inside a tool message content array', () => {
+      const toolMessage = new ToolMessage({
+        content: 'Image generated successfully.',
+        tool_call_id: 'call_img',
+        name: 'generate_image',
+      });
+      (toolMessage as unknown as { content: MessageContentComplex[] }).content =
+        [
+          { type: ContentTypes.TEXT, text: 'Image generated successfully.' },
+          imagePart,
+        ];
+      const messages = [
+        new AIMessageChunk({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_img',
+              name: 'generate_image',
+              args: {},
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        toolMessage,
+      ];
+
+      const result = formatArtifactPayload(messages, true);
+      const toolMsg = result[1] as ToolMessage;
+      expect(Array.isArray(toolMsg.content)).toBe(true);
+      expect(
+        (toolMsg.content as MessageContentComplex[]).some(
+          (p) => (p as { type?: string }).type === 'image_url'
+        )
+      ).toBe(false);
+    });
+
+    it('returns messages unchanged when the tail is not a tool message', () => {
+      const messages = [
+        new HumanMessage({ content: 'hi' }),
+        new AIMessage({ content: 'hello' }),
+      ];
+      expect(formatArtifactPayload(messages, true)).toBe(messages);
+    });
   });
 
   it('should dynamically discover tools from tool_search output and keep their tool calls', () => {

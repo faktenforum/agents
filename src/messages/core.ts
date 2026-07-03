@@ -180,15 +180,14 @@ function getReasoningDetailsText(
 function getAdditionalReasoningContent(
   message: BaseMessage
 ): string | undefined {
-  const additionalKwargs =
-    message.additional_kwargs as ReasoningAdditionalKwargs | undefined;
+  const additionalKwargs = message.additional_kwargs as
+    | ReasoningAdditionalKwargs
+    | undefined;
   if (additionalKwargs == null) {
     return undefined;
   }
 
-  const reasoningContent = getReasoningText(
-    additionalKwargs.reasoning_content
-  );
+  const reasoningContent = getReasoningText(additionalKwargs.reasoning_content);
   if (reasoningContent != null) {
     return reasoningContent;
   }
@@ -431,8 +430,7 @@ export function convertMessagesToContent(
         toolCallMap.set(tool_call.id, tool_call);
       }
 
-      currentAIMessageIndex =
-        addContentPart(message) ?? addToolCallBoundary();
+      currentAIMessageIndex = addContentPart(message) ?? addToolCallBoundary();
       continue;
     } else if (
       messageType === 'tool' &&
@@ -518,63 +516,105 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
   }
 }
 
+/** Assistant bridge that lets a `user` image follow a `tool` result on strict providers. */
+const ARTIFACT_BRIDGE_TEXT = 'Here is the generated image:';
+/** Caption on the injected user message that carries the tool image(s). */
+const ARTIFACT_IMAGE_CAPTION = 'Generated image:';
+
+function isImageUrlPart(part: unknown): boolean {
+  return (
+    part != null &&
+    typeof part === 'object' &&
+    'type' in part &&
+    (part as { type?: string }).type === 'image_url'
+  );
+}
+
 /**
- * Formats tool artifacts by adding them directly to ToolMessage content.
+ * Presents tool image artifacts to OpenAI-compatible (and Google) providers.
  *
- * Similar to Anthropic's approach, artifacts are appended to ToolMessage.content
- * as an array. This maintains proper role sequencing without requiring empty
- * AIMessage or separate HumanMessage, which some strict APIs (e.g., Scaleway)
- * do not accept.
+ * These APIs reject image parts inside a `tool` message, and strict ones
+ * (Scaleway/Mistral) also reject a `user` message immediately after a `tool`
+ * message ("Unexpected role 'user' after role 'tool'"). So the image can go
+ * neither in the tool result nor directly after it. To still let a vision model
+ * see a tool-generated image, keep the tool result text-only and, after the
+ * trailing run of tool messages, insert a short assistant bridge followed by a
+ * user message carrying the image(s). This satisfies role-alternation and
+ * image-placement rules across OpenAI, Scaleway/Mistral, and Google.
  *
- * Note: Base64 image filtering is already done in ToolNode based on vision capability.
+ * When the model is not vision-capable the images are dropped (the tool text
+ * remains), matching the downstream image strip for non-vision models.
  *
- * @param messages - Array of messages containing ToolMessages with artifacts
+ * Runs only for the tail tool round (the graph calls it when the last message
+ * is a ToolMessage). Returns the message array to send; a new array is returned
+ * only when image messages are appended, so the caller must use the return value.
+ *
+ * @param messages - Messages to send; expected to end with a ToolMessage.
+ * @param visionCapable - Whether the target model can see images.
  */
-export function formatArtifactPayload(messages: BaseMessage[]): void {
-  // Restore artifacts from additional_kwargs (where ToolNode stores them)
-  // This is necessary because coerceMessageLikeToMessage preserves additional_kwargs but not artifact property
+export function formatArtifactPayload(
+  messages: BaseMessage[],
+  visionCapable: boolean = true
+): BaseMessage[] {
+  // Restore artifacts from additional_kwargs (where ToolNode stores them);
+  // coerceMessageLikeToMessage preserves additional_kwargs but not the top-level
+  // artifact property.
   for (const msg of messages) {
     if (msg._getType() === 'tool') {
       const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
-      const additionalKwargsArtifact = toolMsg.additional_kwargs.artifact as
+      const stored = toolMsg.additional_kwargs.artifact as
         | t.MCPArtifact
         | undefined;
-      if (additionalKwargsArtifact != null) {
-        toolMsg.artifact = additionalKwargsArtifact;
+      if (stored != null) {
+        toolMsg.artifact = stored;
       }
     }
   }
 
-  // Find all ToolMessages with artifacts
-  // Use _getType() instead of instanceof to handle messages that may have been coerced
-  const toolMessagesWithArtifacts = messages
-    .filter((msg) => msg._getType() === 'tool')
-    .map((msg) => msg as ToolMessage & { artifact?: t.MCPArtifact })
-    .filter((toolMsg) => {
-      const artifact = toolMsg.artifact;
-      return artifact != null && Array.isArray(artifact.content);
-    });
-
-  if (toolMessagesWithArtifacts.length === 0) {
-    return;
+  if (messages.length === 0) {
+    return messages;
+  }
+  const last = messages[messages.length - 1];
+  if (last._getType() !== 'tool') {
+    return messages;
   }
 
-  // Add artifacts directly to ToolMessage content (similar to Anthropic approach)
-  // This maintains proper role sequencing without requiring empty AIMessage or separate HumanMessage
-  for (const toolMsg of toolMessagesWithArtifacts) {
-    const artifact = toolMsg.artifact!;
-
-    // Convert ToolMessage content to array format if needed
-    const currentContent: t.MessageContentComplex[] = Array.isArray(
-      toolMsg.content
-    )
-      ? toolMsg.content
-      : [{ type: 'text', text: String(toolMsg.content) }];
-
-    // Append artifacts directly to ToolMessage content
-    // Artifacts are already filtered by the vision strip before sending
-    toolMsg.content = [...currentContent, ...artifact.content];
+  // Walk back over the trailing run of tool messages (the just-executed round),
+  // collecting image parts and forcing every tool result to stay text-only.
+  const images: t.MessageContentComplex[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg._getType() !== 'tool') {
+      break;
+    }
+    const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
+    if (Array.isArray(toolMsg.content)) {
+      const textOnly = toolMsg.content.filter((p) => !isImageUrlPart(p));
+      toolMsg.content =
+        textOnly.length > 0
+          ? textOnly
+          : stringifyToolMessageContent(toolMsg.content);
+    }
+    const artifact = toolMsg.artifact;
+    if (artifact != null && Array.isArray(artifact.content)) {
+      images.unshift(...artifact.content.filter(isImageUrlPart));
+    }
   }
+
+  if (images.length === 0 || !visionCapable) {
+    return messages;
+  }
+
+  return [
+    ...messages,
+    new AIMessage({ content: ARTIFACT_BRIDGE_TEXT }),
+    new HumanMessage({
+      content: toLangChainContent([
+        { type: ContentTypes.TEXT, text: ARTIFACT_IMAGE_CAPTION },
+        ...images,
+      ]),
+    }),
+  ];
 }
 
 /**
