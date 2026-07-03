@@ -301,8 +301,9 @@ export interface ConvertMessagesOptions {
   /** Convert reasoning_details to content blocks for Claude (requires content array format) */
   convertReasoningDetailsToContent?: boolean;
   /**
-   * When false, image_url parts are stripped from all message content before sending.
-   * Prevents "model is not a multimodal model" / "No endpoints found that support image input" errors.
+   * When false, image content (OpenAI `image_url` parts and standard `image` data
+   * content blocks) is stripped from all message content before sending. Prevents
+   * "model is not a multimodal model" / "No endpoints found that support image input" errors.
    */
   visionCapable?: boolean;
 }
@@ -310,6 +311,21 @@ export interface ConvertMessagesOptions {
 /** Placeholder text when image content is stripped for non-vision models */
 const IMAGE_OMITTED_PLACEHOLDER =
   '(Image content omitted — model does not support vision)';
+
+/**
+ * True for image content parts a non-vision model cannot accept: OpenAI-style
+ * `image_url` parts and standard `image` data content blocks. Data content blocks
+ * are converted to `image_url` downstream (see `fromStandardImageBlock`), so they
+ * must be dropped here too or they still reach a text-only model and trigger a
+ * "not a multimodal model" error.
+ */
+function isImageContentPart(part: unknown): boolean {
+  if (part == null || typeof part !== 'object' || !('type' in part)) {
+    return false;
+  }
+  const { type } = part as { type?: string };
+  return type === 'image_url' || type === 'image';
+}
 
 function filterImagePartsIfNeeded(
   content: string | unknown[],
@@ -321,12 +337,7 @@ function filterImagePartsIfNeeded(
   if (typeof content === 'string') {
     return content;
   }
-  const filtered = content.filter((m: unknown) => {
-    if (m && typeof m === 'object' && 'type' in m) {
-      return (m as { type: string }).type !== 'image_url';
-    }
-    return true;
-  });
+  const filtered = content.filter((m: unknown) => !isImageContentPart(m));
   return filtered.length > 0
     ? filtered
     : [{ type: 'text' as const, text: IMAGE_OMITTED_PLACEHOLDER }];
@@ -337,7 +348,8 @@ function filterImagePartsIfNeeded(
  * level (mirrors filterImagePartsIfNeeded). Used as the single choke point before
  * delegating to the base streaming so images never reach a model that would reject
  * them ("model is not a multimodal model" / "No endpoints found that support image
- * input"). Returns the input unchanged when visionCapable is true.
+ * input"). Covers both OpenAI `image_url` parts and standard `image` data content
+ * blocks. Returns the input unchanged when visionCapable is true.
  */
 export function stripImagesFromMessages(
   messages: BaseMessage[],
@@ -350,12 +362,7 @@ export function stripImagesFromMessages(
     if (!Array.isArray(msg.content)) {
       return msg;
     }
-    const hasImage = msg.content.some(
-      (part) =>
-        part != null &&
-        typeof part === 'object' &&
-        (part as { type?: string }).type === 'image_url'
-    );
+    const hasImage = msg.content.some((part) => isImageContentPart(part));
     if (!hasImage) {
       return msg;
     }
