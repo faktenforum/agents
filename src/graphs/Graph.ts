@@ -1733,7 +1733,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider)
         ) {
-          formatArtifactPayload(finalMessages);
+          finalMessages = formatArtifactPayload(
+            finalMessages,
+            agentContext.vision
+          );
         }
       }
 
