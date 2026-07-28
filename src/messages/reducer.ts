@@ -36,6 +36,66 @@ export type Messages =
   | BaseMessage
   | BaseMessageLike;
 
+/** Reads an MCP artifact off a message-like value, before coercion loses it. */
+function readArtifact(
+  message: BaseMessageLike | null | undefined
+): t.MCPArtifact | undefined {
+  if (message == null || typeof message !== 'object') {
+    return undefined;
+  }
+  const candidate = message as Record<string, unknown>;
+  // Message-likes reach here both as BaseMessage instances and as plain objects, so accept
+  // either accessor; `getType` is the current name, `_getType` the older one still shipped.
+  const getType = (
+    typeof candidate.getType === 'function' ? candidate.getType : candidate._getType
+  ) as (() => string) | undefined;
+  if (typeof getType !== 'function' || getType.call(candidate) !== 'tool') {
+    return undefined;
+  }
+  const toolLike = candidate as {
+    artifact?: t.MCPArtifact;
+    additional_kwargs?: { artifact?: t.MCPArtifact };
+  };
+  return toolLike.artifact ?? toolLike.additional_kwargs?.artifact;
+}
+
+/** Puts an artifact back on a coerced ToolMessage. */
+function restoreArtifact(message: BaseMessage, artifact: t.MCPArtifact): void {
+  const toolMsg = message as ToolMessage & { artifact?: t.MCPArtifact };
+  toolMsg.artifact = artifact;
+  toolMsg.additional_kwargs.artifact = artifact;
+}
+
+/**
+ * Coerce each entry to a {@link BaseMessage} in a single pass, skipping
+ * null/undefined entries. Providers can emit empty/partial stream chunks that
+ * arrive as `undefined`; passing those to `coerceMessageLikeToMessage` throws
+ * "Cannot read properties of undefined (reading 'role')" and crashes the run.
+ * Folding the null check into the coercion loop avoids a second pass over the
+ * array. Refs LibreChat Discussion #12284.
+ *
+ * `coerceMessageLikeToMessage` also drops the `artifact` field of a ToolMessage,
+ * which carries MCP tool output (images among it), so it is lifted off before
+ * coercion and put back afterwards.
+ */
+function coerceMessages(
+  messages: ReadonlyArray<BaseMessageLike | null | undefined>
+): BaseMessage[] {
+  const coerced: BaseMessage[] = [];
+  for (const message of messages) {
+    if (message == null) {
+      continue;
+    }
+    const artifact = readArtifact(message);
+    const result = coerceMessageLikeToMessage(message);
+    if (artifact && result.getType() === 'tool') {
+      restoreArtifact(result, artifact);
+    }
+    coerced.push(result);
+  }
+  return coerced;
+}
+
 /**
  * Prebuilt reducer that combines returned messages.
  * Can handle standard messages and special modifiers like {@link RemoveMessage}
@@ -47,45 +107,9 @@ export function messagesStateReducer(
 ): BaseMessage[] {
   const leftArray = Array.isArray(left) ? left : [left];
   const rightArray = Array.isArray(right) ? right : [right];
-
-  // Preserve and restore artifacts (coerceMessageLikeToMessage loses them)
-  const preserveAndCoerce = (msgs: BaseMessageLike[]): BaseMessage[] => {
-    return msgs.map((msg) => {
-      // Extract artifact before coercion
-      let artifact: t.MCPArtifact | undefined;
-      if (typeof msg === 'object' && msg !== null) {
-        const msgObj = msg as Record<string, unknown>;
-        if (
-          typeof msgObj._getType === 'function' &&
-          msgObj._getType() === 'tool'
-        ) {
-          const toolMsgLike = msgObj as {
-            artifact?: t.MCPArtifact;
-            additional_kwargs?: { artifact?: t.MCPArtifact };
-          };
-          artifact =
-            toolMsgLike.artifact ?? toolMsgLike.additional_kwargs?.artifact;
-        }
-      }
-
-      // Coerce to BaseMessage
-      const coerced = coerceMessageLikeToMessage(msg);
-
-      // Restore artifact after coercion
-      if (artifact && coerced._getType() === 'tool') {
-        const toolMsg = coerced as ToolMessage & { artifact?: t.MCPArtifact };
-        toolMsg.artifact = artifact;
-        toolMsg.additional_kwargs = toolMsg.additional_kwargs ?? {};
-        toolMsg.additional_kwargs.artifact = artifact;
-      }
-
-      return coerced;
-    });
-  };
-
-  const leftMessages = preserveAndCoerce(leftArray as BaseMessageLike[]);
-  const rightMessages = preserveAndCoerce(rightArray as BaseMessageLike[]);
-
+  // coerce to message, skipping null/undefined entries in the same pass
+  const leftMessages = coerceMessages(leftArray as BaseMessageLike[]);
+  const rightMessages = coerceMessages(rightArray as BaseMessageLike[]);
   // assign missing ids
   for (const m of leftMessages) {
     if (m.id == null) {
@@ -124,20 +148,9 @@ export function messagesStateReducer(
           m.getType() === 'tool' &&
           merged[existingIdx].getType() === 'tool'
         ) {
-          const existingToolMsg = merged[existingIdx] as ToolMessage & {
-            artifact?: t.MCPArtifact;
-          };
-          const newToolMsg = m as ToolMessage & { artifact?: t.MCPArtifact };
-
-          // Preserve artifact from existing message if new message doesn't have one
-          const existingArtifact = (existingToolMsg.artifact ??
-            existingToolMsg.additional_kwargs.artifact) as
-            | t.MCPArtifact
-            | undefined;
-          if (existingArtifact && !newToolMsg.artifact) {
-            newToolMsg.artifact = existingArtifact;
-            newToolMsg.additional_kwargs = newToolMsg.additional_kwargs ?? {};
-            newToolMsg.additional_kwargs.artifact = existingArtifact;
+          const existingArtifact = readArtifact(merged[existingIdx]);
+          if (existingArtifact && !readArtifact(m)) {
+            restoreArtifact(m, existingArtifact);
           }
         }
         idsToRemove.delete(m.id);
@@ -150,28 +163,16 @@ export function messagesStateReducer(
         );
       }
       // Preserve artifacts when adding new ToolMessages (especially when ID was undefined and got assigned)
-      if (m.getType() === 'tool') {
-        const toolMsg = m as ToolMessage & { artifact?: t.MCPArtifact };
-
-        // Check if there's an existing ToolMessage with the same tool_call_id that has artifacts
-        const existingWithSameToolCallId = merged.find((existing) => {
-          if (existing.getType() !== 'tool') return false;
-          const existingTool = existing as ToolMessage;
-          return existingTool.tool_call_id === toolMsg.tool_call_id;
-        }) as (ToolMessage & { artifact?: t.MCPArtifact }) | undefined;
-
-        if (existingWithSameToolCallId) {
-          // Preserve artifacts from existing message if new message doesn't have one
-          const existingArtifact = (existingWithSameToolCallId.artifact ??
-            existingWithSameToolCallId.additional_kwargs.artifact) as
-            | t.MCPArtifact
-            | undefined;
-
-          if (existingArtifact && !toolMsg.artifact) {
-            toolMsg.artifact = existingArtifact;
-            toolMsg.additional_kwargs = toolMsg.additional_kwargs ?? {};
-            toolMsg.additional_kwargs.artifact = existingArtifact;
-          }
+      if (m.getType() === 'tool' && !readArtifact(m)) {
+        const toolCallId = (m as ToolMessage).tool_call_id;
+        const previous = merged.find(
+          (existing) =>
+            existing.getType() === 'tool' &&
+            (existing as ToolMessage).tool_call_id === toolCallId
+        );
+        const existingArtifact = previous ? readArtifact(previous) : undefined;
+        if (existingArtifact) {
+          restoreArtifact(m, existingArtifact);
         }
       }
       mergedById.set(m.id, merged.length);

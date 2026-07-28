@@ -80,10 +80,18 @@ export function enforceOriginalContentCap(map: Map<number, string>): void {
 
 /** Minimum cumulative calibration ratio — provider can't count fewer tokens
  *  than our raw estimate (within reason). Prevents divide-by-zero edge cases. */
-const CALIBRATION_RATIO_MIN = 0.5;
+export const CALIBRATION_RATIO_MIN = 0.5;
 
 /** Maximum cumulative calibration ratio — sanity cap for the running ratio. */
-const CALIBRATION_RATIO_MAX = 5;
+export const CALIBRATION_RATIO_MAX = 5;
+
+/** Keeps provider/local token calibration within the shared safe range. */
+export function clampCalibrationRatio(ratio: number): number {
+  return Math.max(
+    CALIBRATION_RATIO_MIN,
+    Math.min(CALIBRATION_RATIO_MAX, ratio)
+  );
+}
 
 export type PruneMessagesFactoryParams = {
   provider?: Providers;
@@ -135,9 +143,10 @@ export type PruneMessagesParams = {
   usageMetadata?: Partial<UsageMetadata>;
   startType?: ReturnType<BaseMessage['getType']>;
   /**
-   * Usage from the most recent LLM call only (not accumulated).
-   * When provided, calibration uses this instead of usageMetadata
-   * to avoid inflated ratios from N×cacheRead accumulation.
+   * Fallback usage from the most recent LLM call only (not accumulated).
+   * Calibration prefers the provider's raw `usageMetadata.input_tokens`
+   * when available, because cache detail fields may use non-window
+   * accounting units.
    */
   lastCallUsage?: {
     totalTokens: number;
@@ -1001,8 +1010,8 @@ export function maskConsumedToolResults(params: {
   /** When provided, original (pre-masking) content is stored here keyed by
    *  message index — only for entries that actually get truncated. */
   originalContentStore?: Map<number, string>;
-  /** Called after storing content with the char length of the stored entry. */
-  onContentStored?: (charLength: number) => void;
+  /** Called after storing a newly captured entry. */
+  onContentStored?: (index: number, content: string) => void;
 }): number {
   const { messages, indexTokenCountMap, tokenCounter } = params;
   let maskedCount = 0;
@@ -1078,7 +1087,7 @@ export function maskConsumedToolResults(params: {
     if (params.originalContentStore && !params.originalContentStore.has(i)) {
       params.originalContentStore.set(i, content);
       if (params.onContentStored) {
-        params.onContentStored(content.length);
+        params.onContentStored(i, content);
       }
     }
 
@@ -1310,6 +1319,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     remainingContextTokens?: number;
     contextPressure?: number;
     originalToolContent?: Map<number, string>;
+    newOriginalToolContent?: Map<number, string>;
     calibrationRatio?: number;
     resolvedInstructionOverhead?: number;
     /** Usable budget this call: maxTokens minus output reserve */
@@ -1317,6 +1327,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     /** Calibrated instruction overhead actually applied this call */
     effectiveInstructionTokens?: number;
   } {
+    let newOriginalToolContent: Map<number, string> | undefined;
     if (params.messages.length === 0) {
       /** Post-compaction calls still invoke the model — report the same
        *  reserve-adjusted budget fields as the populated paths */
@@ -1436,8 +1447,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // no per-turn oscillation, no map mutation.
     if (currentUsage && params.totalTokensFresh !== false) {
       const instructionOverhead = factoryParams.getInstructionTokens?.() ?? 0;
-      const providerInputTokens =
-        params.lastCallUsage?.inputTokens ?? currentUsage.input_tokens;
+      const rawProviderInputTokens = Number(params.usageMetadata?.input_tokens);
+      const providerInputTokens = checkValidNumber(rawProviderInputTokens)
+        ? rawProviderInputTokens
+        : (params.lastCallUsage?.inputTokens ?? currentUsage.input_tokens);
 
       // Sum raw tiktoken counts for messages the provider saw (excludes
       // new outputs from this turn — the provider hasn't seen them yet).
@@ -1458,42 +1471,62 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         0,
         providerInputTokens - instructionOverhead
       );
+      const minimumComparableInputTokens =
+        instructionOverhead + rawSentThisTurn * CALIBRATION_RATIO_MIN;
+      let calibrationSkipReason: string | undefined;
+      if (rawSentThisTurn <= 0) {
+        calibrationSkipReason = 'no_sent_messages';
+      } else if (providerMessageTokens <= 0) {
+        calibrationSkipReason = 'input_below_instruction_overhead';
+      } else if (providerInputTokens < minimumComparableInputTokens) {
+        calibrationSkipReason = 'input_below_calibration_floor';
+      }
+      // No upper-bound rejection: maxTokens is an application budget, not the
+      // provider's real context window.  Usage above the budget is a genuine
+      // measurement — and the one that must drive pruning/summarization.
 
-      if (rawSentThisTurn > 0 && providerMessageTokens > 0) {
+      if (calibrationSkipReason == null) {
         cumulativeRawSent += rawSentThisTurn;
         cumulativeProviderReported += providerMessageTokens;
         const newRatio = cumulativeProviderReported / cumulativeRawSent;
-        calibrationRatio = Math.max(
-          CALIBRATION_RATIO_MIN,
-          Math.min(CALIBRATION_RATIO_MAX, newRatio)
-        );
+        calibrationRatio = clampCalibrationRatio(newRatio);
+
+        const calibratedOurTotal =
+          instructionOverhead + rawSentThisTurn * calibrationRatio;
+        const overallRatio =
+          calibratedOurTotal > 0 ? providerInputTokens / calibratedOurTotal : 0;
+        const variancePct = Math.round((overallRatio - 1) * 100);
+
+        const absVariance = Math.abs(overallRatio - 1);
+        if (absVariance < bestVarianceAbs) {
+          bestVarianceAbs = absVariance;
+          bestInstructionOverhead = Math.max(
+            0,
+            Math.round(providerInputTokens - rawSentThisTurn * calibrationRatio)
+          );
+          bestInstructionEstimate = factoryParams.getInstructionTokens?.() ?? 0;
+        }
+
+        factoryParams.log?.('debug', 'Calibration observed', {
+          providerInputTokens,
+          calibratedEstimate: Math.round(calibratedOurTotal),
+          variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
+          calibrationRatio: Math.round(calibrationRatio * 100) / 100,
+          instructionOverhead,
+          cumulativeRawSent,
+          cumulativeProviderReported,
+        });
+      } else {
+        factoryParams.log?.('debug', 'Calibration skipped', {
+          reason: calibrationSkipReason,
+          providerInputTokens,
+          minimumComparableInputTokens: Math.round(
+            minimumComparableInputTokens
+          ),
+          rawSentThisTurn,
+          instructionOverhead,
+        });
       }
-
-      const calibratedOurTotal =
-        instructionOverhead + rawSentThisTurn * calibrationRatio;
-      const overallRatio =
-        calibratedOurTotal > 0 ? providerInputTokens / calibratedOurTotal : 0;
-      const variancePct = Math.round((overallRatio - 1) * 100);
-
-      const absVariance = Math.abs(overallRatio - 1);
-      if (absVariance < bestVarianceAbs && rawSentThisTurn > 0) {
-        bestVarianceAbs = absVariance;
-        bestInstructionOverhead = Math.max(
-          0,
-          Math.round(providerInputTokens - rawSentThisTurn * calibrationRatio)
-        );
-        bestInstructionEstimate = factoryParams.getInstructionTokens?.() ?? 0;
-      }
-
-      factoryParams.log?.('debug', 'Calibration observed', {
-        providerInputTokens,
-        calibratedEstimate: Math.round(calibratedOurTotal),
-        variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
-        calibrationRatio: Math.round(calibrationRatio * 100) / 100,
-        instructionOverhead,
-        cumulativeRawSent,
-        cumulativeProviderReported,
-      });
     }
 
     // Computed BEFORE pre-flight truncation so the effective budget can drive
@@ -1635,8 +1668,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             : undefined,
         onContentStored:
           factoryParams.summarizationEnabled === true
-            ? (charLen: number): void => {
-              originalToolContentSize += charLen;
+            ? (index: number, content: string): void => {
+              originalToolContentSize += content.length;
+              if (newOriginalToolContent == null) {
+                newOriginalToolContent = new Map();
+              }
+              newOriginalToolContent.set(index, content);
               while (
                 originalToolContentSize > ORIGINAL_CONTENT_MAX_CHARS &&
                   originalToolContent.size > 0
@@ -1772,6 +1809,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         contextPressure,
         originalToolContent:
           originalToolContent.size > 0 ? originalToolContent : undefined,
+        newOriginalToolContent,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
         contextBudget: pruningBudget,
@@ -2156,6 +2194,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       contextPressure,
       originalToolContent:
         originalToolContent.size > 0 ? originalToolContent : undefined,
+      newOriginalToolContent,
       calibrationRatio,
       resolvedInstructionOverhead: bestInstructionOverhead,
       contextBudget: pruningBudget,

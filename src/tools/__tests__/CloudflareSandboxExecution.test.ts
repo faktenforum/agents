@@ -2,6 +2,7 @@ import type * as t from '@/types';
 import {
   createCloudflareWorkspaceFS,
   createCloudflareLocalExecutionConfig,
+  execWithClientTimeout,
   executeCloudflareBash,
   executeCloudflareCode,
 } from '../cloudflare/CloudflareSandboxExecutionEngine';
@@ -9,6 +10,7 @@ import {
   createCloudflareBashProgrammaticToolCallingTool,
   createCloudflareProgrammaticToolCallingTool,
 } from '../cloudflare/CloudflareProgrammaticToolCalling';
+import { isWorkspaceClientTimeoutError } from '../local/workspaceFS';
 import { createCloudflareBridgeRuntime } from '../cloudflare/CloudflareBridgeRuntime';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
 import { spawnLocalProcess } from '../local/LocalExecutionEngine';
@@ -255,6 +257,327 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(execCommand).toContain('timeout -k 2s 2s bash -lc');
     expect(execTimeout).toBe(6500);
     expect(result.timedOut).toBe(true);
+  });
+
+  it('rejects with a client-side timeout when sandbox exec stalls (no native cancellation)', async () => {
+    // The native Cloudflare Sandbox DO exec() is uncancellable (ExecOptions has no
+    // signal) and its own `timeout` is not enforced when the container/RPC stalls,
+    // while the in-sandbox `timeout(1)` wrapper only bounds a *running* command.
+    // Without a client-side race a stalled exec hangs until the host's run-level
+    // abort, burning the whole budget on one tool call (issue #251).
+    jest.useFakeTimers();
+    try {
+      let mainExecCalls = 0;
+      const sandbox = createRuntime({
+        exec: (command) => {
+          // Cleanup (`rm -rf`) resolves immediately; the real command stalls,
+          // simulating an unresponsive / cold container exec that never returns.
+          if (command.startsWith('rm -rf')) {
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+          }
+          mainExecCalls += 1;
+          return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("slow")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+
+      // Client backstop = outerTimeoutMs(1000) + 5000 = 11000ms; advance past it.
+      await jest.advanceTimersByTimeAsync(11500);
+      await assertion;
+      expect(mainExecCalls).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('aborts signal-aware execs when the client timeout fires', async () => {
+    // For signal-aware transports (e.g. the HTTP bridge), a client timeout should
+    // actually cancel the underlying exec, not just abandon it.
+    jest.useFakeTimers();
+    try {
+      let mainSignal: AbortSignal | undefined;
+      const sandbox = createRuntime({
+        supportsExecSignal: true,
+        exec: (command, options) => {
+          if (command.startsWith('rm -rf')) {
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+          }
+          mainSignal = options?.signal;
+          return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("slow")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+      await jest.advanceTimersByTimeAsync(11500);
+      await assertion;
+
+      expect(mainSignal).toBeDefined();
+      expect(mainSignal?.aborted).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('composes a caller abort signal with the timeout instead of clobbering it', async () => {
+    let received: AbortSignal | undefined;
+    const sandbox = createRuntime({
+      supportsExecSignal: true,
+      exec: (_command, options) => {
+        received = options?.signal;
+        return new Promise<t.CloudflareSandboxExecResult>(
+          (_resolve, reject) => {
+            options?.signal?.addEventListener(
+              'abort',
+              () => reject(new Error('aborted')),
+              { once: true }
+            );
+          }
+        );
+      },
+    });
+
+    const caller = new AbortController();
+    const settled = execWithClientTimeout(
+      sandbox,
+      'echo hi',
+      { signal: caller.signal },
+      60000,
+      'test'
+    ).catch((e) => e as Error);
+
+    await Promise.resolve();
+    expect(received).toBeDefined();
+    // The exec gets a composed signal, not the caller's directly.
+    expect(received).not.toBe(caller.signal);
+    expect(received?.aborted).toBe(false);
+
+    // A caller cancellation must reach the exec (not wait for the client timeout).
+    caller.abort();
+    await settled;
+    expect(received?.aborted).toBe(true);
+  });
+
+  it('strips a caller signal for native runtimes that cannot consume it', async () => {
+    let received: t.CloudflareSandboxExecOptions | undefined;
+    const sandbox = createRuntime({
+      // no supportsExecSignal -> native DO, which cannot clone/consume a signal
+      exec: async (_command, options) => {
+        received = options;
+        return { exitCode: 0, stdout: 'ok', stderr: '' };
+      },
+    });
+    const caller = new AbortController();
+
+    await execWithClientTimeout(
+      sandbox,
+      'echo hi',
+      { cwd: '/workspace', signal: caller.signal },
+      60000,
+      'test'
+    );
+
+    expect(received).toBeDefined();
+    expect(received).not.toHaveProperty('signal');
+  });
+
+  it('rejects with a client-side timeout when sandbox readFile stalls', async () => {
+    // The native-DO file-IO RPCs (readFile/writeFile/listFiles/...) have the same
+    // stall hazard exec() does: no signal, no enforced timeout. A cold/unresponsive
+    // container otherwise hangs the host await until the run-level abort, burning
+    // the whole budget on one read (observed live: a `read_file` stalled ~552s).
+    jest.useFakeTimers();
+    try {
+      let readCalls = 0;
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({
+          readFile: () => {
+            readCalls += 1;
+            return new Promise<string>(() => undefined);
+          },
+        }),
+      });
+
+      const error = (fs.readFile as (p: string) => Promise<unknown>)(
+        '/workspace/a.txt'
+      ).catch((e: unknown) => e);
+      // Client backstop = clientFsTimeoutMs(1000) = 6000ms; advance past it.
+      await jest.advanceTimersByTimeAsync(6500);
+      const settled = await error;
+      // Must be the DISTINGUISHABLE timeout error so ENOENT-only callers rethrow
+      // it instead of mistaking a stalled read for a missing file.
+      expect(isWorkspaceClientTimeoutError(settled)).toBe(true);
+      expect((settled as Error).message).toMatch(/client-side timeout/);
+      expect(readCalls).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the backstop active while draining a streamed file read', async () => {
+    // sandbox.readFile resolves to { content: ReadableStream } whose stream never
+    // ends. The race must cover the drain (normalizeReadFileContent), not just the
+    // initial RPC, or read_file/open/stat still hang to the run-level abort.
+    jest.useFakeTimers();
+    try {
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({
+          readFile: async () => ({
+            content: new ReadableStream<Uint8Array>({
+              // start() never enqueues or closes -> the drain stalls forever.
+              start() {},
+            }),
+          }),
+        }),
+      });
+
+      const error = (fs.readFile as (p: string) => Promise<unknown>)(
+        '/workspace/a.txt'
+      ).catch((e: unknown) => e);
+      await jest.advanceTimersByTimeAsync(6500);
+      const settled = await error;
+      expect(isWorkspaceClientTimeoutError(settled)).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('rethrows a stat directory-probe timeout instead of falling through to readFile', async () => {
+    // findChildInfo returns nothing -> the directory probe (listFiles) runs; if it
+    // STALLS it must surface, not fall through to the readFile branch (which would
+    // burn a SECOND full backstop, ~2x the timeout, before the caller sees it).
+    jest.useFakeTimers();
+    try {
+      let readFileCalls = 0;
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({
+          listFiles: (dir) =>
+            dir === '/workspace/probe-me'
+              ? new Promise(() => undefined) // the probe stalls
+              : Promise.resolve([]), // findChildInfo's parent listing returns fast
+          readFile: () => {
+            readFileCalls += 1;
+            return Promise.resolve('');
+          },
+        }),
+      });
+
+      const error = fs.stat('/workspace/probe-me').catch((e: unknown) => e);
+      await jest.advanceTimersByTimeAsync(6500);
+      const settled = await error;
+      expect(isWorkspaceClientTimeoutError(settled)).toBe(true);
+      // Must NOT have fallen through to the readFile probe.
+      expect(readFileCalls).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('bounds execute_code temp-dir setup RPCs (mkdir/writeFile) that stall', async () => {
+    jest.useFakeTimers();
+    try {
+      const sandbox = createRuntime({
+        // exec would resolve fine; the stall is in the pre-exec mkdir setup.
+        mkdir: () => new Promise<{ ok: true }>(() => undefined),
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("hi")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+      await jest.advanceTimersByTimeAsync(6500);
+      await assertion;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('still cleans up the temp dir when execute_code setup (writeFile) times out', async () => {
+    // The setup RPCs are inside the try, so a stalled writeFile still triggers
+    // the finally cleanup — otherwise the late (uncancellable) write leaves an
+    // orphaned .lc-exec/<uuid> dir behind on every cold-container failure.
+    jest.useFakeTimers();
+    try {
+      const execCommands: string[] = [];
+      const sandbox = createRuntime({
+        mkdir: async () => ({ ok: true }),
+        writeFile: () => new Promise<{ ok: true }>(() => undefined), // stalls
+        exec: async (command) => {
+          execCommands.push(command);
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("hi")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      ).catch((e: unknown) => e);
+      await jest.advanceTimersByTimeAsync(6500);
+      const settled = await promise;
+      expect(isWorkspaceClientTimeoutError(settled)).toBe(true);
+      // Cleanup must have been issued despite the setup failure.
+      expect(execCommands.some((c) => c.startsWith('rm -rf'))).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('rejects with a client-side timeout when sandbox listFiles stalls', async () => {
+    jest.useFakeTimers();
+    try {
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({
+          listFiles: () =>
+            new Promise<t.CloudflareSandboxFileInfo[]>(() => undefined),
+        }),
+      });
+
+      const promise = (fs.readdir as (p: string) => Promise<unknown>)(
+        '/workspace/sub'
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+      await jest.advanceTimersByTimeAsync(6500);
+      await assertion;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not time out a native FS RPC that returns in time', async () => {
+    jest.useFakeTimers();
+    try {
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({ readFile: async () => 'contents' }),
+      });
+
+      const result = await (
+        fs.readFile as (p: string, e: 'utf8') => Promise<string>
+      )('/workspace/a.txt', 'utf8');
+      expect(result).toBe('contents');
+      // The backstop timer must have been cleared, not left dangling.
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {

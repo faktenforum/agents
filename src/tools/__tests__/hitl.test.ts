@@ -34,7 +34,7 @@ import type {
 import type * as t from '@/types';
 import { Providers as providers, GraphEvents } from '@/common';
 import * as events from '@/utils/events';
-import { HookRegistry } from '@/hooks';
+import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import { ToolNode } from '../ToolNode';
 
 async function flushAsyncWork(): Promise<void> {
@@ -253,6 +253,119 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
         allowed_decisions: ['approve', 'reject', 'edit', 'respond'],
       },
     ]);
+  });
+
+  it('waits for approval before executing an explicit ask rule in bypass mode', async () => {
+    let toolExecuted = false;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        toolExecuted = true;
+        const request = data as {
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([
+          { toolCallId: 'call_1', content: 'deleted', status: 'success' },
+        ]);
+      });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        createToolPolicyHook({
+          mode: 'bypass',
+          ask: ['dangerous_*'],
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('dangerous_tool')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_call_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'dangerous_tool',
+        args: { command: 'delete data' },
+      },
+    ]);
+    const config = {
+      configurable: { thread_id: 'thread-bypass-explicit-ask' },
+    };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+
+    expect(isInterrupted<t.HumanInterruptPayload>(interrupted)).toBe(true);
+    expect(toolExecuted).toBe(false);
+
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'approve' }],
+      config
+    )) as { messages: BaseMessage[] };
+
+    expect(toolExecuted).toBe(true);
+    expect(
+      resumed.messages.some(
+        (message) =>
+          message._getType() === 'tool' &&
+          (message as ToolMessage).tool_call_id === 'call_1' &&
+          message.content === 'deleted'
+      )
+    ).toBe(true);
+  });
+
+  it('executes an unmatched tool without interruption in bypass mode', async () => {
+    let toolExecuted = false;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        toolExecuted = true;
+        const request = data as {
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([
+          { toolCallId: 'call_1', content: 'read result', status: 'success' },
+        ]);
+      });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        createToolPolicyHook({
+          mode: 'bypass',
+          ask: ['dangerous_*'],
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('read_tool')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_call_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'read_tool', args: { command: 'read data' } },
+    ]);
+
+    const result = await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'thread-bypass-unmatched' } }
+    );
+
+    expect(isInterrupted(result)).toBe(false);
+    expect(toolExecuted).toBe(true);
   });
 
   it('resume with approve runs the tool through the host event path', async () => {
@@ -761,6 +874,221 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(run.Graph?.compileOptions?.checkpointer).toBe(hostCheckpointer);
   });
 
+  it('processStream defaults durability to "exit" when a checkpointer is active', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'durability-exit-default',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      humanInTheLoop: { enabled: true },
+    });
+    expect(run.Graph?.compileOptions?.checkpointer).toBeInstanceOf(MemorySaver);
+
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END)
+      .compile();
+    const spy = jest.spyOn(graph, 'streamEvents');
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      { version: 'v2', configurable: { thread_id: 't' } }
+    );
+
+    const streamedConfig = spy.mock.calls[0]?.[1] as
+      | t.RunStreamConfig
+      | undefined;
+    expect(streamedConfig?.durability).toBe('exit');
+  });
+
+  it('processStream respects an explicit caller durability over the checkpointer default', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'durability-explicit-override',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END)
+      .compile();
+    const spy = jest.spyOn(graph, 'streamEvents');
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      { version: 'v2', durability: 'sync', configurable: { thread_id: 't' } }
+    );
+
+    const streamedConfig = spy.mock.calls[0]?.[1] as
+      | t.RunStreamConfig
+      | undefined;
+    expect(streamedConfig?.durability).toBe('sync');
+  });
+
+  it('processStream leaves durability unset when no checkpointer is active', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'durability-no-checkpointer',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      // humanInTheLoop omitted — no checkpointer installed
+    });
+    expect(run.Graph?.compileOptions?.checkpointer).toBeUndefined();
+
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END)
+      .compile();
+    const spy = jest.spyOn(graph, 'streamEvents');
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      { version: 'v2', configurable: { thread_id: 't' } }
+    );
+
+    const streamedConfig = spy.mock.calls[0]?.[1] as
+      | t.RunStreamConfig
+      | undefined;
+    expect(streamedConfig?.durability).toBeUndefined();
+  });
+
+  it('defaults durability to "exit" when HITL installs the fallback checkpointer but caller compileOptions omit it', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'durability-hitl-fallback-compileopts',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+        // Caller compileOptions without a checkpointer: HITL adds a MemorySaver
+        // fallback to the compiled graph, but the constructor restores this raw
+        // metadata (no checkpointer) onto Graph.compileOptions.
+        compileOptions: { interruptBefore: [] },
+      },
+      humanInTheLoop: { enabled: true },
+    });
+    expect(run.Graph?.compileOptions?.checkpointer).toBeUndefined();
+
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END)
+      .compile();
+    const spy = jest.spyOn(graph, 'streamEvents');
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      { version: 'v2', configurable: { thread_id: 't' } }
+    );
+
+    const streamedConfig = spy.mock.calls[0]?.[1] as
+      | t.RunStreamConfig
+      | undefined;
+    expect(streamedConfig?.durability).toBe('exit');
+  });
+
+  it('Run.resume forwards update + goto into the resume Command (langgraph 1.4.5)', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'hitl-resume-update-goto',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+    });
+
+    const spy = jest.spyOn(run, 'processStream').mockResolvedValue(undefined);
+
+    const decision = [{ type: 'approve' as const }];
+    const update = { messages: [new AIMessage('host-edit')] };
+    await run.resume(
+      decision,
+      { version: 'v1', configurable: { thread_id: 't' } },
+      undefined,
+      { update, goto: 'agent' }
+    );
+
+    const cmd = spy.mock.calls[0]?.[0] as Command;
+    expect(cmd).toBeInstanceOf(Command);
+    // No interrupt was captured, so the resume value passes through unscoped.
+    expect(cmd.resume).toEqual(decision);
+    expect(cmd.update).toEqual(update);
+    expect(cmd.goto).toEqual(['agent']); // langgraph normalizes goto to an array
+
+    // Backward-compat: omitting commandOptions leaves update unset, goto empty.
+    await run.resume(decision, {
+      version: 'v1',
+      configurable: { thread_id: 't' },
+    });
+    const cmd2 = spy.mock.calls[1]?.[0] as Command;
+    expect(cmd2.update).toBeUndefined();
+    expect(cmd2.goto).toEqual([]);
+  });
+
   it('re-exports langgraph HITL primitives from the SDK barrel for host use', async () => {
     const indexExports = await import('@/index');
     expect(indexExports.MemorySaver).toBe(MemorySaver);
@@ -901,6 +1229,120 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
      * reason carried over from the previous pass. */
     expect(run.getInterrupt()).toBeUndefined();
     expect(run.getHaltReason()).toBeUndefined();
+  });
+
+  it('Run.resume() forwards `update` so langgraph applies the channel edit through streamEvents', async () => {
+    /** Executing proof (not a spy): interrupt on a tool, resume with an
+     * injected message via `update`, then read the committed checkpoint.
+     * langgraph 1.4.5 maps an INPUT resume Command through `mapCommand`
+     * (pregel/io.js), which applies resume AND update AND goto, so the
+     * injected message must land in the messages channel. */
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'host-result',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+
+    const hexToolCallId = '0123456789abcdef0123456789abcdef';
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([[hexToolCallId, 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode(
+        'agent',
+        (): MessagesUpdate => ({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: hexToolCallId, name: 'echo', args: { command: 'x' } },
+              ],
+            }),
+          ],
+        })
+      )
+      .addNode('tools', node)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const run = await Run.create<t.IState>({
+      runId: 'run-resume-update',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    const callerConfig = {
+      configurable: { thread_id: 'run-resume-update-thread' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, callerConfig);
+    expect(run.getInterrupt()).toBeDefined();
+
+    const injected = new HumanMessage({ content: 'human-injected-on-resume' });
+    await run.resume(
+      { [hexToolCallId]: { type: 'approve' } },
+      callerConfig,
+      undefined,
+      { update: { messages: [injected] } }
+    );
+
+    expect(run.getInterrupt()).toBeUndefined();
+
+    const state = await graph.getState(callerConfig);
+    const contents = (state.values.messages as BaseMessage[]).map(
+      (m) => m.content
+    );
+    /** Proves langgraph honored `update` on the INPUT resume Command. */
+    expect(contents).toContain('human-injected-on-resume');
+    /** Resume itself still completed: the approved tool produced its result. */
+    expect(contents).toContain('host-result');
   });
 
   it('Run.getHaltReason() reports prompt_denied when UserPromptSubmit denies the prompt', async () => {
@@ -1236,6 +1678,118 @@ describe('ToolNode HITL — PostToolBatch hook', () => {
     );
     expect(injected).toBeDefined();
     expect(String(injected!.content)).toContain('format the response as JSON');
+  });
+
+  it('PostToolBatch injectedMessages land as individual HumanMessages after the consolidated context', async () => {
+    mockEventDispatch([
+      { toolCallId: 'call_1', content: 'ok', status: 'success' },
+    ]);
+
+    const registry = new HookRegistry();
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (): Promise<PostToolBatchHookOutput> => ({
+          additionalContext: 'batch convention',
+          injectedMessages: [
+            { role: 'user', content: 'steer one', source: 'steer' },
+            { role: 'user', content: 'steer two', source: 'steer' },
+          ],
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'a' } },
+    ]);
+    const result = (await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'batch-steer-thread' } }
+    )) as { messages: BaseMessage[] };
+
+    type KwargMessage = {
+      additional_kwargs?: { source?: string; role?: string };
+    };
+    const humanMessages = result.messages.filter(
+      (m) => m._getType() === 'human'
+    );
+    const contextIndex = humanMessages.findIndex(
+      (m) => (m as KwargMessage).additional_kwargs?.source === 'hook'
+    );
+    const steerMessages = humanMessages.filter(
+      (m) => (m as KwargMessage).additional_kwargs?.source === 'steer'
+    );
+
+    expect(contextIndex).toBeGreaterThanOrEqual(0);
+    expect(steerMessages).toHaveLength(2);
+    expect(String(steerMessages[0].content)).toBe('steer one');
+    expect(String(steerMessages[1].content)).toBe('steer two');
+    for (const steer of steerMessages) {
+      expect((steer as KwargMessage).additional_kwargs?.role).toBe('user');
+      expect(humanMessages.indexOf(steer)).toBeGreaterThan(contextIndex);
+    }
+    const toolIndex = result.messages.findIndex((m) => m._getType() === 'tool');
+    const firstSteerIndex = result.messages.indexOf(steerMessages[0]);
+    expect(firstSteerIndex).toBeGreaterThan(toolIndex);
+  });
+
+  it('PostToolBatch injectedMessages work without additionalContext', async () => {
+    mockEventDispatch([
+      { toolCallId: 'call_1', content: 'ok', status: 'success' },
+    ]);
+
+    const registry = new HookRegistry();
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (): Promise<PostToolBatchHookOutput> => ({
+          injectedMessages: [
+            { role: 'user', content: 'solo steer', source: 'steer' },
+          ],
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'a' } },
+    ]);
+    const result = (await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'solo-steer-thread' } }
+    )) as { messages: BaseMessage[] };
+
+    type KwargMessage = {
+      additional_kwargs?: { source?: string; role?: string };
+    };
+    const consolidated = result.messages.find(
+      (m) =>
+        m._getType() === 'human' &&
+        (m as KwargMessage).additional_kwargs?.source === 'hook'
+    );
+    const steer = result.messages.find(
+      (m) =>
+        m._getType() === 'human' &&
+        (m as KwargMessage).additional_kwargs?.source === 'steer'
+    );
+    expect(consolidated).toBeUndefined();
+    expect(steer).toBeDefined();
+    expect(String(steer!.content)).toBe('solo steer');
   });
 });
 
@@ -3665,6 +4219,139 @@ describe('AskUserQuestion — interrupt + resume', () => {
     );
 
     expect(resumedAnswer).toBe('production');
+  });
+
+  it('carries multiSelect through the interrupt payload and resumes with the joined option values', async () => {
+    const { askUserQuestion } = await import('@/hitl');
+
+    let resumedAnswer: string | undefined;
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode('clarifier', () => {
+        const resolution = askUserQuestion({
+          question: 'Which environments?',
+          options: [
+            { label: 'Staging', value: 'staging' },
+            { label: 'Production', value: 'production' },
+          ],
+          multiSelect: true,
+        });
+        resumedAnswer = resolution.answer;
+        return { messages: [] };
+      })
+      .addEdge(START, 'clarifier')
+      .addEdge('clarifier', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const config = { configurable: { thread_id: 'ask-q-multi-thread' } };
+
+    const interrupted = (await graph.invoke({ messages: [] }, config)) as {
+      __interrupt__?: Array<{ id?: string; value?: t.HumanInterruptPayload }>;
+    };
+    const payload = interrupted.__interrupt__![0].value!;
+    if (payload.type !== 'ask_user_question') {
+      throw new Error('expected ask_user_question');
+    }
+    expect(payload.question.multiSelect).toBe(true);
+    expect(payload.question.options).toHaveLength(2);
+
+    // Host joins the selected option values with ", ".
+    const resolution: t.AskUserQuestionResolution = {
+      answer: 'staging, production',
+    };
+    await resumeGraph(
+      graph as unknown as CompiledMessagesGraph,
+      interrupted,
+      resolution,
+      config
+    );
+
+    expect(resumedAnswer).toBe('staging, production');
+  });
+
+  it('a DIRECT tool in event-driven mode can raise ask_user_question from its body and resume with the answer as its ToolMessage', async () => {
+    /**
+     * The production host shape (e.g. LibreChat's `AgentInputs.graphTools`
+     * plumb): the run is event-driven (other tools are schema-only
+     * definitions dispatched to the host), but an interrupt-capable tool is
+     * supplied as a real instance and marked direct so it executes inside
+     * the Pregel task frame. Event dispatch must never see the call — a
+     * host-side handler runs outside the graph, where `interrupt()` throws.
+     */
+    const { askUserQuestion } = await import('@/hitl');
+
+    const dispatchSpy = jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async () => {});
+
+    let bodyRuns = 0;
+    const askTool = tool(
+      async (input: { question: string }) => {
+        bodyRuns += 1;
+        const resolution = askUserQuestion(input);
+        return resolution.answer;
+      },
+      {
+        name: 'ask_user_question',
+        description: 'Ask the user a clarifying question.',
+        schema: z.object({ question: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo'), askTool],
+      toolMap: new Map([
+        ['echo', createSchemaStub('echo')],
+        ['ask_user_question', askTool],
+      ]),
+      eventDrivenMode: true,
+      agentId: 'agent-ask-direct',
+      toolCallStepIds: new Map([['call_ask_1', 'step_call_ask_1']]),
+      directToolNames: new Set(['ask_user_question']),
+    });
+
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_ask_1',
+        name: 'ask_user_question',
+        args: { question: 'Which environment?' },
+      },
+    ]);
+    const config = { configurable: { thread_id: 'thread-ask-direct' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted<t.HumanInterruptPayload>(interrupted)).toBe(true);
+    if (!isInterrupted<t.HumanInterruptPayload>(interrupted)) {
+      throw new Error('expected interrupt');
+    }
+    const payload = interrupted.__interrupt__[0].value!;
+    if (payload.type !== 'ask_user_question') {
+      throw new Error('expected ask_user_question payload');
+    }
+    expect(payload.question.question).toBe('Which environment?');
+    expect(bodyRuns).toBe(1);
+
+    /** The interrupt came from the direct path — never dispatched to the host. */
+    const toolExecuteDispatches = dispatchSpy.mock.calls.filter(
+      ([event]) => event === 'on_tool_execute'
+    );
+    expect(toolExecuteDispatches).toHaveLength(0);
+
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      { answer: 'staging' } satisfies t.AskUserQuestionResolution,
+      config
+    )) as MessagesUpdate;
+
+    expect(bodyRuns).toBe(2); // body re-runs from the top on the resume pass
+    const toolMessage = resumed.messages.find(
+      (m): m is ToolMessage =>
+        m._getType() === 'tool' &&
+        (m as ToolMessage).tool_call_id === 'call_ask_1'
+    );
+    expect(toolMessage).toBeDefined();
+    expect(String(toolMessage!.content)).toBe('staging');
   });
 
   it('isAskUserQuestionInterrupt narrows the payload union correctly', async () => {

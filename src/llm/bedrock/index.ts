@@ -26,12 +26,14 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import {
   ConverseStreamCommand,
+  type ConverseStreamOutput,
   type GuardrailConfiguration,
   type GuardrailStreamConfiguration,
 } from '@aws-sdk/client-bedrock-runtime';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
+import type { ContentBlockDeltaEvent } from './types';
 import {
   convertToConverseMessages,
   createConverseToolUseStopChunk,
@@ -39,6 +41,12 @@ import {
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
 } from './utils';
+import {
+  resolveBedrockPromptCacheTtl,
+  supportsBedrockToolCache,
+  type PromptCacheTtl,
+} from '@/messages/cache';
+import { applyCachePointsToConversePayload } from './cachePoints';
 import { insertBedrockToolCachePoint } from './toolCache';
 
 /**
@@ -51,6 +59,112 @@ export type ServiceTierType = 'priority' | 'default' | 'flex' | 'reserved';
 export type CustomGuardrailConfiguration = GuardrailConfiguration &
   Pick<GuardrailStreamConfiguration, 'streamProcessingMode'>;
 
+const MAX_STREAM_QUEUE_CHUNKS = 256;
+const MAX_STREAM_QUEUE_TEXT_CHARS = 8192;
+const STREAM_CHUNK_MIN_SIZE = 4;
+const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
+
+type QueuedGenerationChunk = {
+  chunk: ChatGenerationChunk;
+  callbackChunk?: ChatGenerationChunk;
+  callbackToken: string;
+  smooth: boolean;
+  textLength: number;
+};
+
+function findStreamChunkBoundary(text: string, minSize: number): number {
+  if (minSize >= text.length) {
+    return text.length;
+  }
+
+  for (let position = minSize; position < text.length; position++) {
+    if (STREAM_BOUNDARIES.has(text[position])) {
+      return position + 1;
+    }
+  }
+
+  return text.length;
+}
+
+function splitStreamToken(text: string): string[] {
+  const chunks: string[] = [];
+  let currentIndex = 0;
+
+  while (currentIndex < text.length) {
+    const remainingText = text.slice(currentIndex);
+    const chunkSize = findStreamChunkBoundary(
+      remainingText,
+      STREAM_CHUNK_MIN_SIZE
+    );
+    chunks.push(text.slice(currentIndex, currentIndex + chunkSize));
+    currentIndex += chunkSize;
+  }
+
+  return chunks;
+}
+
+/**
+ * Resolves the text a delta contributes to the smoothing cadence, preferring a
+ * text delta over a reasoning delta and ignoring non-string payloads.
+ */
+function resolveVisibleText(text?: string, reasoningText?: string): string {
+  if (typeof text === 'string') {
+    return text;
+  }
+
+  if (typeof reasoningText === 'string') {
+    return reasoningText;
+  }
+
+  return '';
+}
+
+function getCadencedStreamDelay({
+  targetDelay,
+  lastVisibleContentAt,
+  now,
+}: {
+  targetDelay: number;
+  lastVisibleContentAt?: number;
+  now: number;
+}): number {
+  if (targetDelay <= 0 || lastVisibleContentAt == null) {
+    return 0;
+  }
+  return Math.max(0, targetDelay - (now - lastVisibleContentAt));
+}
+
+async function waitForStreamDelay(
+  delay: number,
+  signal?: AbortSignal
+): Promise<void> {
+  if (delay <= 0 || isSignalAborted(signal)) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeoutRef: { current?: ReturnType<typeof setTimeout> } = {};
+    const onAbort = (): void => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    timeoutRef.current = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delay);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (isSignalAborted(signal)) {
+      onAbort();
+    }
+  });
+}
+
+function isSignalAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
+}
+
 /**
  * Extended input interface with additional features:
  * - applicationInferenceProfile: Use an inference profile ARN instead of model ID
@@ -62,6 +176,20 @@ export interface CustomChatBedrockConverseInput
    * Enables Bedrock prompt cache checkpoints for message and tool prefixes.
    */
   promptCache?: boolean;
+
+  /**
+   * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` for the legacy 5-minute behavior.
+   * Bedrock models that don't support the 1-hour TTL downgrade to 5m
+   * server-side (verified on Sonnet/Opus 4.6), so the default is safe to leave
+   * on; use `'5m'` for any model that rejects it.
+   */
+  promptCacheTtl?: PromptCacheTtl;
+
+  /**
+   * Minimum delay in milliseconds between visible streamed content deltas.
+   */
+  _lc_stream_delay?: number;
 
   /**
    * Guardrail configuration for Converse and ConverseStream invocations.
@@ -104,10 +232,17 @@ export interface CustomChatBedrockConverseCallOptions {
 }
 
 export class CustomChatBedrockConverse extends ChatBedrockConverse {
+  _lc_stream_delay: number;
+
   /**
    * Whether to insert Bedrock prompt cache checkpoints when available.
    */
   promptCache?: boolean;
+
+  /**
+   * Prompt-cache checkpoint TTL (`'5m'` legacy or `'1h'` extended cache).
+   */
+  promptCacheTtl?: PromptCacheTtl;
 
   /**
    * Application Inference Profile ARN to use instead of model ID.
@@ -119,11 +254,25 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
    */
   serviceTier?: ServiceTierType;
 
+  /**
+   * The configured model id, captured at construction so it survives the
+   * temporary `this.model` swap to an application-inference-profile ARN during
+   * generation. Used to gate the Bedrock tool cache point to Claude models
+   * (see {@link supportsBedrockToolCache}).
+   */
+  private readonly cacheModelId: string;
+
   constructor(fields?: CustomChatBedrockConverseInput) {
     super(fields);
     this.promptCache = fields?.promptCache;
+    this.promptCacheTtl = fields?.promptCacheTtl;
+    this._lc_stream_delay = Math.max(0, fields?._lc_stream_delay ?? 0);
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
+    // `super(fields)` initializes `this.model` to LangChain's default Claude
+    // model when `fields.model` is omitted, so fall back to it rather than ''
+    // (which would treat the default Claude model as tool-cache-unsupported).
+    this.cacheModelId = fields?.model ?? this.model;
   }
 
   static lc_name(): string {
@@ -148,8 +297,12 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   } {
     const baseParams = super.invocationParams(options);
     const toolConfig =
-      this.promptCache === true
-        ? insertBedrockToolCachePoint(baseParams.toolConfig, true)
+      this.promptCache === true && supportsBedrockToolCache(this.cacheModelId)
+        ? insertBedrockToolCachePoint(
+          baseParams.toolConfig,
+          true,
+          resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.cacheModelId)
+        )
         : baseParams.toolConfig;
 
     /** Service tier from options or fall back to class-level setting */
@@ -209,6 +362,14 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
     const modelId = this.getModelId();
 
+    applyCachePointsToConversePayload({
+      cacheControl: options.cache_control,
+      system: converseSystem,
+      messages: converseMessages,
+      params,
+      modelId,
+    });
+
     const command = new ConverseStreamCommand({
       modelId,
       messages: converseMessages,
@@ -216,102 +377,350 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
       ...(params as Record<string, unknown>),
     });
 
-    const response = await this.client.send(command, {
-      abortSignal: options.signal,
-    });
-
-    if (!response.stream) {
-      return;
+    const streamAbortController = new AbortController();
+    const abortStream = (): void => streamAbortController.abort();
+    options.signal?.addEventListener('abort', abortStream, { once: true });
+    if (isSignalAborted(options.signal)) {
+      abortStream();
     }
 
-    const seenBlockIndices = new Set<number>();
-    const toolUseBlockIndices = new Set<number>();
-    /**
-     * Guardrails can reject an already-streamed toolUse block at
-     * `messageStop` (`guardrail_intervened`), after `contentBlockStop` has
-     * passed. Only emit eager-execution seals when no guardrails are
-     * configured, so a later intervention can't race an eagerly started tool.
-     */
-    const sealToolUseOnStop =
-      options.guardrailConfig == null && this.guardrailConfig == null;
+    try {
+      const response = await this.client.send(command, {
+        abortSignal: streamAbortController.signal,
+      });
 
-    for await (const event of response.stream) {
-      if (event.contentBlockStart != null) {
-        const startChunk = handleConverseStreamContentBlockStart(
-          event.contentBlockStart
-        );
-        if (startChunk != null) {
-          const idx = event.contentBlockStart.contentBlockIndex;
-          if (idx != null) {
-            seenBlockIndices.add(idx);
-            if (event.contentBlockStart.start?.toolUse != null) {
-              toolUseBlockIndices.add(idx);
-            }
-          }
-          yield this.enrichChunk(startChunk, seenBlockIndices);
+      const stream: AsyncIterable<ConverseStreamOutput> | undefined =
+        response.stream;
+      if (!stream) {
+        return;
+      }
 
-          // Registered stream handlers receive chunks through callback
-          // events, not the yielded generator — dispatch the start chunk so
-          // they see the tool call's id/name (eager chunk state needs both).
-          await runManager?.handleLLMNewToken(
-            startChunk.text,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            { chunk: startChunk }
-          );
+      const seenBlockIndices = new Set<number>();
+      const toolUseBlockIndices = new Set<number>();
+      const queuedChunks: QueuedGenerationChunk[] = [];
+      const producerState: { done: boolean; error?: unknown } = { done: false };
+      let queuedChunkIndex = 0;
+      let bufferedTextLength = 0;
+      let consumerClosed = false;
+      let notifyConsumer: (() => void) | undefined;
+      let notifyProducer: (() => void) | undefined;
+      let hasEmittedVisibleContent = false;
+      let lastVisibleContentAt: number | undefined;
+
+      /**
+       * Guardrails can reject an already-streamed toolUse block at
+       * `messageStop` (`guardrail_intervened`), after `contentBlockStop` has
+       * passed. Only emit eager-execution seals when no guardrails are
+       * configured, so a later intervention can't race an eagerly started tool.
+       */
+      const sealToolUseOnStop =
+        options.guardrailConfig == null && this.guardrailConfig == null;
+
+      const notifyConsumerForChunk = (): void => {
+        notifyConsumer?.();
+        notifyConsumer = undefined;
+      };
+
+      const notifyProducerForSpace = (): void => {
+        notifyProducer?.();
+        notifyProducer = undefined;
+      };
+
+      const hasQueuedChunks = (): boolean =>
+        queuedChunkIndex < queuedChunks.length;
+
+      const getQueuedChunkCount = (): number =>
+        queuedChunks.length - queuedChunkIndex;
+
+      const isQueueAtCapacity = (): boolean =>
+        getQueuedChunkCount() >= MAX_STREAM_QUEUE_CHUNKS ||
+        bufferedTextLength >= MAX_STREAM_QUEUE_TEXT_CHARS;
+
+      const waitForNextChunk = async (): Promise<void> => {
+        if (
+          hasQueuedChunks() ||
+          producerState.done ||
+          producerState.error != null
+        ) {
+          return;
         }
-      } else if (event.contentBlockDelta != null) {
-        const deltaChunk = handleConverseStreamContentBlockDelta(
-          event.contentBlockDelta
-        );
+        await new Promise<void>((resolve) => {
+          notifyConsumer = resolve;
+        });
+      };
 
-        const idx = event.contentBlockDelta.contentBlockIndex;
+      const waitForQueueSpace = async (): Promise<void> => {
+        while (
+          isQueueAtCapacity() &&
+          !consumerClosed &&
+          !isSignalAborted(options.signal)
+        ) {
+          await new Promise<void>((resolve) => {
+            const signal = options.signal;
+            const onAbort = (): void => {
+              signal?.removeEventListener('abort', onAbort);
+              resolve();
+            };
+            const onSpace = (): void => {
+              signal?.removeEventListener('abort', onAbort);
+              resolve();
+            };
+            notifyProducer = onSpace;
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (isSignalAborted(signal)) {
+              onAbort();
+            }
+          });
+        }
+      };
+
+      const dequeue = (): QueuedGenerationChunk | undefined => {
+        if (!hasQueuedChunks()) {
+          return undefined;
+        }
+        const queuedChunk = queuedChunks[queuedChunkIndex];
+        queuedChunkIndex++;
+        if (
+          queuedChunkIndex > 128 &&
+          queuedChunkIndex * 2 >= queuedChunks.length
+        ) {
+          queuedChunks.splice(0, queuedChunkIndex);
+          queuedChunkIndex = 0;
+        }
+        return queuedChunk;
+      };
+
+      const enqueue = async (
+        queuedChunk: QueuedGenerationChunk
+      ): Promise<void> => {
+        await waitForQueueSpace();
+        if (consumerClosed || isSignalAborted(options.signal)) {
+          abortStream();
+          throw new Error('AbortError: User aborted the request.');
+        }
+        queuedChunks.push(queuedChunk);
+        if (queuedChunk.smooth) {
+          bufferedTextLength += queuedChunk.textLength;
+        }
+        notifyConsumerForChunk();
+      };
+
+      const enqueueChunk = async ({
+        chunk,
+        callbackChunk,
+        callbackToken = '',
+        smooth = false,
+        textLength = 0,
+      }: {
+        chunk: ChatGenerationChunk;
+        callbackChunk?: ChatGenerationChunk;
+        callbackToken?: string;
+        smooth?: boolean;
+        textLength?: number;
+      }): Promise<void> => {
+        await enqueue({
+          chunk,
+          callbackChunk,
+          callbackToken,
+          smooth,
+          textLength: smooth ? textLength : 0,
+        });
+      };
+
+      const enqueueDelta = async (
+        contentBlockDelta: ContentBlockDeltaEvent
+      ): Promise<void> => {
+        const delta = contentBlockDelta.delta;
+        if (delta == null) {
+          throw new Error('No delta found in content block.');
+        }
+
+        const idx = contentBlockDelta.contentBlockIndex;
         if (idx != null) {
           seenBlockIndices.add(idx);
         }
 
-        yield this.enrichChunk(deltaChunk, seenBlockIndices);
+        const text = delta.text;
+        const reasoningContent = delta.reasoningContent;
+        const reasoningText = reasoningContent?.text;
+        const visibleText = resolveVisibleText(text, reasoningText);
+        const smooth = this._lc_stream_delay > 0 && visibleText !== '';
+        const tokenChunks = smooth
+          ? splitStreamToken(visibleText)
+          : [visibleText];
 
-        await runManager?.handleLLMNewToken(
-          deltaChunk.text,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          { chunk: deltaChunk }
-        );
-      } else if (event.metadata != null) {
-        yield handleConverseStreamMetadata(event.metadata, { streamUsage });
-      } else if (event.contentBlockStop != null) {
-        const stopIdx = event.contentBlockStop.contentBlockIndex;
-        if (stopIdx != null) {
-          seenBlockIndices.add(stopIdx);
-          if (sealToolUseOnStop && toolUseBlockIndices.has(stopIdx)) {
-            // Converse guarantees the block's input is complete at stop, so
-            // emit an explicit seal chunk for eager tool execution — through
-            // the callback path too, for registered stream handlers.
-            const sealChunk = createConverseToolUseStopChunk(stopIdx);
-            yield sealChunk;
+        for (const token of tokenChunks) {
+          let splitDelta = contentBlockDelta;
+          if (typeof text === 'string') {
+            splitDelta = {
+              ...contentBlockDelta,
+              delta: { text: token },
+            };
+          } else if (
+            typeof reasoningText === 'string' &&
+            reasoningContent != null
+          ) {
+            splitDelta = {
+              ...contentBlockDelta,
+              delta: {
+                reasoningContent: {
+                  ...reasoningContent,
+                  text: token,
+                },
+              },
+            };
+          }
+
+          const deltaChunk = handleConverseStreamContentBlockDelta(splitDelta);
+          await enqueueChunk({
+            chunk: this.enrichChunk(deltaChunk, seenBlockIndices),
+            callbackChunk: deltaChunk,
+            callbackToken: deltaChunk.text,
+            smooth,
+            textLength: token.length,
+          });
+        }
+      };
+
+      const producer = (async (): Promise<void> => {
+        try {
+          for await (const event of stream) {
+            if (isSignalAborted(options.signal)) {
+              abortStream();
+              throw new Error('AbortError: User aborted the request.');
+            }
+
+            if (event.contentBlockStart != null) {
+              const startChunk = handleConverseStreamContentBlockStart(
+                event.contentBlockStart
+              );
+              if (startChunk != null) {
+                const idx = event.contentBlockStart.contentBlockIndex;
+                if (idx != null) {
+                  seenBlockIndices.add(idx);
+                  if (event.contentBlockStart.start?.toolUse != null) {
+                    toolUseBlockIndices.add(idx);
+                  }
+                }
+                await enqueueChunk({
+                  chunk: this.enrichChunk(startChunk, seenBlockIndices),
+                  callbackChunk: startChunk,
+                  callbackToken: startChunk.text,
+                });
+              }
+            } else if (event.contentBlockDelta != null) {
+              await enqueueDelta(event.contentBlockDelta);
+            } else if (event.metadata != null) {
+              await enqueueChunk({
+                chunk: handleConverseStreamMetadata(event.metadata, {
+                  streamUsage,
+                }),
+              });
+            } else if (event.contentBlockStop != null) {
+              const stopIdx = event.contentBlockStop.contentBlockIndex;
+              if (stopIdx != null) {
+                seenBlockIndices.add(stopIdx);
+                if (sealToolUseOnStop && toolUseBlockIndices.has(stopIdx)) {
+                  const sealChunk = createConverseToolUseStopChunk(stopIdx);
+                  await enqueueChunk({
+                    chunk: sealChunk,
+                    callbackChunk: sealChunk,
+                    callbackToken: sealChunk.text,
+                  });
+                }
+              }
+            } else {
+              await enqueueChunk({
+                chunk: new ChatGenerationChunk({
+                  text: '',
+                  message: new AIMessageChunk({
+                    content: '',
+                    response_metadata: { ...event } as ResponseMetadata,
+                  }),
+                }),
+              });
+            }
+          }
+        } catch (error) {
+          producerState.error = error;
+        } finally {
+          producerState.done = true;
+          notifyConsumerForChunk();
+        }
+      })();
+
+      try {
+        let keepStreaming = true;
+        while (keepStreaming) {
+          if (isSignalAborted(options.signal)) {
+            abortStream();
+            throw new Error('AbortError: User aborted the request.');
+          }
+
+          await waitForNextChunk();
+          const queuedChunk = dequeue();
+
+          if (!queuedChunk) {
+            if (producerState.error != null) {
+              throw producerState.error;
+            }
+            if (producerState.done) {
+              keepStreaming = false;
+            }
+            continue;
+          }
+
+          if (queuedChunk.smooth) {
+            bufferedTextLength = Math.max(
+              0,
+              bufferedTextLength - queuedChunk.textLength
+            );
+            notifyProducerForSpace();
+            await waitForStreamDelay(
+              getCadencedStreamDelay({
+                targetDelay: hasEmittedVisibleContent
+                  ? this._lc_stream_delay
+                  : 0,
+                lastVisibleContentAt,
+                now: Date.now(),
+              }),
+              options.signal
+            );
+            if (isSignalAborted(options.signal)) {
+              abortStream();
+              throw new Error('AbortError: User aborted the request.');
+            }
+            hasEmittedVisibleContent = true;
+            lastVisibleContentAt = Date.now();
+          } else {
+            notifyProducerForSpace();
+          }
+
+          yield queuedChunk.chunk;
+
+          if (queuedChunk.callbackChunk != null) {
             await runManager?.handleLLMNewToken(
-              sealChunk.text,
+              queuedChunk.callbackToken,
               undefined,
               undefined,
               undefined,
               undefined,
-              { chunk: sealChunk }
+              { chunk: queuedChunk.callbackChunk }
             );
           }
         }
-      } else {
-        yield new ChatGenerationChunk({
-          text: '',
-          message: new AIMessageChunk({
-            content: '',
-            response_metadata: { ...event } as ResponseMetadata,
-          }),
-        });
+      } finally {
+        consumerClosed = true;
+        if (!producerState.done) {
+          abortStream();
+          notifyProducerForSpace();
+        }
+        await producer;
+      }
+    } finally {
+      options.signal?.removeEventListener('abort', abortStream);
+      if (!streamAbortController.signal.aborted) {
+        streamAbortController.abort();
       }
     }
   }

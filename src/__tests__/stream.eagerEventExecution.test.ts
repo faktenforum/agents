@@ -21,6 +21,13 @@ import {
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
+import { HookRegistry } from '@/hooks';
+
+function createResultAlteringRegistry(): HookRegistry {
+  const registry = new HookRegistry();
+  registry.register('PreToolUse', { hooks: [async () => ({})] });
+  return registry;
+}
 
 function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
   const runSteps = new Map<string, t.RunStep>();
@@ -3221,9 +3228,50 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
+  it('does not prestart when parent-run session hooks alter results', async () => {
+    // A subagent child graph has its own runId, but ToolNode executes hooks
+    // under the PARENT run id from `configurable.run_id` ONLY — the prestart
+    // gate must read the same source (a differing metadata run id here is a
+    // deliberate distractor pinning the precedence).
+    const sessionRegistry = new HookRegistry();
+    sessionRegistry.registerSession('parent-run', 'PreToolUse', {
+      hooks: [async () => ({ decision: 'allow' as const })],
+    });
+    const graph = createGraph({
+      runId: 'child-run',
+      hookRegistry: sessionRegistry,
+      config: {
+        configurable: { user_id: 'user_1', run_id: 'parent-run' },
+        metadata: { run_id: 'run_1' },
+      },
+    } as Partial<StandardGraph>);
+    const sessionDispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            { id: 'call_weather', name: 'weather', args: { city: 'NYC' } },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent', run_id: 'some-other-run' },
+      graph
+    );
+
+    expect(sessionDispatchSpy).not.toHaveBeenCalledWith(
+      GraphEvents.ON_TOOL_EXECUTE,
+      expect.anything(),
+      expect.anything()
+    );
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
   it('does not prestart when batch-sensitive hooks are configured', async () => {
     const graph = createGraph({
-      hookRegistry: {} as StandardGraph['hookRegistry'],
+      hookRegistry: createResultAlteringRegistry(),
     });
     const dispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
 
@@ -3251,6 +3299,56 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       expect.anything()
     );
     expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
+  it('prestarts when the registry only has observation hooks (PostToolBatch)', async () => {
+    const observationRegistry = new HookRegistry();
+    observationRegistry.register('PostToolBatch', {
+      hooks: [async () => ({})],
+    });
+    const graph = createGraph({ hookRegistry: observationRegistry });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(graph.eagerEventToolExecutions.get('call_weather')).toMatchObject({
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+    });
   });
 
   it('does not buffer streamed chunks when eager execution is disabled', async () => {
@@ -4418,7 +4516,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
 
   it('does not prestart on-arrival sealed calls when batch-sensitive hooks are configured', async () => {
     const graph = createGraph({
-      hookRegistry: {} as StandardGraph['hookRegistry'],
+      hookRegistry: createResultAlteringRegistry(),
     });
     const dispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
 
@@ -4725,5 +4823,149 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
 
     expect(toolExecuteCalls).toHaveLength(0);
     expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
+  it('does not prestart tools listed in excludeToolNames', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: {
+        enabled: true,
+        excludeToolNames: ['create_file'],
+      },
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          { toolCallId: 'call_file', status: 'success', content: 'ok' },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_file',
+              name: 'create_file',
+              args: { path: '/mnt/data/x.py', content: 'print(1)' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    // Excluded: no eager execution started; the call falls through to ToolNode.
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_file')).toBe(false);
+  });
+
+  it('does not prestart codeSessionToolNames tools even without excludeToolNames', async () => {
+    // A declared session-writing host tool is side-effecting, so it must not be
+    // eagerly prestarted even when the host didn't also list it in excludeToolNames.
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: true },
+      codeSessionToolNames: ['create_file', 'edit_file'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          { toolCallId: 'call_cf2', status: 'success', content: 'ok' },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_cf2',
+              name: 'create_file',
+              args: { path: '/mnt/data/y.py', content: 'print(2)' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_cf2')).toBe(false);
+  });
+
+  it('keeps the direct-tool batch guard when an excluded tool is also direct', async () => {
+    // edit_file is both a direct graph tool AND excluded from eager. A mixed
+    // batch with a direct tool must suppress eager for the whole batch, so the
+    // sibling event tool must NOT prestart — excluding edit_file must not hide
+    // it from the batch-level direct-tool guard.
+    const graph = createGraph({
+      eagerEventToolExecution: {
+        enabled: true,
+        excludeToolNames: ['edit_file'],
+      },
+      getAgentContext: jest.fn(() => ({
+        provider: Providers.ANTHROPIC,
+        reasoningKey: 'reasoning',
+        toolDefinitions: [{ name: 'weather' }, { name: 'edit_file' }],
+        graphTools: [{ name: 'edit_file' }],
+        agentId: 'agent_1',
+      })) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        toolExecuteCalls.push(data as t.ToolExecuteBatchRequest);
+        (data as t.ToolExecuteBatchRequest).resolve([]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            { id: 'call_weather', name: 'weather', args: { city: 'NYC' } },
+            {
+              id: 'call_edit',
+              name: 'edit_file',
+              args: { path: '/mnt/data/x.py' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    // Direct tool in batch suppresses eager for the whole batch.
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(false);
+    expect(graph.eagerEventToolExecutions.has('call_edit')).toBe(false);
   });
 });

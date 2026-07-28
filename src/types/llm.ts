@@ -22,6 +22,7 @@ import type { Runnable } from '@langchain/core/runnables';
 import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
+import type { PromptCacheTtl } from '@/messages/cache';
 import {
   AzureChatOpenAI,
   ChatDeepSeek,
@@ -44,7 +45,7 @@ export type AzureClientOptions = Partial<OpenAIChatInput> &
     deploymentName?: string;
   } & BaseChatModelParams & {
     configuration?: OAIClientOptions;
-  };
+  } & ManagedRequestOptions;
 /**
  * Controls whether Claude's reasoning content is returned in adaptive
  * thinking responses. Added for Claude Opus 4.7, which omits thinking by
@@ -72,10 +73,22 @@ export type GoogleThinkingConfig = {
   includeThoughts?: boolean;
   thinkingLevel?: 'THINKING_LEVEL_UNSPECIFIED' | 'LOW' | 'MEDIUM' | 'HIGH';
 };
-export type OpenAIClientOptions = ChatOpenAIFields;
+/** GPT-5.6 managed-request passthrough fields, shared by the OpenAI and
+ *  Azure wrappers that both read them. */
+export type ManagedRequestOptions = {
+  promptCacheExplicit?: boolean;
+  safety_identifier?: string;
+};
+export type OpenAIClientOptions = ChatOpenAIFields & ManagedRequestOptions;
 export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
   thinking?: ThinkingConfig;
   promptCache?: boolean;
+  /**
+   * Prompt-cache breakpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` to opt back into the legacy
+   * 5-minute behavior.
+   */
+  promptCacheTtl?: PromptCacheTtl;
 };
 export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
@@ -86,6 +99,17 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
   additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
     AnthropicReasoning;
   promptCache?: boolean;
+  /**
+   * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` to opt into the legacy 5-minute
+   * behavior. Bedrock models that don't support the 1-hour TTL downgrade to 5m
+   * server-side, so the default is safe to leave on.
+   */
+  promptCacheTtl?: PromptCacheTtl;
+  /**
+   * Minimum delay in milliseconds between visible streamed content deltas.
+   */
+  _lc_stream_delay?: number;
 };
 export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
@@ -113,10 +137,17 @@ export type SharedLLMConfig = {
   _lc_stream_delay?: number;
 };
 
+export interface FallbackConfig {
+  provider: Providers;
+  clientOptions?: ClientOptions;
+  /** Context window used to corroborate ambiguous fallback overflow errors. */
+  maxContextTokens?: number;
+}
+
 export type LLMConfig = SharedLLMConfig &
   ClientOptions & {
     /** Optional provider fallbacks in order of attempt */
-    fallbacks?: Array<{ provider: Providers; clientOptions?: ClientOptions }>;
+    fallbacks?: FallbackConfig[];
   };
 
 export type ProviderOptionsMap = {

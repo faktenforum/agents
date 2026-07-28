@@ -2,8 +2,10 @@ import { describe, it, expect } from '@jest/globals';
 import {
   BashExecutionToolDescription,
   BashToolOutputReferencesGuide,
+  StatefulBashExecutionToolDescription,
   buildBashExecutionToolDescription,
 } from '../BashExecutor';
+import { CODE_ARTIFACT_PATH_GUIDANCE } from '../CodeExecutor';
 
 describe('buildBashExecutionToolDescription', () => {
   it('returns the base description by default', () => {
@@ -54,5 +56,53 @@ describe('buildBashExecutionToolDescription', () => {
       enableToolOutputReferences: true,
     });
     expect(composed.includes(`${BashExecutionToolDescription}\n\n`)).toBe(true);
+  });
+
+  describe('stateful variant', () => {
+    it('selects the stateful description when statefulSessions is on', () => {
+      expect(
+        buildBashExecutionToolDescription({ statefulSessions: true })
+      ).toBe(StatefulBashExecutionToolDescription);
+    });
+
+    /* Filesystem-tier only: each call runs in a fresh sandbox (new process
+     * tree + private /tmp), so background processes are reaped and non-
+     * /mnt/data writes are discarded. The description must not promise
+     * otherwise. */
+    it('promises /mnt/data persistence WITHOUT promising surviving processes or /tmp', () => {
+      const d = StatefulBashExecutionToolDescription;
+      expect(d).toContain('same warm machine');
+      expect(d).toContain('Only /mnt/data is durable');
+      expect(d).toContain('background processes do NOT survive');
+      expect(d).toContain('/tmp');
+    });
+
+    it('never claims /tmp or background processes persist between calls', () => {
+      const d = StatefulBashExecutionToolDescription;
+      expect(d).not.toContain('files (including /tmp)');
+      expect(d).not.toContain(
+        'background processes from earlier calls typically persist'
+      );
+    });
+
+    it('keeps the artifact-path guidance in both variants', () => {
+      expect(BashExecutionToolDescription).toContain(
+        CODE_ARTIFACT_PATH_GUIDANCE
+      );
+      expect(StatefulBashExecutionToolDescription).toContain(
+        CODE_ARTIFACT_PATH_GUIDANCE
+      );
+    });
+
+    it('still composes with the output-references guide', () => {
+      const composed = buildBashExecutionToolDescription({
+        statefulSessions: true,
+        enableToolOutputReferences: true,
+      });
+      expect(composed.startsWith(StatefulBashExecutionToolDescription)).toBe(
+        true
+      );
+      expect(composed).toContain(BashToolOutputReferencesGuide);
+    });
   });
 });

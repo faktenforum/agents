@@ -10,10 +10,13 @@ import {
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendCodeSessionFileSummary,
   appendFailedExecutionFileReminder,
+  buildCodeApiExecutionErrorMessage,
   buildCodeApiHttpErrorMessage,
+  CodeApiRequestError,
   emptyOutputMessage,
   getCodeBaseURL,
   appendTmpScratchReminder,
+  normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
 import {
@@ -479,30 +482,34 @@ export async function makeRequest(
   proxy?: string,
   authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.ProgrammaticExecutionResponse> {
-  const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
-  const fetchOptions: RequestInit = {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'LibreChat/1.0',
-      ...resolvedAuthHeaders,
-    },
-    body: JSON.stringify(body),
-  };
+  try {
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
+    const fetchOptions: RequestInit = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'LibreChat/1.0',
+        ...resolvedAuthHeaders,
+      },
+      body: JSON.stringify(body),
+    };
 
-  if (proxy != null && proxy !== '') {
-    fetchOptions.agent = new HttpsProxyAgent(proxy);
+    if (proxy != null && proxy !== '') {
+      fetchOptions.agent = new HttpsProxyAgent(proxy);
+    }
+
+    const response = await fetch(endpoint, fetchOptions);
+
+    if (!response.ok) {
+      throw new CodeApiRequestError(
+        await buildCodeApiHttpErrorMessage('POST', endpoint, response)
+      );
+    }
+
+    return (await response.json()) as t.ProgrammaticExecutionResponse;
+  } catch (error) {
+    throw normalizeCodeApiRequestError(error);
   }
-
-  const response = await fetch(endpoint, fetchOptions);
-
-  if (!response.ok) {
-    throw new Error(
-      await buildCodeApiHttpErrorMessage('POST', endpoint, response)
-    );
-  }
-
-  return (await response.json()) as t.ProgrammaticExecutionResponse;
 }
 
 /**
@@ -835,6 +842,12 @@ export function formatCompletedResponse(
     {
       session_id: response.session_id,
       files: response.files,
+      ...(response.runtime_session_id != null
+        ? {
+          runtime_session_id: response.runtime_session_id,
+          runtime_status: response.runtime_status,
+        }
+        : {}),
     } satisfies t.ProgrammaticExecutionArtifact,
   ];
 }
@@ -883,8 +896,15 @@ export function createProgrammaticToolCallingTool(
         Partial<t.ProgrammaticCache> & {
           session_id?: string;
           _injected_files?: t.CodeEnvFile[];
+          _runtime_session_hint?: string;
         };
-      const { toolMap, toolDefs, session_id, _injected_files } = toolCall;
+      const {
+        toolMap,
+        toolDefs,
+        session_id,
+        _injected_files,
+        _runtime_session_hint,
+      } = toolCall;
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -933,6 +953,16 @@ export function createProgrammaticToolCallingTool(
           );
         }
 
+        /* Stateful sessions: hint rides the INITIAL request only; the server
+         * binds continuation round-trips to the same runtime via the
+         * continuation_token. Additive — ignored by stateless servers. PTC
+         * keeps its stateless prompt in v1; only the wire hint plumbs here. */
+        const runtimeSessionHint =
+          typeof _runtime_session_hint === 'string' &&
+          _runtime_session_hint !== ''
+            ? _runtime_session_hint
+            : undefined;
+
         let response = await makeRequest(
           EXEC_ENDPOINT,
           {
@@ -941,6 +971,9 @@ export function createProgrammaticToolCallingTool(
             session_id,
             timeout,
             ...(files && files.length > 0 ? { files } : {}),
+            ...(runtimeSessionHint != null
+              ? { runtime_session_hint: runtimeSessionHint }
+              : {}),
           },
           proxy,
           initParams.authHeaders
@@ -993,15 +1026,10 @@ export function createProgrammaticToolCallingTool(
         }
 
         if (response.status === 'error') {
-          throw new Error(
-            `Execution error: ${response.error}` +
-              (response.stderr != null && response.stderr !== ''
-                ? `\n\nStderr:\n${response.stderr}`
-                : '')
-          );
+          throw new Error(buildCodeApiExecutionErrorMessage(response));
         }
 
-        throw new Error(`Unexpected response status: ${response.status}`);
+        throw new CodeApiRequestError();
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,

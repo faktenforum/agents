@@ -5,6 +5,10 @@ import type { WriteFileOptions, MakeDirectoryOptions, Stats } from 'fs';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { FileHandle } from 'fs/promises';
 import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
+import {
+  WorkspaceClientTimeoutError,
+  isWorkspaceClientTimeoutError,
+} from '@/tools/local/workspaceFS';
 import type * as t from '@/types';
 import {
   LOCAL_SPAWN_TIMEOUT_MS,
@@ -129,6 +133,147 @@ function outerTimeoutMs(timeoutMs: number): number {
 
 function isInSandboxTimeoutExit(exitCode: number | null): boolean {
   return exitCode === 124 || exitCode === 137;
+}
+
+/**
+ * Client-side backstop timeout for a `sandbox.exec()` await: a few seconds beyond
+ * the exec's own `timeout` option, so a stalled exec that never honors `timeout`
+ * still can't outlast this.
+ */
+export function clientExecTimeoutMs(timeoutMs: number): number {
+  return outerTimeoutMs(timeoutMs) + 5000;
+}
+
+/**
+ * Client-side backstop timeout for a native-DO sandbox FILE-IO RPC
+ * (`readFile`/`writeFile`/`listFiles`/`mkdir`/`deleteFile`). Unlike `exec()`
+ * there is no in-sandbox `timeout(1)` layer for these to honor, so this is just a
+ * few seconds of headroom over the configured tool timeout — enough that a normal
+ * (even large, byte-capped) read completes, while a stalled/cold container can't
+ * outlast it. See `withClientTimeout` for why the native DO RPC needs this.
+ */
+export function clientFsTimeoutMs(timeoutMs: number): number {
+  return timeoutMs + 5000;
+}
+
+/**
+ * Bound a `sandbox.exec()` await with a CLIENT-SIDE timeout.
+ *
+ * The native Cloudflare Sandbox Durable Object `exec()` is effectively
+ * uncancellable from the host: `ExecOptions` has no `signal` (so
+ * `supportsExecSignal` is false for the native transport), and its `timeout`
+ * option is not reliably enforced when the container/RPC itself stalls — while
+ * the in-sandbox `timeout(1)` wrapper only bounds a command that is actually
+ * running. So a stalled exec (an unresponsive/cold container) otherwise hangs
+ * until the host's run-level abort, burning the whole run budget on one tool
+ * call. This race guarantees the host await settles within `timeoutMs`
+ * regardless of the transport.
+ *
+ * On timeout the underlying `exec` promise may keep running in the DO (a
+ * native-DO exec cannot be truly cancelled), so its late settlement is swallowed
+ * to avoid an unhandled rejection.
+ */
+export async function withClientTimeout<T>(
+  exec: Promise<T>,
+  timeoutMs: number,
+  label: string,
+  options: {
+    /**
+     * Detach the backstop timer from the event loop. Use ONLY when something else
+     * already settles the caller (e.g. the spawn path, where spawnLocalProcess's
+     * own timer resolves the child). The awaited direct-exec paths must leave it
+     * REF'd so the timeout is guaranteed to fire even if nothing else is pending.
+     */
+    unref?: boolean;
+    /** Invoked when the client timeout fires — e.g. abort a signal-aware exec. */
+    onTimeout?: () => void;
+  } = {}
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return exec;
+  }
+  // Swallow a late rejection from the losing promise after the race settles.
+  exec.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      exec,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          // Reject FIRST so this client-timeout message reliably wins the race;
+          // only then abort a signal-aware exec, whose resulting AbortError must
+          // not surface to the caller instead of the timeout.
+          reject(
+            new WorkspaceClientTimeoutError(
+              `${label} exceeded ${timeoutMs}ms client-side timeout (sandbox RPC did not return)`
+            )
+          );
+          options.onTimeout?.();
+        }, timeoutMs);
+        if (options.unref === true) {
+          (timer as { unref?: () => void } | undefined)?.unref?.();
+        }
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Run `sandbox.exec()` bounded by a client-side timeout, and — for signal-aware
+ * transports (e.g. the HTTP bridge, `supportsExecSignal === true`) — abort the
+ * underlying exec when the timeout fires instead of merely abandoning it. The
+ * native DO transport ignores `signal`, so it only gets the timeout. Leaves the
+ * backstop timer ref'd (this is an awaited direct-exec path).
+ */
+export async function execWithClientTimeout(
+  sandbox: t.CloudflareSandboxRuntime,
+  command: string,
+  options: t.CloudflareSandboxExecOptions,
+  timeoutMs: number,
+  label: string,
+  runOptions: { unref?: boolean } = {}
+): Promise<t.CloudflareSandboxExecResult> {
+  const controller = new AbortController();
+  const execOptions: t.CloudflareSandboxExecOptions = { ...options };
+  const callerSignal = options.signal;
+  let onCallerAbort: (() => void) | undefined;
+  if (sandbox.supportsExecSignal === true) {
+    // Compose the caller's signal (e.g. run/user cancellation) with our timeout
+    // controller so EITHER source cancels the exec — don't clobber the caller's.
+    if (callerSignal != null) {
+      if (callerSignal.aborted) {
+        controller.abort();
+      } else {
+        onCallerAbort = (): void => controller.abort();
+        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+      }
+    }
+    execOptions.signal = controller.signal;
+  } else if ('signal' in execOptions) {
+    // Native DO RPC cannot consume an AbortSignal (and would fail to clone it).
+    // Strip any caller-provided one so the spread above can't reintroduce it.
+    delete execOptions.signal;
+  }
+  try {
+    return await withClientTimeout(
+      sandbox.exec(command, execOptions),
+      timeoutMs,
+      label,
+      {
+        unref: runOptions.unref,
+        onTimeout: () => controller.abort(),
+      }
+    );
+  } finally {
+    // Don't leave a listener attached to a long-lived/shared caller signal.
+    if (onCallerAbort != null && callerSignal != null) {
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    }
+  }
 }
 
 function truncateOutput(value: string, maxChars: number): string {
@@ -283,12 +428,17 @@ function createDirent(info: t.CloudflareSandboxFileInfo): ReaddirEntry {
 
 async function findChildInfo(
   sandbox: t.CloudflareSandboxRuntime,
-  filePath: string
+  filePath: string,
+  timeoutMs: number
 ): Promise<t.CloudflareSandboxFileInfo | undefined> {
   const parent = path.dirname(filePath);
   const basename = path.basename(filePath);
   const entries = normalizeFileList(
-    await sandbox.listFiles(parent, { includeHidden: true })
+    await withClientTimeout(
+      sandbox.listFiles(parent, { includeHidden: true }),
+      timeoutMs,
+      'cloudflare sandbox listFiles'
+    )
   );
   return entries.find((entry) => {
     const absolute = entryAbsolutePath(entry, parent);
@@ -300,13 +450,29 @@ export function createCloudflareWorkspaceFS(
   config: t.CloudflareSandboxExecutionConfig
 ): WorkspaceFS {
   const workspaceRoot = getCloudflareWorkspaceRoot(config);
+  // Native-DO file-IO RPCs have the SAME stall hazard as exec() (PR #252): no
+  // `signal`, no reliably-enforced timeout, so a cold/unresponsive container
+  // hangs the host await until the run-level abort — burning the whole budget on
+  // one read (observed: a `read_file` that stalled ~552s before the wall-clock
+  // budget killed it). Bound every native FS RPC with the same client-side
+  // backstop the exec sites use.
+  const fsTimeoutMs = clientFsTimeoutMs(config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const bound = <T>(op: Promise<T>, label: string): Promise<T> =>
+    withClientTimeout(op, fsTimeoutMs, `cloudflare sandbox ${label}`);
 
   const fs: WorkspaceFS = {
     readFile: (async (filePath: string, encoding?: 'utf8') => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
-      const buffer = await normalizeReadFileContent(
-        await sandbox.readFile(resolved, encoding ? { encoding } : undefined)
+      // Wrap the stream drain (normalizeReadFileContent) inside the backstop too:
+      // a sandbox.readFile that resolves to a { content: ReadableStream } can
+      // still stall mid-drain after the RPC promise settled.
+      const buffer = await bound(
+        (async (): Promise<Buffer> =>
+          normalizeReadFileContent(
+            await sandbox.readFile(resolved, encoding ? { encoding } : undefined)
+          ))(),
+        'readFile'
       );
       return encoding != null ? buffer.toString(encoding) : buffer;
     }) as WorkspaceFS['readFile'],
@@ -318,29 +484,46 @@ export function createCloudflareWorkspaceFS(
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       const normalized = normalizeWriteFileContent(content);
-      await sandbox.writeFile(resolved, normalized.content, normalized.options);
+      await bound(
+        sandbox.writeFile(resolved, normalized.content, normalized.options),
+        'writeFile'
+      );
     },
     stat: async (filePath: string) => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       if (resolved === workspaceRoot) {
         const entries = normalizeFileList(
-          await sandbox.listFiles(resolved, { includeHidden: true })
+          await bound(
+            sandbox.listFiles(resolved, { includeHidden: true }),
+            'listFiles'
+          )
         );
         return createStats({ size: entries.length, type: 'directory' });
       }
-      const info = await findChildInfo(sandbox, resolved);
+      const info = await findChildInfo(sandbox, resolved, fsTimeoutMs);
       if (info != null) {
         return createStats({ size: info.size, type: info.type });
       }
       try {
         const entries = normalizeFileList(
-          await sandbox.listFiles(resolved, { includeHidden: true })
+          await bound(
+            sandbox.listFiles(resolved, { includeHidden: true }),
+            'listFiles'
+          )
         );
         return createStats({ size: entries.length, type: 'directory' });
-      } catch {
-        const buffer = await normalizeReadFileContent(
-          await sandbox.readFile(resolved)
+      } catch (error) {
+        // A directory-probe timeout is a stalled container, not "not a directory".
+        // Don't fall through to the readFile branch — that would wait through a
+        // SECOND full backstop (~2x the timeout) before surfacing.
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
+        const buffer = await bound(
+          (async (): Promise<Buffer> =>
+            normalizeReadFileContent(await sandbox.readFile(resolved)))(),
+          'readFile'
         );
         return createStats({ size: buffer.length, type: 'file' });
       }
@@ -349,7 +532,10 @@ export function createCloudflareWorkspaceFS(
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       const entries = normalizeFileList(
-        await sandbox.listFiles(resolved, { includeHidden: true })
+        await bound(
+          sandbox.listFiles(resolved, { includeHidden: true }),
+          'listFiles'
+        )
       );
       if (options?.withFileTypes === true) {
         return entries.map(createDirent);
@@ -358,21 +544,29 @@ export function createCloudflareWorkspaceFS(
     }) as WorkspaceFS['readdir'],
     mkdir: async (filePath: string, options?: MakeDirectoryOptions) => {
       const sandbox = await resolveCloudflareSandbox(config);
-      await sandbox.mkdir(toSandboxPath(filePath, workspaceRoot), {
-        recursive: options?.recursive,
-      });
+      await bound(
+        sandbox.mkdir(toSandboxPath(filePath, workspaceRoot), {
+          recursive: options?.recursive,
+        }),
+        'mkdir'
+      );
     },
     realpath: async (filePath: string) =>
       toSandboxPath(filePath, workspaceRoot),
     unlink: async (filePath: string) => {
       const sandbox = await resolveCloudflareSandbox(config);
-      await sandbox.deleteFile(toSandboxPath(filePath, workspaceRoot));
+      await bound(
+        sandbox.deleteFile(toSandboxPath(filePath, workspaceRoot)),
+        'deleteFile'
+      );
     },
     open: async (filePath: string, _flags: 'r') => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
-      const buffer = await normalizeReadFileContent(
-        await sandbox.readFile(resolved)
+      const buffer = await bound(
+        (async (): Promise<Buffer> =>
+          normalizeReadFileContent(await sandbox.readFile(resolved)))(),
+        'readFile'
       );
       return {
         read: async (
@@ -466,7 +660,14 @@ function createCloudflareSpawn(
         execOptions.signal = abortController.signal;
       }
       try {
-        const result = await ctx.sandbox.exec(timedCommand, execOptions);
+        const result = await withClientTimeout(
+          ctx.sandbox.exec(timedCommand, execOptions),
+          clientExecTimeoutMs(timeoutMs),
+          'cloudflare sandbox exec',
+          // spawnLocalProcess's own timer already resolves the child, so this
+          // backstop may safely detach; abort the (signal-aware) exec on timeout.
+          { unref: true, onTimeout: () => abortController.abort() }
+        );
         if (isClosed()) {
           return;
         }
@@ -551,13 +752,16 @@ export async function executeCloudflareBash(
     args.length > 0
       ? `${ctx.shell} -lc ${quote(command)} -- ${args.map(quote).join(' ')}`
       : `${ctx.shell} -lc ${quote(command)}`;
-  const result = await ctx.sandbox.exec(
+  const result = await execWithClientTimeout(
+    ctx.sandbox,
     withInSandboxTimeout(shellCommand, ctx.timeoutMs),
     {
       cwd: ctx.workspaceRoot,
       env: ctx.env,
       timeout: outerTimeoutMs(ctx.timeoutMs),
-    }
+    },
+    clientExecTimeoutMs(ctx.timeoutMs),
+    'cloudflare sandbox bash exec'
   );
   return {
     stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
@@ -693,25 +897,41 @@ export async function executeCloudflareCode(
     input.args,
     ctx.shell
   );
-  await ctx.sandbox.mkdir(tempDir, { recursive: true });
-  if (runtime.source != null) {
-    await ctx.sandbox.writeFile(
-      path.join(tempDir, runtime.fileName),
-      runtime.source,
-      {
-        encoding: 'utf8',
-      }
-    );
-  }
+  let execSucceeded = false;
   try {
-    const result = await ctx.sandbox.exec(
+    // Bound the temp-dir setup RPCs (they run BEFORE the bounded exec): a
+    // native-DO stall here would hang the host on a single mkdir/writeFile and
+    // burn the run budget. Keep them INSIDE the try so the finally cleanup still
+    // removes .lc-exec/<uuid> if setup throws — the uncancellable write can land
+    // late on a cold container, so an orphaned dir would otherwise accumulate.
+    await withClientTimeout(
+      ctx.sandbox.mkdir(tempDir, { recursive: true }),
+      clientFsTimeoutMs(ctx.timeoutMs),
+      'cloudflare sandbox mkdir'
+    );
+    if (runtime.source != null) {
+      await withClientTimeout(
+        ctx.sandbox.writeFile(
+          path.join(tempDir, runtime.fileName),
+          runtime.source,
+          { encoding: 'utf8' }
+        ),
+        clientFsTimeoutMs(ctx.timeoutMs),
+        'cloudflare sandbox writeFile'
+      );
+    }
+    const result = await execWithClientTimeout(
+      ctx.sandbox,
       withInSandboxTimeout(runtime.command, ctx.timeoutMs),
       {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: outerTimeoutMs(ctx.timeoutMs),
-      }
+      },
+      clientExecTimeoutMs(ctx.timeoutMs),
+      'cloudflare sandbox code-exec'
     );
+    execSucceeded = true;
     return {
       stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
       stderr: truncateOutput(result.stderr, ctx.maxOutputChars),
@@ -719,13 +939,25 @@ export async function executeCloudflareCode(
       timedOut: isInSandboxTimeoutExit(result.exitCode),
     };
   } finally {
-    await ctx.sandbox
-      .exec(`rm -rf ${quote(tempDir)}`, {
+    // After a normal run, AWAIT cleanup so the temp dir is gone before returning.
+    // After a stalled/failed run, detach it (unref'd) so we don't pile a second
+    // client timeout onto the caller's latency; cleanup still runs best-effort.
+    const detach = !execSucceeded;
+    const cleanup = execWithClientTimeout(
+      ctx.sandbox,
+      `rm -rf ${quote(tempDir)}`,
+      {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: 10000,
-      })
-      .catch(() => undefined);
+      },
+      clientExecTimeoutMs(10000),
+      'cloudflare sandbox cleanup',
+      { unref: detach }
+    ).catch(() => undefined);
+    if (!detach) {
+      await cleanup;
+    }
   }
 }
 

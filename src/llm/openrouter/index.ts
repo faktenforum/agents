@@ -6,6 +6,9 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { SeenScalarMetadata } from '@/llm/openai/streamMetadata';
+import type { PromptCacheTtl } from '@/messages/cache';
+import { dropRepeatedScalarMetadata } from '@/llm/openai/streamMetadata';
 import { ChatOpenAI, emitStreamChunkCallback } from '@/llm/openai';
 
 export type OpenRouterReasoningEffort =
@@ -30,6 +33,13 @@ export interface ChatOpenRouterCallOptions
   reasoning?: OpenRouterReasoning;
   modelKwargs?: OpenAIChatInput['modelKwargs'];
   promptCache?: boolean;
+  /**
+   * Prompt-cache breakpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` for the legacy 5-minute behavior.
+   * OpenRouter forwards this to Claude upstreams (Anthropic / Bedrock / Vertex),
+   * which downgrade to 5m where the extended TTL isn't supported.
+   */
+  promptCacheTtl?: PromptCacheTtl;
 }
 
 export type ChatOpenRouterInput = Partial<
@@ -107,6 +117,7 @@ export class ChatOpenRouter extends ChatOpenAI {
   constructor(_fields: ChatOpenRouterInput) {
     const fieldsWithoutPromptCache: ChatOpenRouterInput = { ..._fields };
     delete fieldsWithoutPromptCache.promptCache;
+    delete fieldsWithoutPromptCache.promptCacheTtl;
 
     const {
       include_reasoning,
@@ -152,9 +163,7 @@ export class ChatOpenRouter extends ChatOpenAI {
     return 'LibreChatOpenRouter';
   }
 
-  // @ts-expect-error - OpenRouter reasoning extends OpenAI Reasoning with additional
-  // effort levels ('xhigh' | 'none' | 'minimal') not in ReasoningEffort.
-  // The parent's generic conditional return type cannot be widened in an override.
+  // OpenRouter widens OpenAI reasoning with extra effort levels ('xhigh' | 'none' | 'minimal').
   override invocationParams(
     options?: this['ParsedCallOptions'],
     extra?: InvocationParamsExtra
@@ -233,8 +242,11 @@ export class ChatOpenRouter extends ChatOpenAI {
       string,
       OpenRouterReasoningEncryptedDetail
     >();
+    // Consume the raw (un-deduped) stream so `finish_reason` survives as the
+    // reasoning-flush signal below; de-duplicate after that, before emitting.
+    const seenScalarMetadata: SeenScalarMetadata = new Map();
 
-    for await (const generationChunk of super._streamResponseChunks(
+    for await (const generationChunk of super._streamRawResponseChunks(
       messages,
       options,
       undefined
@@ -283,12 +295,11 @@ export class ChatOpenRouter extends ChatOpenAI {
         } else {
           delete generationChunk.message.additional_kwargs.reasoning_details;
         }
-        await emitStreamChunkCallback(generationChunk, runManager);
-        yield generationChunk;
-        continue;
+      } else {
+        delete generationChunk.message.additional_kwargs.reasoning_details;
       }
 
-      delete generationChunk.message.additional_kwargs.reasoning_details;
+      dropRepeatedScalarMetadata(generationChunk, seenScalarMetadata);
       await emitStreamChunkCallback(generationChunk, runManager);
       yield generationChunk;
     }

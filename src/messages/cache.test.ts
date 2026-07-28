@@ -12,8 +12,16 @@ import {
   stripAnthropicCacheControl,
   stripBedrockCacheControl,
   addBedrockCacheControl,
+  addBedrockTailCacheControl,
   addCacheControl,
+  addTailCacheControl,
   addCacheControlToStablePrefixMessages,
+  buildAnthropicCacheControl,
+  buildBedrockCachePoint,
+  resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
+  supportsBedrockToolCache,
+  DEFAULT_PROMPT_CACHE_TTL,
 } from './cache';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { toLangChainContent } from './langchain';
@@ -886,6 +894,67 @@ describe('synthetic skill/meta messages are not cache-anchored', () => {
 
     expect(hasAnthropicMarker(result[2])).toBe(false);
     expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+});
+
+describe('supportsBedrockToolCache', () => {
+  test('returns true for Claude model ids (incl. cross-region + profile)', () => {
+    expect(
+      supportsBedrockToolCache('anthropic.claude-3-5-sonnet-20241022-v2:0')
+    ).toBe(true);
+    expect(
+      supportsBedrockToolCache('us.anthropic.claude-sonnet-4-5-20250929-v1:0')
+    ).toBe(true);
+    expect(supportsBedrockToolCache('anthropic.claude-opus-4-6-v1')).toBe(true);
+  });
+
+  test('returns false for Nova and other non-Claude families (tool cache only)', () => {
+    // Nova accepts system/message cachePoints but rejects the tool checkpoint.
+    expect(supportsBedrockToolCache('us.amazon.nova-pro-v1:0')).toBe(false);
+    expect(supportsBedrockToolCache('amazon.nova-lite-v1:0')).toBe(false);
+    expect(supportsBedrockToolCache('meta.llama3-1-70b-instruct-v1:0')).toBe(
+      false
+    );
+    expect(supportsBedrockToolCache('mistral.mistral-large-2407-v1:0')).toBe(
+      false
+    );
+  });
+
+  test('returns false for empty / missing model', () => {
+    expect(supportsBedrockToolCache('')).toBe(false);
+    expect(supportsBedrockToolCache(undefined)).toBe(false);
+    expect(supportsBedrockToolCache(null)).toBe(false);
+  });
+});
+
+describe('resolveBedrockPromptCacheTtl', () => {
+  test('Claude: defaults to 1h and honors an explicit ttl', () => {
+    const claude = 'us.anthropic.claude-sonnet-4-5-20250929-v1:0';
+    expect(resolveBedrockPromptCacheTtl(undefined, claude)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl('1h', claude)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl('5m', claude)).toBe('5m');
+  });
+
+  test('Nova: clamps to 5m even when 1h is configured (extended TTL Anthropic-only)', () => {
+    const nova = 'us.amazon.nova-lite-v1:0';
+    expect(resolveBedrockPromptCacheTtl(undefined, nova)).toBe('5m');
+    expect(resolveBedrockPromptCacheTtl('1h', nova)).toBe('5m');
+    expect(resolveBedrockPromptCacheTtl('5m', nova)).toBe('5m');
+  });
+
+  test('other non-Claude families clamp to 5m', () => {
+    expect(
+      resolveBedrockPromptCacheTtl('1h', 'meta.llama3-1-70b-instruct-v1:0')
+    ).toBe('5m');
+    expect(
+      resolveBedrockPromptCacheTtl('1h', 'mistral.mistral-large-2407-v1:0')
+    ).toBe('5m');
+  });
+
+  test('omitted model defaults to Claude behavior (1h)', () => {
+    expect(resolveBedrockPromptCacheTtl(undefined, undefined)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl(undefined, null)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl('1h', undefined)).toBe('1h');
   });
 });
 
@@ -1811,5 +1880,174 @@ describe('OpenRouter prompt caching (reuses addCacheControl)', () => {
 
     const lastContent = result[2].content as MessageContentComplex[];
     expect('cache_control' in lastContent[0]).toBe(true);
+  });
+});
+
+describe('prompt-cache TTL (1h default, 5m legacy)', () => {
+  describe('resolvePromptCacheTtl', () => {
+    it('defaults to the 1h extended cache when unset', () => {
+      expect(resolvePromptCacheTtl(undefined)).toBe('1h');
+      expect(DEFAULT_PROMPT_CACHE_TTL).toBe('1h');
+    });
+
+    it('passes an explicit value through unchanged', () => {
+      expect(resolvePromptCacheTtl('5m')).toBe('5m');
+      expect(resolvePromptCacheTtl('1h')).toBe('1h');
+    });
+  });
+
+  describe('marker builders', () => {
+    it('buildAnthropicCacheControl adds ttl only for 1h', () => {
+      expect(buildAnthropicCacheControl('1h')).toEqual({
+        type: 'ephemeral',
+        ttl: '1h',
+      });
+      // 5m / undefined stay byte-identical to the legacy marker (no ttl)
+      expect(buildAnthropicCacheControl('5m')).toEqual({ type: 'ephemeral' });
+      expect(buildAnthropicCacheControl()).toEqual({ type: 'ephemeral' });
+    });
+
+    it('buildBedrockCachePoint adds ttl only for 1h', () => {
+      expect(buildBedrockCachePoint('1h')).toEqual({
+        type: 'default',
+        ttl: '1h',
+      });
+      expect(buildBedrockCachePoint('5m')).toEqual({ type: 'default' });
+      expect(buildBedrockCachePoint()).toEqual({ type: 'default' });
+    });
+  });
+
+  describe('addTailCacheControl threads ttl', () => {
+    const baseMessages = (): AnthropicMessages => [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi there' },
+    ];
+
+    it('stamps a 1h cache_control on the tail block', () => {
+      const result = addTailCacheControl(baseMessages(), '1h');
+      const tail = result[result.length - 1].content as MessageContentComplex[];
+      expect(tail[tail.length - 1]).toEqual({
+        type: 'text',
+        text: 'Hi there',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      });
+    });
+
+    it('omits ttl for 5m and for the unspecified (legacy) default', () => {
+      for (const ttl of ['5m', undefined] as const) {
+        const result = addTailCacheControl(baseMessages(), ttl);
+        const tail = result[result.length - 1]
+          .content as MessageContentComplex[];
+        expect(
+          (tail[tail.length - 1] as Anthropic.TextBlockParam).cache_control
+        ).toEqual({ type: 'ephemeral' });
+      }
+    });
+  });
+
+  describe('addCacheControl threads ttl', () => {
+    it('stamps a 1h cache_control on the latest user messages', () => {
+      const messages: AnthropicMessages = [
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'reply' },
+        { role: 'user', content: 'second' },
+      ];
+      const result = addCacheControl(messages, '1h');
+      const lastUser = result[2].content as MessageContentComplex[];
+      expect((lastUser[0] as Anthropic.TextBlockParam).cache_control).toEqual({
+        type: 'ephemeral',
+        ttl: '1h',
+      });
+    });
+  });
+
+  describe('addCacheControlToStablePrefixMessages threads ttl', () => {
+    it('stamps 1h on every stable-prefix marker', () => {
+      const messages: AnthropicMessages = [
+        { role: 'user', content: 'turn 1' },
+        { role: 'assistant', content: 'reply 1' },
+        { role: 'user', content: 'turn 2' },
+        { role: 'assistant', content: 'reply 2' },
+      ];
+      const result = addCacheControlToStablePrefixMessages(messages, 2, '1h');
+      const marked = result
+        .flatMap((m) =>
+          Array.isArray(m.content) ? (m.content as MessageContentComplex[]) : []
+        )
+        .filter((block) => 'cache_control' in block);
+      expect(marked.length).toBeGreaterThan(0);
+      for (const block of marked) {
+        expect((block as Anthropic.TextBlockParam).cache_control).toEqual({
+          type: 'ephemeral',
+          ttl: '1h',
+        });
+      }
+    });
+  });
+
+  describe('addBedrockTailCacheControl threads ttl', () => {
+    const messages = (): TestMsg[] => [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+    ];
+
+    it('stamps a 1h cachePoint on the tail message', () => {
+      const result = addBedrockTailCacheControl(messages(), '1h');
+      const last = result[result.length - 1].content as MessageContentComplex[];
+      expect(last[last.length - 1]).toEqual({
+        cachePoint: { type: 'default', ttl: '1h' },
+      });
+    });
+
+    it('omits ttl for 5m and the legacy default', () => {
+      for (const ttl of ['5m', undefined] as const) {
+        const result = addBedrockTailCacheControl(messages(), ttl);
+        const last = result[result.length - 1]
+          .content as MessageContentComplex[];
+        expect(last[last.length - 1]).toEqual({
+          cachePoint: { type: 'default' },
+        });
+      }
+    });
+
+    it('normalizes a stale 5m system cachePoint to the resolved tail ttl', () => {
+      const msgs: TestMsg[] = [
+        {
+          role: 'system',
+          content: [
+            { type: ContentTypes.TEXT, text: 'System' },
+            { cachePoint: { type: 'default' } } as MessageContentComplex,
+          ],
+        },
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi' },
+      ];
+      const result = addBedrockTailCacheControl(msgs, '1h');
+      // Stale 5m system checkpoint is upgraded to 1h so it never precedes the
+      // 1h message tail (Bedrock requires longer-TTL checkpoints first).
+      const system = result[0].content as MessageContentComplex[];
+      expect(system[system.length - 1]).toEqual({
+        cachePoint: { type: 'default', ttl: '1h' },
+      });
+      const tail = result[result.length - 1].content as MessageContentComplex[];
+      expect(tail[tail.length - 1]).toEqual({
+        cachePoint: { type: 'default', ttl: '1h' },
+      });
+    });
+  });
+
+  describe('addBedrockCacheControl threads ttl', () => {
+    it('stamps a 1h cachePoint when configured', () => {
+      const messages: TestMsg[] = [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi' },
+      ];
+      const result = addBedrockCacheControl(messages, '1h');
+      // Only one user message present, so the cachePoint anchors on it.
+      const user = result[0].content as MessageContentComplex[];
+      expect(user[user.length - 1]).toEqual({
+        cachePoint: { type: 'default', ttl: '1h' },
+      });
+    });
   });
 });

@@ -132,6 +132,7 @@ describe('CustomReranker', () => {
           headers: {
             'Content-Type': 'application/json',
           },
+          timeout: expect.any(Number),
         }
       );
     });
@@ -152,6 +153,7 @@ describe('CustomReranker', () => {
         apiUrl: 'https://api.scaleway.ai/v1/rerank',
         apiKey: 'my-key',
         model: 'qwen3-embedding-8b',
+        timeout: 4321,
         logger: mockLogger,
       });
 
@@ -171,6 +173,7 @@ describe('CustomReranker', () => {
             'Content-Type': 'application/json',
             Authorization: 'Bearer my-key',
           },
+          timeout: 4321,
         }
       );
 

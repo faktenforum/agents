@@ -473,6 +473,13 @@ function _formatContent(message: BaseMessage) {
    * forwarding an unusable block. The receiving model produces its own thinking.
    */
   const foreignReasoningTypes = ['reasoning_content', 'reasoning', 'think'];
+  /**
+   * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
+   * URL context or Google Search). Only Google can execute these and validate
+   * their thought signatures, so they are dropped on a cross-provider handoff
+   * (e.g. Google → Anthropic); the assistant's answer text is kept.
+   */
+  const foreignServerToolTypes = ['toolCall', 'toolResponse'];
   const { content } = message;
 
   if (typeof content === 'string') {
@@ -482,8 +489,8 @@ function _formatContent(message: BaseMessage) {
     const contentBlocks = contentParts.map((contentPart) => {
       /**
        * Normalize server_tool_use blocks into a clean shape the API accepts.
-       * These blocks may arrive with the correct type (server_tool_use) or mislabeled
-       * as text/tool_use after chunk concatenation or state serialization.
+       * These blocks may arrive with the correct type (server_tool_use), as a
+       * standardized server_tool_call, or mislabeled after state serialization.
        * Regardless of current type, if the id starts with 'srvtoolu_' we rebuild
        * a clean block with only the properties the API expects.
        */
@@ -496,7 +503,7 @@ function _formatContent(message: BaseMessage) {
         'name' in contentPart
       ) {
         const rawPart = contentPart as Record<string, unknown>;
-        let input = rawPart.input;
+        let input = rawPart.input ?? rawPart.args;
         if (typeof input === 'string') {
           try {
             input = JSON.parse(input);
@@ -547,6 +554,60 @@ function _formatContent(message: BaseMessage) {
           return corrected;
         }
         return null;
+      }
+
+      /**
+       * Native ChatModelStream output standardizes client tool uses as
+       * `tool_call` blocks. Convert those blocks back to Anthropic's wire shape
+       * before the generic content formatter sees them.
+       */
+      if (
+        contentPart.type === 'tool_call' &&
+        'id' in contentPart &&
+        typeof contentPart.id === 'string' &&
+        'name' in contentPart &&
+        typeof contentPart.name === 'string' &&
+        'args' in contentPart
+      ) {
+        let args = contentPart.args;
+        if (typeof args === 'string') {
+          try {
+            args = JSON.parse(args);
+          } catch {
+            args = {};
+          }
+        }
+        if (args == null || typeof args !== 'object' || Array.isArray(args)) {
+          args = {};
+        }
+        return _convertLangChainToolCallToAnthropic({
+          id: contentPart.id,
+          name: contentPart.name,
+          args: args as Record<string, unknown>,
+        });
+      }
+
+      /**
+       * Native Anthropic thinking is exposed through the standard reasoning
+       * stream, but its signature makes it safe and necessary to round-trip.
+       * Keep unsigned or cross-provider reasoning on the existing drop path.
+       */
+      if (
+        contentPart.type === 'reasoning' &&
+        isAIMessage(message) &&
+        message.response_metadata.model_provider === 'anthropic' &&
+        'reasoning' in contentPart &&
+        typeof contentPart.reasoning === 'string' &&
+        'signature' in contentPart &&
+        typeof contentPart.signature === 'string' &&
+        contentPart.signature !== ''
+      ) {
+        const block: AnthropicThinkingBlockParam = {
+          type: 'thinking',
+          thinking: contentPart.reasoning,
+          signature: contentPart.signature,
+        };
+        return block;
       }
 
       /**
@@ -621,9 +682,17 @@ function _formatContent(message: BaseMessage) {
         if (isAIMessage(message) && (signature == null || signature === '')) {
           return null;
         }
+        // Opus 4.7+ omits thinking text by default (signed but text-less
+        // block), so `thinking` may be absent on a signed block even though the
+        // type declares it required. Coerce to '' — JSON.stringify drops an
+        // undefined value, which would send a `thinking` block missing its
+        // required `thinking` field and trip a 400
+        // `messages.N.content.M.thinking.thinking: Field required`.
+        const thinkingText =
+          (thinkingPart as { thinking?: string }).thinking ?? '';
         const block: AnthropicThinkingBlockParam = {
           type: 'thinking' as const, // Explicitly setting the type as "thinking"
-          thinking: thinkingPart.thinking,
+          thinking: thinkingText,
           signature: thinkingPart.signature,
           ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
@@ -657,6 +726,9 @@ function _formatContent(message: BaseMessage) {
         const block: AnthropicCompactionBlockParam = {
           type: 'compaction' as const,
           content: compactionPart.content,
+          ...('encrypted_content' in compactionPart
+            ? { encrypted_content: compactionPart.encrypted_content }
+            : {}),
           ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;
@@ -789,6 +861,14 @@ function _formatContent(message: BaseMessage) {
         // input and fall through to the throw below rather than being silently
         // dropped — as does any other unknown block (user media, Google
         // code-execution), which must be surfaced, not discarded.
+        return null;
+      } else if (
+        isAIMessage(message) &&
+        foreignServerToolTypes.some((t) => t === contentPart.type)
+      ) {
+        // Google server-side tool call/response (e.g. URL context) — only
+        // Google can execute it or validate its thought signature; drop it
+        // on a cross-provider handoff rather than crash.
         return null;
       } else {
         console.error(
@@ -978,11 +1058,16 @@ const NON_CACHEABLE_PAYLOAD_BLOCK_TYPES = new Set([
  * skipped. Returns a new array only when it actually places a marker.
  */
 function reanchorTailCacheControl(
-  messages: AnthropicMessageCreateParams['messages']
+  messages: AnthropicMessageCreateParams['messages'],
+  ttl?: '1h'
 ): AnthropicMessageCreateParams['messages'] {
   if (messages.length === 0) {
     return messages;
   }
+  const cacheControl =
+    ttl === '1h'
+      ? ({ type: 'ephemeral', ttl: '1h' } as const)
+      : ({ type: 'ephemeral' } as const);
   const lastIndex = messages.length - 1;
   const tail = messages[lastIndex];
   const content = tail.content;
@@ -994,9 +1079,7 @@ function reanchorTailCacheControl(
     const next = [...messages];
     next[lastIndex] = {
       ...tail,
-      content: [
-        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
-      ],
+      content: [{ type: 'text', text: content, cache_control: cacheControl }],
     } as (typeof messages)[number];
     return next;
   }
@@ -1027,10 +1110,34 @@ function reanchorTailCacheControl(
   next[lastIndex] = {
     ...tail,
     content: content.map((block, i) =>
-      i === anchor ? { ...block, cache_control: { type: 'ephemeral' } } : block
+      i === anchor ? { ...block, cache_control: cacheControl } : block
     ),
   } as (typeof messages)[number];
   return next;
+}
+
+/**
+ * Find the extended-cache TTL (`'1h'`) carried by an existing `cache_control`
+ * breakpoint, so {@link reanchorTailCacheControl} can re-apply the same TTL the
+ * stripped prefill had. Returns `undefined` for the legacy 5-minute default
+ * (no `ttl`), keeping that path byte-identical to before.
+ */
+function findCacheControlTtl(
+  messages: AnthropicMessageCreateParams['messages']
+): '1h' | undefined {
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+    for (const block of message.content) {
+      const cacheControl = (block as { cache_control?: { ttl?: unknown } })
+        .cache_control;
+      if (cacheControl?.ttl === '1h') {
+        return '1h';
+      }
+    }
+  }
+  return undefined;
 }
 
 export function stripUnsupportedAssistantPrefill<
@@ -1065,7 +1172,7 @@ export function stripUnsupportedAssistantPrefill<
   const reanchored =
     messagesHaveCacheControl(messages) &&
     !messagesHaveCacheControl(nextMessages)
-      ? reanchorTailCacheControl(nextMessages)
+      ? reanchorTailCacheControl(nextMessages, findCacheControlTtl(messages))
       : nextMessages;
 
   return {

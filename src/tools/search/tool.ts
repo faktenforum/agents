@@ -16,6 +16,7 @@ import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
@@ -197,16 +198,24 @@ export async function executeParallelSearches({
 function createSearchProcessor({
   searchAPI,
   safeSearch,
+  supportsImages,
   supportsVideos,
+  supportsNews,
   sourceProcessor,
   onGetHighlights,
+  mainExpandBy,
+  separatorExpandBy,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
+  supportsImages: boolean;
   supportsVideos: boolean;
+  supportsNews: boolean;
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
+  mainExpandBy: t.SearchToolConfig['mainExpandBy'];
+  separatorExpandBy: t.SearchToolConfig['separatorExpandBy'];
   logger: t.Logger;
 }) {
   return async function ({
@@ -238,9 +247,9 @@ function createSearchProcessor({
         date,
         country,
         safeSearch,
-        images,
+        images: supportsImages && images,
         videos: supportsVideos && videos,
-        news,
+        news: supportsNews && news,
         logger,
       });
 
@@ -255,7 +264,11 @@ function createSearchProcessor({
         numElements: maxSources,
       });
 
-      return expandHighlights(processedSources);
+      return expandHighlights(
+        processedSources,
+        mainExpandBy,
+        separatorExpandBy
+      );
     } catch (error) {
       logger.error('Error in search:', error);
       return {
@@ -315,7 +328,11 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
-      const { output, references } = formatResultsForLLM(turn, searchResult, maxOutputChars);
+      const { output, references } = formatResultsForLLM(
+        turn,
+        searchResult,
+        maxOutputChars
+      );
       const data: t.SearchResultData = { turn, ...searchResult, references };
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
@@ -331,8 +348,8 @@ function createTool({
 /**
  * Creates a search tool with configurable search and scraper providers.
  *
- * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized).
- * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction).
+ * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized), fastCRW (Firecrawl-compatible, self-host or cloud).
+ * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction), fastCRW (Firecrawl-compatible, self-host or cloud).
  *
  * The country schema field is exposed to the LLM for providers that support localized results.
  */
@@ -358,9 +375,17 @@ export const createSearchTool = (
     tavilySearchUrl,
     tavilyExtractUrl,
     tavilySearchOptions,
+    keenableApiKey,
+    keenableApiUrl,
+    keenableSearchOptions,
     rerankerType = 'cohere',
+    rerankerTimeout,
     topResults = 5,
     maxContentLength,
+    chunkSize,
+    chunkOverlap,
+    mainExpandBy,
+    separatorExpandBy,
     maxOutputChars,
     strategies = ['no_extraction'],
     filterContent = true,
@@ -372,6 +397,10 @@ export const createSearchTool = (
     firecrawlOptions,
     serperScraperOptions,
     tavilyScraperOptions,
+    crwApiKey,
+    crwApiUrl,
+    crwSearchOptions,
+    crwScraperOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -418,6 +447,12 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions: effectiveTavilySearchOptions,
+    keenableApiKey,
+    keenableApiUrl,
+    keenableSearchOptions,
+    crwApiKey,
+    crwApiUrl,
+    crwSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -441,6 +476,16 @@ export const createSearchTool = (
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
       logger,
     });
+  } else if (scraperProvider === 'crw') {
+    scraperInstance = createCrwScraper({
+      ...crwScraperOptions,
+      apiKey:
+        crwScraperOptions?.apiKey ?? crwApiKey ?? process.env.CRW_API_KEY,
+      apiUrl: crwScraperOptions?.apiUrl ?? crwApiUrl,
+      timeout: scraperTimeout ?? crwScraperOptions?.timeout,
+      formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
+      logger,
+    });
   } else {
     scraperInstance = createFirecrawlScraper({
       ...firecrawlOptions,
@@ -461,6 +506,7 @@ export const createSearchTool = (
     customRerankerApiUrl,
     customRerankerApiKey,
     customRerankerModel,
+    rerankerTimeout,
     logger,
   });
 
@@ -473,6 +519,8 @@ export const createSearchTool = (
       reranker: selectedReranker,
       topResults,
       maxContentLength,
+      chunkSize,
+      chunkOverlap,
       strategies,
       filterContent,
       logger,
@@ -483,9 +531,18 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
-    supportsVideos: searchProvider !== 'tavily',
+    // Keenable is organic-only: its API ignores `type`, so image/news
+    // sub-searches would spend rate limit and merge nothing.
+    supportsImages: searchProvider !== 'keenable',
+    supportsVideos:
+      searchProvider !== 'tavily' &&
+      searchProvider !== 'keenable' &&
+      searchProvider !== 'crw',
+    supportsNews: searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
+    mainExpandBy,
+    separatorExpandBy,
     logger,
   });
 

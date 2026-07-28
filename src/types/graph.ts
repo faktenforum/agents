@@ -336,6 +336,16 @@ export type StandardGraphInput = {
    * they already flow through the registry's `CHAT_MODEL_END` handler.
    */
   subagentUsageSink?: SubagentUsageSink;
+  /**
+   * True when this graph IS a subagent child run (set by `SubagentExecutor`
+   * when it constructs the child graph). Drives the hook-input `agentId`
+   * subagent-scope marker: hook dispatches from this graph's tool nodes
+   * carry `agentId` so run-scoped host hooks — which fire for child scopes
+   * too, because children inherit the parent's `run_id` — can tell child
+   * scope from the top level. Top-level graphs leave this unset and their
+   * hook inputs carry only `executingAgentId`.
+   */
+  subagentScope?: boolean;
 };
 
 export type GraphEdge = {
@@ -524,9 +534,9 @@ export type LangfuseToolOutputTracingConfig = {
 
 export type LangfuseToolNodeTracingConfig = {
   /**
-   * Overrides ToolNode callback tracing. ToolNode spans are exported by the
-   * env-backed Langfuse callback, so this only enables tracing when that
-   * callback is configured.
+   * Opts into the internal ToolNode batch observation. Graph tool-dispatch
+   * and individual tool observations are exported without this wrapper, so
+   * the default is false to avoid a redundant hierarchy level.
    */
   enabled?: boolean;
 };
@@ -536,7 +546,23 @@ export interface LangfuseConfig {
   publicKey?: string;
   secretKey?: string;
   baseUrl?: string;
+  /**
+   * Environment identifier attached to exported traces (Langfuse
+   * `environment`). When unset, falls back to `LANGFUSE_TRACING_ENVIRONMENT`
+   * then `NODE_ENV`, so production traces are not collapsed under the
+   * `default` environment.
+   */
+  environment?: string;
   metadata?: Record<string, string | number | boolean | null | undefined>;
+  /**
+   * Internal OTLP span attributes to attach to Langfuse observations before
+   * export. Intended for collector-side routing/filtering; strip these in the
+   * collector before forwarding spans to Langfuse.
+   */
+  librechatTraceAttributes?: Record<
+    string,
+    string | number | boolean | null | undefined
+  >;
   tags?: string[];
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
@@ -603,6 +629,28 @@ export interface AgentInputs {
   subagentConfigs?: SubagentConfig[];
   /** Maximum subagent nesting depth. Default 1 means top-level agents can spawn subagents but subagents cannot nest further. */
   maxSubagentDepth?: number;
+  /**
+   * Host-supplied tool instances that must execute IN-PROCESS inside the graph's
+   * ToolNode even when the run is event-driven (`toolDefinitions` non-empty). Each
+   * instance is bound to the model alongside the schema-only event tools and its
+   * name is marked direct, so calls bypass ON_TOOL_EXECUTE dispatch and run inside
+   * the Pregel task frame. This is the only execution mode where a tool body may
+   * raise a LangGraph `interrupt()` (e.g. a tool built on `askUserQuestion()`) —
+   * the host-side event handler runs outside the graph task, where `interrupt()`
+   * throws. Do NOT also list these tools in `toolDefinitions` (they would be bound
+   * twice). NOT inherited by SELF-SPAWNED subagent children (their config is a
+   * shallow spread of the parent's inputs, and child graphs compile without a
+   * checkpointer, so an interrupt-capable tool could never pause there) —
+   * `buildChildInputs` scrubs the inherited copy; an EXPLICIT child config that
+   * lists its own `graphTools` keeps them.
+   *
+   * Deliberately `GenericTool[]`, not `GraphTools`: the wider union admits
+   * schema-only shapes (OpenAI `BindToolsInput`, Google tool objects) that
+   * `initializeTools` cannot register in the ToolNode direct map — the model
+   * would bind a tool the SDK advertised as in-process but cannot execute.
+   * Every entry must be a real executable tool instance with a `name`.
+   */
+  graphTools?: GenericTool[];
 }
 
 export interface ContextPruningConfig {

@@ -1,3 +1,4 @@
+import { nanoid } from 'nanoid';
 import { ToolCall } from '@langchain/core/messages/tool';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
@@ -19,8 +20,12 @@ import type {
   RunnableConfig,
   RunnableToolLike,
 } from '@langchain/core/runnables';
+import type {
+  ToolRuntime,
+  StructuredToolInterface,
+} from '@langchain/core/tools';
 import type { BaseMessage, AIMessage } from '@langchain/core/messages';
-import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type {
   ToolOutputResolveView,
   PreResolvedArgsMap,
@@ -34,13 +39,18 @@ import type {
 } from '@/hooks';
 import type * as t from '@/types';
 import {
+  buildToolExecutionRequestPlan,
+  resolveRuntimeSessionHint,
+  recordArgsEqual,
+} from '@/tools/eagerEventExecution';
+import {
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import {
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
-import {
-  buildToolExecutionRequestPlan,
-  recordArgsEqual,
-} from '@/tools/eagerEventExecution';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
@@ -49,7 +59,6 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
-import { withLangfuseToolOutputTracingConfig } from '@/langfuseToolOutputTracing';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { toLangChainContent } from '@/messages/langchain';
@@ -62,7 +71,7 @@ import { executeHooks } from '@/hooks';
  * batch-scoped value the method needs so the signature stays at
  * three positional parameters even as new context fields are added.
  */
-type RunToolBatchContext = {
+type RunToolBatchContext<T = unknown> = {
   /** Position of this call within the parent ToolNode batch. */
   batchIndex?: number;
   /** Batch turn shared across every call in the batch. */
@@ -101,9 +110,19 @@ type RunToolBatchContext = {
    * contract for hosts relying on it for policy / recovery guidance.
    */
   additionalContextsSink?: string[];
+  /**
+   * Graph state the ToolNode was invoked with, threaded from `run()`
+   * so `tool.invoke` can forward it as langgraph 1.4's `runtime.state`
+   * (the deprecation-free replacement for `getCurrentTaskInput()`,
+   * which relies on `node:async_hooks` and is browser-incompatible).
+   */
+  runInput?: T;
 };
 
 const TOOL_NODE_RUN_NAME = 'tool_batch';
+const NANOID_URL_ALPHABET =
+  '_-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const RUNTIME_HANDOFF_GROUP_OFFSET = 2 ** 48;
 
 /**
  * Per-batch context for `dispatchToolEvents` / `executeViaEvent`.
@@ -141,6 +160,41 @@ function isSend(value: unknown): value is Send {
 
 function isHandoffToolName(name: string): boolean {
   return name.startsWith(Constants.LC_TRANSFER_TO_);
+}
+
+/**
+ * Encodes 48 random bits from the persisted batch key into a safe integer.
+ * The high offset keeps runtime groups disjoint from low, structural group IDs.
+ */
+function getRuntimeHandoffGroupId(batch: string): number {
+  let value = 0;
+  for (const char of batch.slice(0, 8)) {
+    const digit = NANOID_URL_ALPHABET.indexOf(char);
+    value = value * 64 + Math.max(digit, 0);
+  }
+  return RUNTIME_HANDOFF_GROUP_OFFSET + value;
+}
+
+function findHandoffMessage(
+  messages: BaseMessage[],
+  destination: string
+): ToolMessage | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.getType() !== 'tool') {
+      continue;
+    }
+    const toolMessage = message as ToolMessage;
+    const isStandardHandoff =
+      toolMessage.name === `${Constants.LC_TRANSFER_TO_}${destination}`;
+    const isConditionalHandoff =
+      toolMessage.name === 'conditional_transfer' &&
+      toolMessage.additional_kwargs.handoff_destination === destination;
+    if (isStandardHandoff || isConditionalHandoff) {
+      return toolMessage;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -401,6 +455,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private agentLangfuse?: t.LangfuseConfig;
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
+  /**
+   * Tool call ids whose `errorHandler` did NOT dispatch the error completion
+   * event (it returned `false` or threw). The output loop must dispatch the
+   * completion for these itself — skipping them there would strand the
+   * client's tool-call part without a terminal event.
+   */
+  private undispatchedToolErrors: Set<string> = new Set();
   private toolUsageCount: Map<string, number>;
   /** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
   private toolCallTurns: Map<string, number> = new Map();
@@ -425,6 +486,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private eventDrivenMode: boolean = false;
   /** Opt-in stream-layer prestart config for event-driven tools. */
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
+  /** Host tools that write to the code sandbox and share its exec session. */
+  private codeSessionToolNames?: ReadonlySet<string>;
   /** Shared per-run prestarted tool registry populated by ChatModelStreamHandler. */
   private eagerEventToolExecutions?: Map<string, t.EagerEventToolExecution>;
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
@@ -440,6 +503,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private executingAgentId?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
+  /**
+   * Tool names whose in-process body may raise a LangGraph `interrupt()`
+   * mid-execution (e.g. `ask_user_question`). Used only to REORDER within
+   * the direct group: a tool named here that is *already* direct (a real
+   * in-process graphTool — the only kind whose body can reach
+   * `interrupt()`) is scheduled ahead of its non-interrupting direct
+   * siblings, so a mid-body interrupt unwinds the ToolNode before a
+   * non-idempotent sibling executes and LangGraph's resume-time batch
+   * re-execution can't double it. This set is deliberately NOT folded
+   * into direct classification: a name that resolves to a schema-only
+   * event stub (an inherited `toolDefinition` with no executable
+   * instance) stays event-dispatched — forcing it direct would invoke
+   * the stub, which throws. See {@link t.ToolNodeOptions.interruptingToolNames}.
+   */
+  private interruptingToolNames?: Set<string>;
   /**
    * File checkpointer extracted from the local coding tool bundle when
    * `toolExecution.local.fileCheckpointing === true`. Exposed via
@@ -501,6 +579,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     agentId,
     executingAgentId,
     directToolNames,
+    interruptingToolNames,
+    codeSessionToolNames,
     maxContextTokens,
     maxToolResultChars,
     hookRegistry,
@@ -538,6 +618,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // existing agentId option) still get attribution without knowing the new option.
     this.executingAgentId = executingAgentId ?? agentId;
     this.directToolNames = directToolNames;
+    this.interruptingToolNames =
+      interruptingToolNames != null && interruptingToolNames.size > 0
+        ? interruptingToolNames
+        : undefined;
+    this.codeSessionToolNames =
+      codeSessionToolNames != null && codeSessionToolNames.length > 0
+        ? new Set(codeSessionToolNames)
+        : undefined;
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
@@ -577,10 +665,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     options?: Partial<RunnableConfig>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Promise<any> {
-    return withLangfuseToolOutputTracingConfig(
-      this.runLangfuse,
-      () => super.invoke(input, options),
-      this.agentLangfuse
+    return withLangfuseRuntimeScope(
+      resolveLangfuseRuntimeScope({
+        runLangfuse: this.runLangfuse,
+        langfuseOverlay: this.agentLangfuse,
+      }),
+      () => super.invoke(input, options)
     );
   }
 
@@ -771,10 +861,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private recordEventToolPlanningTurn(
     toolName: string,
     turn: number,
-    callId?: string
+    callId?: string,
+    runId?: string
   ): void {
     this.recordToolUsageTurn(toolName, turn, callId);
-    if (this.canConsumeEagerEventExecution()) {
+    if (this.canConsumeEagerEventExecution(runId)) {
       this.eagerEventToolUsageCount?.set(
         toolName,
         Math.max(this.eagerEventToolUsageCount.get(toolName) ?? 0, turn + 1)
@@ -802,9 +893,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     // Convert MCP format (type: 'image' with data:) to image_url format
     artifactObj.content = artifactObj.content.map((item) => {
+      // The declared element type says non-null, but this content came off the wire from an
+      // MCP server, so the nullish guard stays: `'type' in null` would throw.
       if (
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+        item != null &&
         typeof item === 'object' &&
-        item !== null &&
         'type' in item &&
         item.type === 'image' &&
         'data' in item
@@ -836,7 +930,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   protected async runTool(
     call: ToolCall,
     config: RunnableConfig,
-    batchContext: RunToolBatchContext = {}
+    batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
     const {
       batchIndex,
@@ -844,6 +938,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       batchScopeId,
       resolvedArgsByCallId,
       preBatchSnapshot,
+      runInput,
     } = batchContext;
     let tool = this.toolMap.get(call.name);
 
@@ -1012,7 +1107,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * still need to travel through `_injected_files`; the legacy
        * `/files/<session_id>` fallback was removed from the executors.
        */
-      if (CODE_EXECUTION_TOOLS.has(call.name)) {
+      if (this.participatesInCodeSession(call.name)) {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
@@ -1029,10 +1124,43 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             );
           }
         }
+
+        /**
+         * Stateful runtime session hint — orthogonal to the transient
+         * exec-session above, and injected independently (a first call has a
+         * hint but no exec session yet). Explicit host hint wins; otherwise
+         * fall back to the conversation's thread_id.
+         */
+        const runtimeSessionHint = this.resolveRuntimeSessionHint(config);
+        if (runtimeSessionHint != null) {
+          invokeParams = {
+            ...invokeParams,
+            _runtime_session_hint: runtimeSessionHint,
+          };
+        }
       }
 
-      // Invoke tool (standard path for all tools)
-      const output = await tool.invoke(invokeParams, config);
+      /**
+       * Forward the graph state as langgraph 1.4's `runtime.state` so
+       * tools can read it off their second argument instead of the
+       * deprecated `getCurrentTaskInput()` (which relies on
+       * `node:async_hooks` and is browser-incompatible). Shape mirrors
+       * langgraph's prebuilt ToolNode runtime exactly.
+       */
+      const lgConfig = config as LangGraphRunnableConfig;
+      const runtime: ToolRuntime<T> = {
+        ...config,
+        state: runInput as ToolRuntime<T>['state'],
+        toolCallId: call.id ?? '',
+        config,
+        context: lgConfig.context as ToolRuntime<T>['context'],
+        store: (lgConfig.store ?? null) as ToolRuntime<T>['store'],
+        writer:
+          lgConfig.writer ??
+          (config.configurable?.writer as ToolRuntime<T>['writer']) ??
+          null,
+      };
+      const output = await tool.invoke(invokeParams, runtime);
 
       // Handle MCP tuple [content, artifact] (content_and_artifact
       // tuple form). Normalize the MCP image artifact and stash it in
@@ -1078,7 +1206,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // If a ToolMessage carries an artifact (tools with
         // responseFormat: 'content_and_artifact'), ensure it is in
         // additional_kwargs for formatArtifactPayload downstream.
-        if (toolMsg.artifact && !toolMsg.additional_kwargs.artifact) {
+        if (toolMsg.artifact != null && toolMsg.additional_kwargs.artifact == null) {
           toolMsg.additional_kwargs.artifact = toolMsg.artifact;
         }
 
@@ -1182,7 +1310,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       if (this.errorHandler) {
         try {
-          await this.errorHandler(
+          const dispatched = await this.errorHandler(
             {
               error: e,
               id: call.id!,
@@ -1191,7 +1319,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             },
             config.metadata
           );
+          if (dispatched === false && call.id != null && call.id !== '') {
+            /**
+             * The handler could not dispatch the error completion (typically
+             * a resume pass, where a fast-failing tool errors before the
+             * step replay registers its run step). Remember the call so the
+             * output loop dispatches the completion itself instead of
+             * assuming the handler covered it.
+             */
+            this.undispatchedToolErrors.add(call.id);
+          }
         } catch (handlerError) {
+          // A THROWN handler is not proof the completion wasn't dispatched: the
+          // built-in session handler emits `tool.completed` BEFORE invoking a
+          // user ON_RUN_STEP_COMPLETED callback, so a throw from that callback
+          // has already dispatched. Marking it undispatched would make the
+          // fallback loop re-emit a duplicate completion — only an explicit
+          // `false` return (handled above) means "nothing dispatched"; a throw
+          // is just logged.
           // eslint-disable-next-line no-console
           console.error('Error in errorHandler:', {
             toolName: call.name,
@@ -1288,7 +1433,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private async runDirectToolWithLifecycleHooks(
     call: ToolCall,
     config: RunnableConfig,
-    batchContext: RunToolBatchContext = {}
+    batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const hookRegistry = this.hookRegistry;
@@ -1823,6 +1968,34 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * Extracts code execution session context from tool results and stores in Graph.sessions.
    * Mirrors the session storage logic in handleRunToolCompletions for direct execution.
    */
+  /**
+   * True when a tool's successful result should fold its returned exec
+   * `session_id` into the shared code session: built-in `CODE_EXECUTION_TOOLS`,
+   * plus host-declared sandbox-writing tools (`codeSessionToolNames`, e.g.
+   * create_file/edit_file). Kept name-scoped rather than a blanket artifact
+   * opt-in so only host-declared tools can influence the shared session.
+   */
+  private participatesInCodeSession(name: string): boolean {
+    if (name === '') {
+      return false;
+    }
+    return (
+      CODE_EXECUTION_TOOLS.has(name) ||
+      this.codeSessionToolNames?.has(name) === true
+    );
+  }
+
+  /** Delegates to the shared resolver so the direct and event-driven planning
+   *  paths derive the runtime session hint identically. */
+  private resolveRuntimeSessionHint(
+    config: RunnableConfig
+  ): string | undefined {
+    return resolveRuntimeSessionHint(
+      this.toolExecution,
+      config.configurable?.thread_id as string | undefined
+    );
+  }
+
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
     requestMap: Map<string, t.ToolCallRequest>
@@ -1841,7 +2014,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (
         request?.name == null ||
         request.name === '' ||
-        (!CODE_EXECUTION_TOOLS.has(request.name) &&
+        (!this.participatesInCodeSession(request.name) &&
           request.name !== Constants.SKILL_TOOL)
       ) {
         continue;
@@ -1889,12 +2062,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const toolCallId = call.id ?? '';
 
       // Skip error ToolMessages when errorHandler already dispatched ON_RUN_STEP_COMPLETED
-      // via handleToolCallErrorStatic. Without this check, errors would be double-dispatched.
+      // via handleToolCallErrorStatic — dispatching again here would double-dispatch.
+      // When the handler reported it could NOT dispatch (no run step registered yet at
+      // error time, e.g. a fast-failing tool on a resume pass), fall through: by now the
+      // step replay has usually registered the id, so this loop's dispatch is the only
+      // terminal event the client's tool-call part will ever get.
       if (toolMessage.status === 'error' && this.errorHandler != null) {
-        continue;
+        if (this.undispatchedToolErrors.has(toolCallId)) {
+          // CONSUME the marker: this loop now owns the dispatch for this id.
+          // Leaving it set would let a later re-entry (same ToolNode instance
+          // re-executing the batch, where the handler CAN dispatch) fall
+          // through here too and double-dispatch — and the set would grow
+          // unbounded across a long-lived graph's fast-failing calls.
+          this.undispatchedToolErrors.delete(toolCallId);
+        } else {
+          continue;
+        }
       }
 
-      if (this.sessions && CODE_EXECUTION_TOOLS.has(call.name)) {
+      if (this.sessions && this.participatesInCodeSession(call.name)) {
         const artifact = toolMessage.artifact as
           | t.CodeExecutionArtifact
           | undefined;
@@ -2048,6 +2234,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const postToolBatchEntryByCallId = new Map<string, PostToolBatchEntry>();
     const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
       additionalContexts: [] as string[],
+      injectedMessages: [] as t.InjectedMessage[],
       errors: [] as string[],
     });
 
@@ -2058,6 +2245,32 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * to defensively `?.` it across every reference inside.
        */
       const hookRegistry = this.hookRegistry;
+      /**
+       * Pull each call's prestarted eager record BEFORE awaiting the hooks:
+       * an async deny must never race the eager host promise into emitting a
+       * successful completion (`dispatchEagerToolCompletions`' map-identity
+       * check skips deleted records). Allowed entries get their record
+       * restored in the decision loop below so consumption still works;
+       * denied entries stay deleted. Ask/interrupt configs never have eager
+       * records (HITL disables the reservation gate).
+       */
+      const preemptedEagerRecords = new Map<
+        string,
+        t.EagerEventToolExecution
+      >();
+      if (this.eagerEventToolExecutions != null) {
+        for (const entry of preToolCalls) {
+          const callId = entry.call.id;
+          if (callId == null) {
+            continue;
+          }
+          const record = this.eagerEventToolExecutions.get(callId);
+          if (record != null) {
+            preemptedEagerRecords.set(callId, record);
+            this.eagerEventToolExecutions.delete(callId);
+          }
+        }
+      }
       const preResults = await Promise.all(
         preToolCalls.map((entry) =>
           executeHooks({
@@ -2140,6 +2353,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           contentString,
           reason,
         });
+        /**
+         * A prestarted eager execution for a now-blocked call must neither be
+         * consumed nor emit its completion — the run reports this call as
+         * blocked. Deleting the record makes `dispatchEagerToolCompletions`'
+         * map-identity check skip the pending emission (same pattern as the
+         * rejected-results cleanup below).
+         */
+        this.eagerEventToolExecutions?.delete(entry.call.id!);
       };
 
       const flushDeferredBlockedSideEffects = async (): Promise<void> => {
@@ -2268,6 +2489,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (hookResult.updatedInput != null) {
           applyInputOverride(entry, hookResult.updatedInput);
+        }
+        if (entry.call.id != null) {
+          const preempted = preemptedEagerRecords.get(entry.call.id);
+          if (preempted != null) {
+            this.eagerEventToolExecutions?.set(entry.call.id, preempted);
+          }
         }
         approvedEntries.push(entry);
       }
@@ -2527,23 +2754,34 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const plan = buildToolExecutionRequestPlan({
         toolCalls: approvedEntries.map((entry) => {
           const codeSessionContext =
-            CODE_EXECUTION_TOOLS.has(entry.call.name) ||
+            this.participatesInCodeSession(entry.call.name) ||
             entry.call.name === Constants.SKILL_TOOL ||
             entry.call.name === Constants.READ_FILE
               ? this.getCodeSessionContext()
               : undefined;
+          const runtimeSessionHint = this.participatesInCodeSession(
+            entry.call.name
+          )
+            ? this.resolveRuntimeSessionHint(config)
+            : undefined;
           return {
             id: entry.call.id,
             name: entry.call.name,
             args: entry.args,
             stepId: entry.stepId,
             codeSessionContext,
+            runtimeSessionHint,
           };
         }),
         usageCount: this.toolUsageCount,
         invalidArgsBehavior: 'error-result',
         recordTurn: (toolName, reservedTurn, callId) => {
-          this.recordEventToolPlanningTurn(toolName, reservedTurn, callId);
+          this.recordEventToolPlanningTurn(
+            toolName,
+            reservedTurn,
+            callId,
+            runId
+          );
         },
       });
       if (plan == null) {
@@ -2588,7 +2826,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * released if the dispatch fails, letting the batch path re-emit.
        */
       const canEmitEarlyCompletions =
-        this.hookRegistry == null && this.humanInTheLoop?.enabled !== true;
+        this.hookRegistry?.hasResultAlteringHooks(runId) !== true &&
+        this.humanInTheLoop?.enabled !== true;
+      /**
+       * Snapshot the post-hook gates at the same instant as the early-emission
+       * gate: a result-altering hook registered while this batch is in flight
+       * applies from the NEXT batch. Evaluating these after results settle
+       * would let a late hook rewrite the ToolMessage AFTER an early
+       * completion already emitted the pre-hook output — two views of the
+       * same call.
+       */
+      const hasPostHook =
+        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
+      const hasFailureHook =
+        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
       const earlyCompletionDispatchedIds = new Set<string>();
       const earlyCompletionDispatches: Array<Promise<void>> = [];
       const dispatchRequestById = new Map(
@@ -2637,7 +2888,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             const batchRequest: t.ToolExecuteBatchRequest = {
               toolCalls: dispatchRequests,
               userId: config.configurable?.user_id as string | undefined,
-              agentId: this.agentId,
+              // Dispatch attribution, NOT the hook subagent-scope marker:
+              // hosts key tool/credential lookup on the owning agent, and
+              // the eager path sends `agentContext.agentId` — this must
+              // match it at the top level too.
+              agentId: this.executingAgentId,
               configurable: config.configurable as
                   | Record<string, unknown>
                   | undefined,
@@ -2703,11 +2958,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ];
 
       this.storeCodeSessionFromResults(results, requestMap);
-
-      const hasPostHook =
-        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
-      const hasFailureHook =
-        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
 
       for (const result of results) {
         if (result.injectedMessages && result.injectedMessages.length > 0) {
@@ -2846,6 +3096,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 this.maxToolResultChars
               );
               finalToolOutput = hookResult.updatedOutput;
+              /**
+               * The hook ACTUALLY rewrote this output: any completion the
+               * stream already emitted for the consumed eager result showed
+               * the raw content, so un-mark it and let the dispatch below
+               * re-emit the corrected version. Hooks that merely observe or
+               * add context leave the original emission final — no
+               * duplicates.
+               */
+              eagerCompletionDispatchedIds.delete(result.toolCallId);
             }
           }
 
@@ -2922,11 +3181,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     return { toolMessages, injected };
   }
 
-  private canConsumeEagerEventExecution(): boolean {
+  /** Run-scoped so another run's session hooks can't flip this run's gate. */
+  private canConsumeEagerEventExecution(runId?: string): boolean {
     return (
       this.eventDrivenMode &&
       this.eagerEventToolExecution?.enabled === true &&
-      this.hookRegistry == null &&
+      this.hookRegistry?.hasResultAlteringHooks(runId) !== true &&
       this.humanInTheLoop?.enabled !== true
     );
   }
@@ -2934,7 +3194,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private takeMatchingEagerEventExecution(
     request: t.ToolCallRequest
   ): t.EagerEventToolExecution | undefined {
-    if (!this.canConsumeEagerEventExecution()) {
+    // Static enablement only: a stored record means the reservation-time
+    // gates passed and the host already dispatched the execution. Re-checking
+    // the dynamic hook gate here could decline consumption after a mid-run
+    // registration and send the same call through normal dispatch — executing
+    // the tool twice. PostToolUse hooks still process consumed results below.
+    if (
+      !this.eventDrivenMode ||
+      this.eagerEventToolExecution?.enabled !== true
+    ) {
       return undefined;
     }
 
@@ -3049,6 +3317,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         orderedBatchEntries.push(entry);
       }
     }
+    const hookInjectedMessages: t.InjectedMessage[] = [];
     if (
       this.hookRegistry?.hasHookFor('PostToolBatch', runId) === true &&
       orderedBatchEntries.length > 0
@@ -3069,6 +3338,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         for (const ctx of batchHookResult.additionalContexts) {
           batchAdditionalContexts.push(ctx);
         }
+        for (const msg of batchHookResult.injectedMessages) {
+          hookInjectedMessages.push(msg);
+        }
       }
     }
 
@@ -3087,6 +3359,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           additional_kwargs: { role: 'system', source: 'hook' },
         })
       );
+    }
+
+    /**
+     * Hook-returned `injectedMessages` land AFTER the consolidated context
+     * message: one converted `HumanMessage` per entry (role/source kept in
+     * `additional_kwargs`), preserving per-message identity so verbatim
+     * user speech (e.g. steering) sits closest to the next model call.
+     */
+    if (hookInjectedMessages.length > 0) {
+      try {
+        injected.push(...this.convertInjectedMessages(hookInjectedMessages));
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[ToolNode] Failed to convert PostToolBatch injectedMessages:',
+          e instanceof Error ? e.message : e
+        );
+      }
     }
   }
 
@@ -3189,6 +3479,94 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Execute a group of direct (in-process) tool calls with interrupt-safe
+   * ordering, returning outputs aligned 1:1 with `directCalls`.
+   *
+   * Fast path (the common case): when no call in the group is in
+   * `interruptingToolNames`, this is a single `Promise.all` — byte-for-byte
+   * the prior behavior, so ordinary batches are unaffected.
+   *
+   * Interrupt-safe path: when the group contains an interrupting tool (e.g.
+   * `ask_user_question`, whose body raises a LangGraph `interrupt()` to
+   * collect a human answer), the interrupting calls run as their own awaited
+   * group **first**; only after they all settle without interrupting do the
+   * remaining (potentially non-idempotent) siblings run. If an interrupting
+   * call throws a `GraphInterrupt`, the `await` below rejects and unwinds the
+   * whole ToolNode *before* any non-interrupting sibling has started — so a
+   * sibling with real side effects (send_email, billing) never executes on
+   * the first pass. On the resume pass LangGraph re-runs the batch from the
+   * top; the interrupting tool resolves with the host's answer instead of
+   * throwing, and the siblings execute for the FIRST time, exactly once.
+   *
+   * Without this ordering, a flat `Promise.all` starts every sibling
+   * concurrently, so a non-idempotent sibling can complete its side effect
+   * before the interrupt unwinds and then run a SECOND time on resume — the
+   * duplicate side effect this method exists to prevent. Interrupting tools
+   * are expected to be side-effect-free (they only suspend), so running them
+   * as a group and re-running them on resume is harmless.
+   *
+   * `batchIndices[i]` is `directCalls[i]`'s position within the parent
+   * ToolNode batch (used for `{{tool<i>turn<n>}}` registration); it is
+   * preserved regardless of execution order. `baseContext` carries the
+   * batch-scoped fields every call shares; `batchIndex` is filled in
+   * per-call here.
+   */
+  private async runDirectBatchInterruptSafe(
+    directCalls: ToolCall[],
+    batchIndices: number[],
+    config: RunnableConfig,
+    baseContext: Omit<RunToolBatchContext<T>, 'batchIndex'>
+  ): Promise<(BaseMessage | Command)[]> {
+    const runOne = (
+      call: ToolCall,
+      position: number
+    ): Promise<BaseMessage | Command> =>
+      this.runDirectToolWithLifecycleHooks(call, config, {
+        ...baseContext,
+        batchIndex: batchIndices[position],
+      });
+
+    const interrupting = this.interruptingToolNames;
+    const hasInterrupting =
+      interrupting != null &&
+      directCalls.some((call) => interrupting.has(call.name));
+
+    if (!hasInterrupting) {
+      return Promise.all(directCalls.map((call, i) => runOne(call, i)));
+    }
+
+    const outputs: (BaseMessage | Command)[] = new Array(directCalls.length);
+    const interruptingPositions: number[] = [];
+    const regularPositions: number[] = [];
+    for (let i = 0; i < directCalls.length; i++) {
+      if (interrupting.has(directCalls[i].name)) {
+        interruptingPositions.push(i);
+      } else {
+        regularPositions.push(i);
+      }
+    }
+
+    // Interrupting group first. A GraphInterrupt here propagates out of the
+    // `await` before any regular sibling is dispatched below.
+    const interruptingOutputs = await Promise.all(
+      interruptingPositions.map((i) => runOne(directCalls[i], i))
+    );
+    interruptingPositions.forEach((i, k) => {
+      outputs[i] = interruptingOutputs[k];
+    });
+
+    // No interrupting call suspended — safe to run the remaining siblings.
+    const regularOutputs = await Promise.all(
+      regularPositions.map((i) => runOne(directCalls[i], i))
+    );
+    regularPositions.forEach((i, k) => {
+      outputs[i] = regularOutputs[k];
+    });
+
+    return outputs;
+  }
+
+  /**
    * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
    * Injected messages are placed AFTER ToolMessages to respect provider
    * message ordering (AIMessage tool_calls must be immediately followed
@@ -3258,6 +3636,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       // branch, so direct tools dispatched via Send (a supported
       // input shape) still silently dropped hook context.
       const directAdditionalContexts: string[] = [];
+      // Mirror langgraph's prebuilt ToolNode: the Send-input state is
+      // the input minus the `lg_tool_call` envelope key.
+      const { lg_tool_call: _sendToolCall, ...sendState } = input;
       const sendOutput = await this.runDirectToolWithLifecycleHooks(
         input.lg_tool_call,
         config,
@@ -3267,6 +3648,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           batchScopeId,
           resolvedArgsByCallId,
           additionalContextsSink: directAdditionalContexts,
+          runInput: sendState as T,
         }
       );
       outputs =
@@ -3430,17 +3812,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directAdditionalContexts: string[] = [];
         const directOutputs: (BaseMessage | Command)[] =
           directCalls.length > 0
-            ? await Promise.all(
-              directCalls.map((call, i) =>
-                this.runDirectToolWithLifecycleHooks(call, config, {
-                  batchIndex: directIndices[i],
-                  turn,
-                  batchScopeId,
-                  resolvedArgsByCallId,
-                  preBatchSnapshot,
-                  additionalContextsSink: directAdditionalContexts,
-                })
-              )
+            ? await this.runDirectBatchInterruptSafe(
+              directCalls,
+              directIndices,
+              config,
+              {
+                turn,
+                batchScopeId,
+                resolvedArgsByCallId,
+                preBatchSnapshot,
+                additionalContextsSink: directAdditionalContexts,
+                runInput: input as T,
+              }
             )
             : [];
 
@@ -3494,17 +3877,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const preBatchSnapshot =
           this.toolOutputRegistry?.snapshot(batchScopeId);
         const directAdditionalContexts: string[] = [];
-        const toolOutputs = await Promise.all(
-          filteredCalls.map((call, i) =>
-            this.runDirectToolWithLifecycleHooks(call, config, {
-              batchIndex: i,
-              turn,
-              batchScopeId,
-              resolvedArgsByCallId,
-              preBatchSnapshot,
-              additionalContextsSink: directAdditionalContexts,
-            })
-          )
+        const toolOutputs = await this.runDirectBatchInterruptSafe(
+          filteredCalls,
+          filteredCalls.map((_call, i) => i),
+          config,
+          {
+            turn,
+            batchScopeId,
+            resolvedArgsByCallId,
+            preBatchSnapshot,
+            additionalContextsSink: directAdditionalContexts,
+            runInput: input as T,
+          }
         );
         await this.handleRunToolCompletions(
           filteredCalls,
@@ -3612,21 +3996,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const goto = cmd.goto;
         return typeof goto === 'string' ? goto : (goto as string[])[0];
       });
+      const parallelBatch = nanoid();
+      const parallelGroupId = getRuntimeHandoffGroupId(parallelBatch);
 
       const sends = handoffCommands.map((cmd, idx) => {
         const destination = allDestinations[idx];
         /** Get siblings (other destinations, not this one) */
         const siblings = allDestinations.filter((d) => d !== destination);
 
-        /** Add siblings to ToolMessage additional_kwargs */
         const update = cmd.update as { messages?: BaseMessage[] } | undefined;
-        if (update && update.messages) {
-          for (const msg of update.messages) {
-            if (msg.getType() === 'tool') {
-              (msg as ToolMessage).additional_kwargs.handoff_parallel_siblings =
-                siblings;
-            }
-          }
+        const handoffMessage = update?.messages
+          ? findHandoffMessage(update.messages, destination)
+          : undefined;
+        if (handoffMessage) {
+          handoffMessage.additional_kwargs.handoff_parallel_siblings = siblings;
+          handoffMessage.additional_kwargs[Constants.HANDOFF_PARALLEL_BATCH] =
+            parallelBatch;
+          handoffMessage.additional_kwargs[Constants.HANDOFF_GROUP_ID] =
+            parallelGroupId;
         }
 
         return new Send(destination, cmd.update);

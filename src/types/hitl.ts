@@ -140,6 +140,13 @@ export interface AskUserQuestionRequest {
    * UI allows it. Omit to require a free-form answer.
    */
   options?: AskUserQuestionOption[];
+  /**
+   * When `true`, the host UI may let the user pick several options; the
+   * resulting `AskUserQuestionResolution.answer` is the selected option
+   * values joined by `", "`. When omitted or `false`, hosts render a
+   * single-select picker. Only meaningful alongside `options`.
+   */
+  multiSelect?: boolean;
 }
 
 /**
@@ -168,9 +175,10 @@ export type HumanInterruptPayload =
 export interface AskUserQuestionResolution {
   /**
    * The human's answer. Free-form text, or — when `options` were
-   * provided — one of the option `value`s. Hosts may also send any
-   * structured object their custom UI defines; see the host docs for
-   * what your downstream consumer expects.
+   * provided — one of the option `value`s (or, when the request set
+   * `multiSelect`, several option `value`s joined by `", "`). Hosts may
+   * also send any structured object their custom UI defines; see the
+   * host docs for what your downstream consumer expects.
    */
   answer: string;
 }
@@ -286,6 +294,44 @@ export function isAskUserQuestionInterrupt(
  * there's any chance another tool in the same batch could trigger
  * an interrupt. This applies equally to direct tools (handoffs,
  * subagents) and to event tools.
+ *
+ * ### Guarding non-idempotent siblings via `interruptingToolNames`
+ *
+ * The "must be idempotent" rule above is unavoidable in the general
+ * case, but the SDK can protect siblings against the one interrupt
+ * shape it can predict: a tool whose *body* raises `interrupt()`
+ * mid-execution — the `ask_user_question` shape, where the tool
+ * suspends the run to collect a human answer. Declare such tools in
+ * `RunConfig.interruptingToolNames`
+ * ({@link ToolNodeOptions.interruptingToolNames}) and the ToolNode
+ * schedules them, within each batch, **ahead of** their
+ * non-interrupting direct siblings. When one interrupts, the batch
+ * unwinds before any declared-safe sibling has run, so the sibling
+ * executes exactly once (on resume) instead of twice. Empirically:
+ *
+ *   - A **direct** sibling sharing the interrupter's in-process
+ *     `Promise.all` is the only shape that double-executes; declaring
+ *     the interrupter closes it.
+ *   - An **event-dispatched** sibling is already safe without any
+ *     config: the ToolNode awaits the whole direct group (where the
+ *     body interrupt unwinds) before it dispatches event tools, so a
+ *     dispatched sibling never runs on the first pass.
+ *
+ * This is a *scheduling* guard, not full resume idempotency: it only
+ * covers tools that interrupt from their own body and only protects
+ * siblings scheduled after them. It does not retroactively make a
+ * `PreToolUse` `'ask'` gate on tool B stop tool A (already executed)
+ * from re-running — unless B is itself declared interrupting, so it
+ * runs first. Tools with side effects should still be written
+ * idempotent as defense in depth.
+ *
+ * The guard only REORDERS the direct group — declaring a name does not
+ * force it onto the direct path. The interrupting tool must already be a
+ * real in-process graphTool (the only kind whose body can reach
+ * `interrupt()`). A name that resolves to a schema-only event stub (an
+ * inherited `toolDefinition` with no executable instance, e.g. in a
+ * self-spawned child that scrubs `graphTools`) stays event-dispatched
+ * and the ordering is a no-op for it.
  *
  * ## Note on idempotency
  *

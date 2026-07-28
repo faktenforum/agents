@@ -11,7 +11,9 @@ import {
   appendCodeSessionFileSummary,
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
+  CodeApiRequestError,
   getCodeBaseURL,
+  normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
 import { Constants } from '@/common';
@@ -58,6 +60,30 @@ Usage:
 `.trim();
 
 /**
+ * Bash statefulness is filesystem-tier and scoped to `/mnt/data`. The machine
+ * is warm across calls, but each call runs in a fresh sandbox (new process
+ * tree + private /tmp), so background processes are reaped when the call ends
+ * and anything written outside /mnt/data is discarded. The note must not
+ * promise otherwise: a model told background processes survive will start a
+ * server in one call and assume it is listening in the next.
+ */
+export const STATEFUL_BASH_NOTE =
+  'Session state: commands in this conversation run on the same warm machine, so files written to /mnt/data persist between calls. Each call runs in a fresh, isolated sandbox: shell variables, the working directory, /tmp, and background processes do NOT survive after the call returns — a process started in one call is terminated when that call ends. Only /mnt/data is durable (the machine itself may also be reset at any time).';
+
+export const StatefulBashExecutionToolDescription = `
+Runs bash commands and returns stdout/stderr output. Commands in this conversation share one warm machine with a persistent /mnt/data, but each command runs in its own isolated sandbox (not a persistent shell session).
+
+${STATEFUL_BASH_NOTE}
+
+Usage:
+- No network access available.
+- Generated files are automatically delivered; **DO NOT** provide download links.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
+- ${BASH_SHELL_GUIDANCE}
+- NEVER use this tool to execute malicious commands.
+`.trim();
+
+/**
  * Supplemental prompt documenting the tool-output reference feature.
  *
  * Hosts should append this (separated by a blank line) to the base
@@ -87,11 +113,45 @@ Referencing previous tool outputs:
  */
 export function buildBashExecutionToolDescription(options?: {
   enableToolOutputReferences?: boolean;
+  statefulSessions?: boolean;
 }): string {
+  const base =
+    options?.statefulSessions === true
+      ? StatefulBashExecutionToolDescription
+      : BashExecutionToolDescription;
   if (options?.enableToolOutputReferences === true) {
-    return `${BashExecutionToolDescription}\n\n${BashToolOutputReferencesGuide}`;
+    return `${base}\n\n${BashToolOutputReferencesGuide}`;
   }
-  return BashExecutionToolDescription;
+  return base;
+}
+
+const STATELESS_BASH_PARAM_NOTE =
+  'The environment is stateless; variables and state don\'t persist between executions.';
+const STATEFUL_BASH_PARAM_NOTE =
+  'Files written to /mnt/data persist between calls on the same warm machine. Each call runs in a fresh sandbox: shell variables, cwd, /tmp, and background processes do NOT survive the call. Only /mnt/data is durable.';
+
+export function buildBashExecutionToolSchema(opts?: {
+  statefulSessions?: boolean;
+}): typeof BashExecutionToolSchema {
+  const note =
+    opts?.statefulSessions === true
+      ? STATEFUL_BASH_PARAM_NOTE
+      : STATELESS_BASH_PARAM_NOTE;
+  const commandDescription =
+    BashExecutionToolSchema.properties.command.description.replace(
+      STATELESS_BASH_PARAM_NOTE,
+      note
+    );
+  return {
+    ...BashExecutionToolSchema,
+    properties: {
+      ...BashExecutionToolSchema.properties,
+      command: {
+        ...BashExecutionToolSchema.properties.command,
+        description: commandDescription,
+      },
+    },
+  } as typeof BashExecutionToolSchema;
 }
 
 export const BashExecutionToolName = Constants.BASH_TOOL;
@@ -117,15 +177,32 @@ function createBashExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
-      const { authHeaders, ...executionParams } = params ?? {};
-      const { command, ...rest } = rawInput as {
+      /* `statefulSessions` is prompt-only — keep it out of the wire body. */
+      const {
+        authHeaders,
+        statefulSessions: _statefulSessions,
+        ...executionParams
+      } = params ?? {};
+      void _statefulSessions;
+      /* Drop any model-supplied `runtime_session_hint` from the raw args: the
+       * hint must only come from ToolNode's injected `_runtime_session_hint`
+       * (below), never from the tool call itself. */
+      const {
+        command,
+        runtime_session_hint: _ignoredModelHint,
+        ...rest
+      } = rawInput as {
         command: string;
+        runtime_session_hint?: unknown;
         args?: string[];
       };
-      const { session_id, _injected_files } = (config.toolCall ?? {}) as {
-        session_id?: string;
-        _injected_files?: t.CodeEnvFile[];
-      };
+      void _ignoredModelHint;
+      const { session_id, _injected_files, _runtime_session_hint } =
+        (config.toolCall ?? {}) as {
+          session_id?: string;
+          _injected_files?: t.CodeEnvFile[];
+          _runtime_session_hint?: string;
+        };
 
       const postData: Record<string, unknown> = {
         lang: 'bash',
@@ -133,6 +210,13 @@ function createBashExecutionTool(
         ...rest,
         ...executionParams,
       };
+
+      if (
+        typeof _runtime_session_hint === 'string' &&
+        _runtime_session_hint !== ''
+      ) {
+        postData.runtime_session_hint = _runtime_session_hint;
+      }
 
       /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
        * HTTP fallback was removed because codeapi's sessionAuth requires
@@ -168,7 +252,7 @@ function createBashExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(
+          throw new CodeApiRequestError(
             await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
           );
         }
@@ -187,28 +271,40 @@ function createBashExecutionTool(
           command
         );
         const hasFiles = result.files != null && result.files.length > 0;
+        const runtimeEcho =
+          result.runtime_session_id != null
+            ? {
+              runtime_session_id: result.runtime_session_id,
+              runtime_status: result.runtime_status,
+            }
+            : {};
         return [
           appendCodeSessionFileSummary(outputWithReminder, result.files),
           (hasFiles
-            ? { session_id: result.session_id, files: result.files }
+            ? {
+              session_id: result.session_id,
+              files: result.files,
+              ...runtimeEcho,
+            }
             : {
               session_id: result.session_id,
+              ...runtimeEcho,
             }) satisfies t.CodeExecutionArtifact,
         ];
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
-          (error as Error | undefined)?.message ?? '',
+          normalizeCodeApiRequestError(error).message,
           command
         );
-        throw new Error(
-          `Execution error:\n\n${messageWithReminder}`
-        );
+        throw new Error(`Execution error:\n\n${messageWithReminder}`);
       }
     },
     {
       name: BashExecutionToolName,
-      description: BashExecutionToolDescription,
-      schema: BashExecutionToolSchema,
+      description: buildBashExecutionToolDescription({
+        statefulSessions: params?.statefulSessions,
+      }),
+      schema: buildBashExecutionToolSchema(params ?? undefined),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );

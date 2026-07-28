@@ -1,23 +1,46 @@
 import { CallbackHandler } from '@langfuse/langchain';
+import { isParentCommand } from '@langchain/langgraph';
+import { context as otelContext } from '@opentelemetry/api';
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
 } from '@langfuse/tracing';
+import type {
+  AIMessageChunkFields,
+  AIMessageFields,
+  UsageMetadata,
+} from '@langchain/core/messages';
+import type {
+  ChatGeneration,
+  Generation,
+  LLMResult,
+} from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
-import { isPresent } from '@/utils/misc';
+import {
+  resolveLangfuseConfigForSpan,
+  resolveTraceIdSeedForSpan,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
 const LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'LANGFUSE_FORCE_FLUSH_ON_DISPOSE';
 
 export type LangfuseTraceMetadata = Record<string, string>;
+export type LangfuseTraceAttributes = Record<string, string | number | boolean>;
 type LangfuseMetadata = NonNullable<t.LangfuseConfig['metadata']>;
+type LangfuseConfigTraceAttributes = NonNullable<
+  t.LangfuseConfig['librechatTraceAttributes']
+>;
 
 type LangfuseHandlerParams = {
   userId?: string;
   sessionId?: string;
   traceMetadata?: LangfuseTraceMetadata;
   tags?: string[];
+  traceIdSeed?: string;
 };
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
@@ -32,11 +55,217 @@ type FlushableTracerProvider = {
   forceFlush?: () => Promise<void> | void;
 };
 
-function parseBooleanEnv(value?: string): boolean {
-  if (value == null) {
-    return false;
+type BedrockResponseUsage = {
+  inputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheWriteInputTokens?: number;
+};
+
+type BedrockResponseMetadata = {
+  metadata?: {
+    usage?: BedrockResponseUsage;
+  };
+};
+
+function getLangfuseBedrockUsage(
+  message: AIMessage | AIMessageChunk
+): UsageMetadata | undefined {
+  const usageMetadata = message.usage_metadata;
+  const bedrockUsage = (message.response_metadata as BedrockResponseMetadata)
+    .metadata?.usage;
+  if (
+    usageMetadata == null ||
+    bedrockUsage == null ||
+    usageMetadata.input_tokens !== bedrockUsage.inputTokens
+  ) {
+    return usageMetadata;
   }
-  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+
+  const cacheRead = bedrockUsage.cacheReadInputTokens ?? 0;
+  const cacheCreation = bedrockUsage.cacheWriteInputTokens ?? 0;
+  if (cacheRead === 0 && cacheCreation === 0) {
+    return usageMetadata;
+  }
+
+  return {
+    ...usageMetadata,
+    input_tokens: usageMetadata.input_tokens + cacheRead + cacheCreation,
+  };
+}
+
+function cloneMessageWithUsage(
+  message: AIMessage | AIMessageChunk,
+  usageMetadata: UsageMetadata
+): AIMessage | AIMessageChunk {
+  const fields: AIMessageFields = {
+    content: message.content,
+    additional_kwargs: message.additional_kwargs,
+    response_metadata: message.response_metadata,
+    id: message.id,
+    name: message.name,
+    tool_calls: message.tool_calls,
+    invalid_tool_calls: message.invalid_tool_calls,
+    usage_metadata: usageMetadata,
+  };
+
+  if (message instanceof AIMessageChunk) {
+    const chunkFields: AIMessageChunkFields = {
+      ...fields,
+      tool_call_chunks: message.tool_call_chunks,
+    };
+    return new AIMessageChunk(chunkFields);
+  }
+
+  return new AIMessage(fields);
+}
+
+function normalizeGenerationForLangfuse(generation: Generation): Generation {
+  if (!('message' in generation)) {
+    return generation;
+  }
+
+  const message = (generation as ChatGeneration).message;
+  if (!(message instanceof AIMessage || message instanceof AIMessageChunk)) {
+    return generation;
+  }
+
+  const usageMetadata = getLangfuseBedrockUsage(message);
+  if (usageMetadata == null || usageMetadata === message.usage_metadata) {
+    return generation;
+  }
+
+  const chatGeneration: ChatGeneration = {
+    ...(generation as ChatGeneration),
+    message: cloneMessageWithUsage(message, usageMetadata),
+  };
+  return chatGeneration;
+}
+
+function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
+  if (output.generations.length === 0) {
+    return output;
+  }
+
+  const listIndex = output.generations.length - 1;
+  const generationList = output.generations[listIndex];
+  if (generationList.length === 0) {
+    return output;
+  }
+
+  const generationIndex = generationList.length - 1;
+  const generation = generationList[generationIndex];
+  const normalized = normalizeGenerationForLangfuse(generation);
+  if (normalized === generation) {
+    return output;
+  }
+
+  const generations = [...output.generations];
+  generations[listIndex] = [...generationList];
+  generations[listIndex][generationIndex] = normalized;
+  return { ...output, generations };
+}
+
+class ScopedLangfuseCallbackHandler extends CallbackHandler {
+  private readonly langfuse?: t.LangfuseConfig;
+  private readonly traceIdSeed?: string;
+
+  constructor(params?: AgentLangfuseHandlerParams) {
+    const { langfuse, traceIdSeed, ...handlerParams } = params ?? {};
+    super(handlerParams);
+    this.langfuse = langfuse;
+    this.traceIdSeed = traceIdSeed;
+  }
+
+  private getDeterministicTraceSeed(): string | undefined {
+    return this.langfuse?.deterministicTraceId === true
+      ? this.traceIdSeed
+      : undefined;
+  }
+
+  private withRuntimeContext<T>(action: () => T): T {
+    const activeContext = otelContext.active();
+    const langfuse =
+      resolveLangfuseConfigForSpan(activeContext) ?? this.langfuse;
+    const seed = this.getDeterministicTraceSeed();
+    return withLangfuseRuntimeScope(
+      {
+        langfuse,
+        traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
+      },
+      action
+    );
+  }
+
+  // LangChain may invoke callback handlers outside the caller's OTEL context.
+  // Re-enter tenant scope only for callbacks that start Langfuse observations;
+  // end/error/token callbacks use spans already bound to a processor at start.
+  override handleChainStart(
+    ...args: Parameters<CallbackHandler['handleChainStart']>
+  ): ReturnType<CallbackHandler['handleChainStart']> {
+    return this.withRuntimeContext(() => super.handleChainStart(...args));
+  }
+
+  override handleChainError(
+    ...args: Parameters<CallbackHandler['handleChainError']>
+  ): ReturnType<CallbackHandler['handleChainError']> {
+    const [error, runId, parentRunId] = args;
+    if (error != null && parentRunId != null && isParentCommand(error)) {
+      return super.handleChainEnd(
+        { controlFlow: 'ParentCommand' },
+        runId,
+        parentRunId
+      );
+    }
+    return super.handleChainError(...args);
+  }
+
+  override handleAgentAction(
+    ...args: Parameters<CallbackHandler['handleAgentAction']>
+  ): ReturnType<CallbackHandler['handleAgentAction']> {
+    return this.withRuntimeContext(() => super.handleAgentAction(...args));
+  }
+
+  override handleGenerationStart(
+    ...args: Parameters<CallbackHandler['handleGenerationStart']>
+  ): ReturnType<CallbackHandler['handleGenerationStart']> {
+    return this.withRuntimeContext(() => super.handleGenerationStart(...args));
+  }
+
+  override handleChatModelStart(
+    ...args: Parameters<CallbackHandler['handleChatModelStart']>
+  ): ReturnType<CallbackHandler['handleChatModelStart']> {
+    return this.withRuntimeContext(() => super.handleChatModelStart(...args));
+  }
+
+  override handleLLMStart(
+    ...args: Parameters<CallbackHandler['handleLLMStart']>
+  ): ReturnType<CallbackHandler['handleLLMStart']> {
+    return this.withRuntimeContext(() => super.handleLLMStart(...args));
+  }
+
+  override handleLLMEnd(
+    output: LLMResult,
+    runId: string,
+    parentRunId?: string
+  ): Promise<void> {
+    return super.handleLLMEnd(
+      normalizeBedrockUsageForLangfuse(output),
+      runId,
+      parentRunId
+    );
+  }
+
+  override handleToolStart(
+    ...args: Parameters<CallbackHandler['handleToolStart']>
+  ): ReturnType<CallbackHandler['handleToolStart']> {
+    return this.withRuntimeContext(() => super.handleToolStart(...args));
+  }
+
+  override handleRetrieverStart(
+    ...args: Parameters<CallbackHandler['handleRetrieverStart']>
+  ): ReturnType<CallbackHandler['handleRetrieverStart']> {
+    return this.withRuntimeContext(() => super.handleRetrieverStart(...args));
+  }
 }
 
 function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
@@ -48,6 +277,9 @@ function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
 function hasLangfuseTraceAttributes(langfuse?: t.LangfuseConfig): boolean {
   return (
     Object.keys(createTraceMetadata(langfuse?.metadata ?? {})).length > 0 ||
+    Object.keys(
+      createLibreChatTraceAttributes(langfuse?.librechatTraceAttributes ?? {})
+    ).length > 0 ||
     (mergeLangfuseTags(undefined, langfuse?.tags)?.length ?? 0) > 0
   );
 }
@@ -98,6 +330,26 @@ function createTraceMetadata(
     traceMetadata[key] = stringValue;
   }
   return traceMetadata;
+}
+
+export function createLibreChatTraceAttributes(
+  attributes: LangfuseConfigTraceAttributes
+): LangfuseTraceAttributes {
+  const librechatTraceAttributes: LangfuseTraceAttributes = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    if (value == null || key.trim() === '') {
+      continue;
+    }
+    if (typeof value === 'string') {
+      if (value.trim() === '' || value.length > TRACE_METADATA_MAX_LENGTH) {
+        continue;
+      }
+      librechatTraceAttributes[key] = value;
+      continue;
+    }
+    librechatTraceAttributes[key] = value;
+  }
+  return librechatTraceAttributes;
 }
 
 export function createLangfuseTraceMetadata({
@@ -175,7 +427,7 @@ export function shouldCreateLangfuseHandler(
 export function createLegacyLangfuseHandler(
   params: LangfuseHandlerParams
 ): CallbackHandler {
-  return new CallbackHandler(params);
+  return new ScopedLangfuseCallbackHandler(params);
 }
 
 export function createLangfuseHandler({
@@ -184,11 +436,12 @@ export function createLangfuseHandler({
   sessionId,
   traceMetadata,
   tags,
+  traceIdSeed,
 }: AgentLangfuseHandlerParams): CallbackHandler | undefined {
   if (!shouldCreateLangfuseHandler(langfuse)) {
     return undefined;
   }
-  return new CallbackHandler({
+  return new ScopedLangfuseCallbackHandler({
     userId,
     sessionId,
     traceMetadata: mergeLangfuseTraceMetadata(
@@ -196,6 +449,8 @@ export function createLangfuseHandler({
       langfuse?.metadata
     ),
     tags: mergeLangfuseTags(tags, langfuse?.tags),
+    langfuse,
+    traceIdSeed,
   });
 }
 
@@ -244,7 +499,7 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
 export async function disposeLangfuseHandler(value: unknown): Promise<void> {
   if (
     value == null ||
-    !parseBooleanEnv(process.env[LANGFUSE_FORCE_FLUSH_ON_DISPOSE])
+    parseBooleanEnv(process.env[LANGFUSE_FORCE_FLUSH_ON_DISPOSE]) !== true
   ) {
     return;
   }

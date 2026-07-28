@@ -11,31 +11,34 @@ import type {
   MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
+import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
   formatAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
+  foldToolBlocksForToollessAgent,
   convertMessagesToContent,
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
   addBedrockTailCacheControl,
   formatArtifactPayload,
-  enforceOriginalContentCap,
   formatContentStrings,
   isLegacyConvertible,
+  CALIBRATION_RATIO_MAX,
   createPruneMessages,
   syncBudgetDerivedFields,
   addTailCacheControl,
+  resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
+  supportsBedrockToolCache,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
+  DEFAULT_RETAIN_RECENT_TURNS,
+  splitAtRecencyBoundary,
 } from '@/messages';
-import {
-  resolveLangfuseConfig,
-  shouldTraceToolNodeForLangfuse,
-  withLangfuseToolOutputTracingConfig,
-} from '@/langfuseToolOutputTracing';
 import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
@@ -52,6 +55,18 @@ import {
   sleep,
 } from '@/utils';
 import {
+  getBlindRecoveryBudget,
+  planContextOverflowRecovery,
+  translateRecoveryBudget,
+} from '@/llm/contextOverflowRecovery';
+import {
+  attemptInvoke,
+  tryFallbackProviders,
+  getFallbackErrorContext,
+  getFallbackOverflowCandidates,
+} from '@/llm/invoke';
+import {
+  Constants,
   GraphNodeKeys,
   ContentTypes,
   GraphEvents,
@@ -59,25 +74,30 @@ import {
   StepTypes,
 } from '@/common';
 import {
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import {
   appendCallbacks,
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { shouldTriggerSummarization } from '@/summarization';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
+import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -91,6 +111,18 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
+
+function createToolHandlerRegistry(
+  source: HandlerRegistry | undefined
+): HandlerRegistry | undefined {
+  const toolHandler = source?.getHandler(GraphEvents.ON_TOOL_EXECUTE);
+  if (toolHandler == null) {
+    return undefined;
+  }
+  const registry = new HandlerRegistry();
+  registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
+  return registry;
+}
 
 /**
  * Start index of the span post-prune formatters can mutate in place: the
@@ -353,6 +385,61 @@ function clearCurrentDeltaStepMarkers({
   }
 }
 
+/**
+ * The completion allowance the caller configured, under whichever key the
+ * provider's client uses. Providers count it against the same ceiling as the
+ * prompt, so overflow recovery has to reserve it when the error did not
+ * itemize the total.
+ */
+function getConfiguredCompletionTokens(
+  clientOptions: t.ClientOptions | undefined
+): number | undefined {
+  const options = clientOptions as
+    | { maxTokens?: unknown; maxOutputTokens?: unknown }
+    | undefined;
+  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Our own estimate of the prompt that was actually sent, derived from the
+ * pre-invoke usage snapshot. Used to corroborate ambiguous provider errors
+ * and to measure how far our token accounting sits from the provider's.
+ */
+function getEstimatedPromptTokens(
+  contextUsage: t.ContextUsageEvent | null
+): number | undefined {
+  const budget = contextUsage?.contextBudget;
+  const remaining = contextUsage?.remainingContextTokens;
+  if (
+    budget == null ||
+    remaining == null ||
+    !Number.isFinite(budget) ||
+    !Number.isFinite(remaining)
+  ) {
+    return undefined;
+  }
+  const used = budget - remaining;
+  return used > 0 ? used : undefined;
+}
+
+function minDefined(
+  left: number | undefined,
+  right: number | undefined
+): number | undefined {
+  if (left == null) {
+    return right;
+  }
+  if (right == null) {
+    return left;
+  }
+  return Math.min(left, right);
+}
+
 async function dispatchMessageCreationStep({
   graph,
   stepKey,
@@ -503,7 +590,7 @@ export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
   _TNodeName extends string = string,
 > {
-  abstract resetValues(): void;
+  abstract resetValues(keepContent?: boolean, checkpointScope?: string): void;
   abstract initializeTools({
     currentTools,
     currentToolMap,
@@ -572,6 +659,8 @@ export abstract class Graph<
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
+  /** Host registry retained only for forwarding tools from nested child graphs. */
+  protected parentToolHandlerRegistry: HandlerRegistry | undefined;
   /**
    * True when event-driven tool execution can be routed through callbacks even
    * though this graph intentionally does not own the full handler registry.
@@ -604,6 +693,15 @@ export abstract class Graph<
    * consumes the settled promises while preserving final ToolMessage order.
    */
   eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
+  codeSessionToolNames: string[] | undefined;
+  /**
+   * Run-scoped names of tools whose in-process body may raise a LangGraph
+   * `interrupt()` (e.g. `ask_user_question`). Threaded from
+   * `RunConfig.interruptingToolNames` into every ToolNode this graph
+   * compiles so a mid-batch interrupt cannot double-execute non-idempotent
+   * siblings on resume. See {@link t.ToolNodeOptions.interruptingToolNames}.
+   */
+  interruptingToolNames: string[] | undefined;
   eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
   eagerEventToolUsageCount: Map<string, number> = new Map();
   private eagerEventToolUsageCountsByAgentId: Map<string, Map<string, number>> =
@@ -648,10 +746,13 @@ export abstract class Graph<
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
     this.handlerRegistry = undefined;
+    this.parentToolHandlerRegistry = undefined;
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
     this.eagerEventToolExecution = undefined;
+    this.codeSessionToolNames = undefined;
+    this.interruptingToolNames = undefined;
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
@@ -831,9 +932,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   overrideModel?: t.ChatModel;
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
+  /** Whether the workflow was actually compiled with a checkpointer. */
+  hasCompiledCheckpointer: boolean = false;
   messages: BaseMessage[] = [];
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
+  /** Checkpoint scope whose messages match index-keyed tool snapshots. */
+  private originalToolContentCheckpointScope?: string;
   runId: string | undefined;
   /**
    * Boundary between historical messages (loaded from conversation state)
@@ -855,6 +960,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * {@link t.StandardGraphInput.subagentUsageSink}.
    */
   subagentUsageSink?: t.SubagentUsageSink;
+  /** See {@link t.StandardGraphInput.subagentScope}. */
+  subagentScope: boolean;
 
   constructor({
     runId,
@@ -865,12 +972,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     indexTokenCountMap,
     calibrationRatio,
     subagentUsageSink,
+    subagentScope,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
+    this.subagentScope = subagentScope === true;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -894,7 +1003,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /* Init */
 
-  resetValues(keepContent?: boolean): void {
+  resetValues(keepContent?: boolean, checkpointScope?: string): void {
     this.messages = [];
     this.cachedRunMessages = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
@@ -942,9 +1051,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    const hasScopedCheckpoint =
+      this.hasCompiledCheckpointer &&
+      checkpointScope != null &&
+      checkpointScope !== '';
+    const preserveOriginalToolContent =
+      hasScopedCheckpoint &&
+      this.originalToolContentCheckpointScope === checkpointScope;
     for (const context of this.agentContexts.values()) {
-      context.reset();
+      context.reset({ preserveOriginalToolContent });
     }
+    this.originalToolContentCheckpointScope = hasScopedCheckpoint
+      ? checkpointScope
+      : undefined;
   }
 
   override clearHeavyState(): void {
@@ -952,8 +1071,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
+    const preserveOriginalToolContent =
+      this.hasCompiledCheckpointer &&
+      this.originalToolContentCheckpointScope != null;
     for (const context of this.agentContexts.values()) {
-      context.reset();
+      context.reset({ preserveOriginalToolContent });
     }
   }
 
@@ -1111,6 +1233,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
+    if (this.messages == null) {
+      return this.cachedRunMessages;
+    }
     if (this.messages.length === 0 && this.cachedRunMessages != null) {
       return this.cachedRunMessages;
     }
@@ -1118,6 +1243,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   getContentParts(): t.MessageContentComplex[] | undefined {
+    // `messages` can be null/undefined on a graph that has been disposed
+    // (clearHeavyState) but is still reachable via a cache (e.g. RedisJobStore's
+    // WeakRef) during a HITL resume/reconnect. Guard instead of dereferencing null.
+    if (this.messages == null) {
+      return undefined;
+    }
     return convertMessagesToContent(this.messages.slice(this.startIndex));
   }
 
@@ -1134,7 +1265,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getToolCount(): number {
     const context = this.agentContexts.get(this.defaultAgentId);
     return (
-      (context?.tools?.length ?? 0) + (context?.toolDefinitions?.length ?? 0)
+      (context?.tools?.length ?? 0) +
+      (context?.toolDefinitions?.length ?? 0) +
+      /**
+       * Graph-managed + host-supplied direct tools (handoff, subagent,
+       * `AgentInputs.graphTools`) are bound to the model and token-accounted,
+       * so a count that omits them under-reports the run's tool surface
+       * (Codex #289 P3).
+       */
+      (context?.graphTools?.length ?? 0)
     );
   }
 
@@ -1142,6 +1281,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * Get all run steps, optionally filtered by agent ID
    */
   getRunSteps(agentId?: string): t.RunStep[] {
+    // `contentData` can be null/undefined on a disposed-but-cached graph during a
+    // HITL resume/reconnect; without this guard `[...this.contentData]` throws
+    // "this.contentData is not iterable".
+    if (this.contentData == null) {
+      return [];
+    }
     if (agentId == null || agentId === '') {
       return [...this.contentData];
     }
@@ -1249,24 +1394,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         eventDrivenMode: true,
         sessions: this.sessions,
         toolDefinitions: toolDefMap,
-        agentId: agentContext?.agentId,
+        // `agentId` is the subagent-scope marker — set ONLY for child-run
+        // graphs (hooks fire for child scopes too, via the inherited
+        // run_id); `executingAgentId` always identifies the owning agent.
+        agentId: this.subagentScope ? agentContext?.agentId : undefined,
         executingAgentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
+        codeSessionToolNames: this.codeSessionToolNames,
         eagerEventToolExecutions: this.eagerEventToolExecutions,
         eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
           agentContext?.agentId
         ),
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
+        interruptingToolNames:
+          this.interruptingToolNames != null &&
+          this.interruptingToolNames.length > 0
+            ? new Set(this.interruptingToolNames)
+            : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
-        errorHandler: (data, metadata): Promise<void> =>
+        errorHandler: (data, metadata): Promise<boolean> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
       this.registerCompiledToolNode(node);
@@ -1279,10 +1433,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       graphTools && graphTools.length > 0
         ? [...baseTools, ...graphTools]
         : baseTools;
+    /**
+     * ToolNode treats a supplied `toolMap` as authoritative (it only derives
+     * one from `tools` when the param is undefined), so when graphTools force
+     * us to build a merged map here, an absent `currentToolMap` must be
+     * seeded from the BASE tools first — otherwise ordinary tools stay bound
+     * to the model but vanish from the execution map and every call to them
+     * fails as an unknown tool (Codex #289 round 2).
+     */
     const traditionalToolMap =
       graphTools && graphTools.length > 0
         ? new Map([
-          ...(currentToolMap ?? new Map()),
+          ...(currentToolMap ??
+              new Map(
+                baseTools
+                  .filter(
+                    (t): t is t.GenericTool & { name: string } => 'name' in t
+                  )
+                  .map((t) => [t.name, t] as [string, t.GenericTool])
+              )),
           ...graphTools
             .filter((t): t is t.GenericTool & { name: string } => 'name' in t)
             .map((t) => [t.name, t] as [string, t.GenericTool]),
@@ -1295,16 +1464,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       trace: traceToolNode,
       runLangfuse: this.langfuse,
       agentLangfuse: agentContext?.langfuse,
-      // `agentId` is intentionally left unset on this path (it is the
-      // subagent-scope marker); `executingAgentId` always identifies the owning
-      // agent so hooks can attribute the batch even at the top level.
+      // `agentId` is the subagent-scope marker — set ONLY for child-run
+      // graphs; `executingAgentId` always identifies the owning agent so
+      // hooks can attribute the batch even at the top level.
+      agentId: this.subagentScope ? agentContext?.agentId : undefined,
       executingAgentId: agentContext?.agentId,
       toolCallStepIds: this.toolCallStepIds,
-      errorHandler: (data, metadata): Promise<void> =>
+      errorHandler: (data, metadata): Promise<boolean> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
       toolExecution: this.toolExecution,
+      codeSessionToolNames: this.codeSessionToolNames,
+      interruptingToolNames:
+        this.interruptingToolNames != null &&
+        this.interruptingToolNames.length > 0
+          ? new Set(this.interruptingToolNames)
+          : undefined,
       hookRegistry: this.hookRegistry,
       humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
@@ -1356,6 +1532,82 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     client.abortHandler = undefined;
   }
 
+  /**
+   * Applies a context-overflow recovery plan and hands control to the
+   * summarize node, which compacts and then routes straight back here for a
+   * retry against the corrected budget.
+   *
+   * Returning the detour rather than rethrowing is the whole point: the
+   * caller never sees the provider's rejection, only a slightly longer turn.
+   */
+  private beginOverflowRecovery({
+    recovery,
+    agentContext,
+    agentId,
+    config,
+    originalToolContent,
+    estimatedPromptTokens,
+  }: {
+    recovery: OverflowRecoveryPlan;
+    agentContext: AgentContext;
+    agentId: string;
+    config?: RunnableConfig;
+    /** Masking record from the prune pass that built the rejected prompt. */
+    originalToolContent?: Map<number, string>;
+    /** Size of the rejected prompt, recorded to detect a correction that changed nothing. */
+    estimatedPromptTokens?: number;
+  }): Partial<t.AgentSubgraphState> {
+    const previousBudget = agentContext.maxContextTokens;
+    /**
+     * Deterministic compaction first. Re-pruning against the corrected budget
+     * raises context pressure, which is what drives the pruner's tool-output
+     * truncation and observation masking — no model call, no cost, and no
+     * message content lost. A summarization call is held back until that has
+     * been tried and the provider rejected the prompt again.
+     */
+    const allowSummarization = agentContext.shouldSummarizeOverflow();
+
+    agentContext.preserveOriginalToolContent(originalToolContent);
+    agentContext.applyContextBudgetCorrection(
+      recovery.budgetTokens,
+      estimatedPromptTokens
+    );
+    agentContext.applyObservedOverflowCalibration(
+      recovery.info.provider,
+      recovery.observedCalibrationRatio
+    );
+
+    emitAgentLog(
+      config,
+      'warn',
+      'graph',
+      'Provider rejected the prompt as too large — compacting and retrying',
+      {
+        kind: recovery.info.kind,
+        previousBudget,
+        recoveredBudget: recovery.budgetTokens,
+        providerReportedLimit: recovery.info.limitTokens,
+        providerReportedTokens: recovery.info.requestedTokens,
+        providerReportedPromptTokens: recovery.info.promptTokens,
+        observedCalibrationRatio: recovery.observedCalibrationRatio,
+        detectedBy: recovery.info.source,
+        attempt: agentContext.overflowRecoveryAttempts,
+        compaction: allowSummarization ? 'summarize' : 'compress',
+      },
+      { runId: this.runId, agentId },
+      { force: true }
+    );
+
+    return {
+      summarizationRequest: {
+        remainingContextTokens: 0,
+        agentId: agentId || agentContext.agentId,
+        reason: 'overflow',
+        allowSummarization,
+      },
+    };
+  }
+
   createCallModel(agentId = 'default') {
     return async (
       state: t.AgentSubgraphState,
@@ -1404,7 +1656,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolsForBinding =
           partitionAndMarkAnthropicToolCache(
             rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions)
+            makeIsDeferred(agentContext.toolDefinitions),
+            resolvePromptCacheTtl(
+              (
+                agentContext.clientOptions as
+                  | t.AnthropicClientOptions
+                  | undefined
+              )?.promptCacheTtl
+            )
           ) ?? rawToolsForBinding;
       } else if (
         agentContext.provider === Providers.OPENROUTER &&
@@ -1417,7 +1676,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolsForBinding =
           partitionAndMarkOpenRouterToolCache(
             rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions)
+            makeIsDeferred(agentContext.toolDefinitions),
+            resolvePromptCacheTtl(
+              (
+                agentContext.clientOptions as
+                  | t.ProviderOptionsMap[Providers.OPENROUTER]
+                  | undefined
+              )?.promptCacheTtl
+            )
           ) ?? rawToolsForBinding;
       } else if (
         agentContext.provider === Providers.BEDROCK &&
@@ -1427,11 +1693,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             | undefined
         )?.promptCache === true
       ) {
-        toolsForBinding =
-          partitionAndMarkBedrockToolCache(
-            rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions)
-          ) ?? rawToolsForBinding;
+        const bedrockModel = (
+          agentContext.clientOptions as { model?: string } | undefined
+        )?.model;
+        // An omitted model falls back to LangChain's default Claude model (which
+        // supports tool caching); only an explicit non-Claude model (e.g. Nova)
+        // skips tool marking so its stray marker never leaks into toolConfig.
+        if (bedrockModel == null || supportsBedrockToolCache(bedrockModel)) {
+          toolsForBinding =
+            partitionAndMarkBedrockToolCache(
+              rawToolsForBinding,
+              makeIsDeferred(agentContext.toolDefinitions)
+            ) ?? rawToolsForBinding;
+        }
       }
 
       const clientOptionsWithVision = {
@@ -1460,6 +1734,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       let messagesToUse = messages;
       let contextUsage: t.ContextUsageEvent | null = null;
+      /**
+       * Held outside the prune block so overflow recovery — which detours to
+       * the summarize node from the invoke catch below — can preserve the
+       * same masking record the configured trigger preserves.
+       */
+      let prunedOriginalToolContent: Map<number, string> | undefined;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -1496,7 +1776,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           messagesToRefine,
           prePruneContextTokens,
           remainingContextTokens,
-          originalToolContent,
+          newOriginalToolContent,
           calibrationRatio,
           resolvedInstructionOverhead,
           contextBudget,
@@ -1507,6 +1787,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           lastCallUsage: agentContext.lastCallUsage,
           totalTokensFresh: agentContext.totalTokensFresh,
         });
+        prunedOriginalToolContent = newOriginalToolContent;
+        /**
+         * Masking rewrites tool content in `state.messages` in place, so this
+         * map is the only surviving copy of the full output. Persist it on
+         * every prune, not just when a summary is about to be written — the
+         * pruner closure that produced it is discarded on the next reset, and
+         * with it any chance of a later summary restoring the real content.
+         * AgentContext bounds what accumulates.
+         */
+        agentContext.preserveOriginalToolContent(newOriginalToolContent);
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
@@ -1587,38 +1877,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             });
 
           if (triggerResult) {
-            if (originalToolContent != null && originalToolContent.size > 0) {
-              /**
-               * Merge — never overwrite — the pruner's masking record
-               * into pendingOriginalToolContent.  Carry-over entries
-               * from a prior summarize (preserved by the recency
-               * window for masked tool messages still in the tail) and
-               * the current pruner's new entries are both keyed by
-               * indices in the current `state.messages`, so a key-wise
-               * union is correct.  Overwriting would discard the
-               * carry-over and reduce summary fidelity when those
-               * masked tail messages eventually move into the head.
-               */
-              if (agentContext.pendingOriginalToolContent == null) {
-                agentContext.pendingOriginalToolContent = originalToolContent;
-              } else {
-                for (const [idx, content] of originalToolContent) {
-                  agentContext.pendingOriginalToolContent.set(idx, content);
-                }
-                /**
-                 * Re-apply the per-store char cap after the union.  The
-                 * pruner enforces ORIGINAL_CONTENT_MAX_CHARS inside its
-                 * own map via the onContentStored callback, but a
-                 * key-wise merge with recency carry-over bypasses that
-                 * accounting and could let the merged map grow without
-                 * bound across long sessions.
-                 */
-                enforceOriginalContentCap(
-                  agentContext.pendingOriginalToolContent
-                );
-              }
-            }
-
             emitAgentLog(
               config,
               'info',
@@ -1761,6 +2019,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      /**
+       * A destination that binds no tools is invoked without a tool schema, but
+       * in a multi-agent graph it can still inherit a prior agent's toolUse/
+       * toolResult history. Bedrock's Converse API (and other tool-schema-strict
+       * providers) reject such a request when no top-level toolConfig is sent.
+       * Fold that historical tool content into plain text so the tool-less agent
+       * receives valid, context-preserving messages. Handoff tools count as
+       * bound tools, so a tool-less router mid-handoff is not affected.
+       */
+      if (toolsForBinding == null || toolsForBinding.length === 0) {
+        finalMessages = foldToolBlocksForToollessAgent(finalMessages, config);
+        // The fold emits structured (array) content; re-flatten for agents that
+        // opted into string-only messages (`useLegacyContent`, run earlier at
+        // the top of this block) so the folded turn isn't the lone exception.
+        if (agentContext.useLegacyContent) {
+          finalMessages = formatContentStrings(finalMessages);
+        }
+      }
+
       // Determine the prompt-cache strategy up front. Two distinct facts:
       //
       //   `providerPromptCacheEnabled` — prompt caching is on for this provider
@@ -1782,6 +2059,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             | t.ProviderOptionsMap[Providers.OPENROUTER]
             | undefined
         )?.promptCache === true;
+      // Message/system cache points work on all cache-capable Bedrock models,
+      // including Nova (verified live: HTTP 200 with cacheWriteInputTokens). Only
+      // the tool checkpoint is Claude-only, so this is gated on promptCache alone.
       const bedrockPromptCacheEnabled =
         agentContext.provider === Providers.BEDROCK &&
         (
@@ -1840,9 +2120,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
         !agentContext.systemRunnable
       ) {
-        finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
+        finalMessages = addTailCacheControl<BaseMessage>(
+          finalMessages,
+          resolvePromptCacheTtl(
+            anthropicPromptCacheEnabled
+              ? (
+                  agentContext.clientOptions as
+                    | t.AnthropicClientOptions
+                    | undefined
+              )?.promptCacheTtl
+              : (
+                  agentContext.clientOptions as
+                    | t.ProviderOptionsMap[Providers.OPENROUTER]
+                    | undefined
+              )?.promptCacheTtl
+          )
+        );
       } else if (bedrockPromptCacheEnabled) {
-        finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
+        const bedrockOptions = agentContext.clientOptions as
+          | t.BedrockAnthropicClientOptions
+          | undefined;
+        // Non-Claude models (Nova) reject the extended 1h TTL, so resolve it
+        // against the model — message/system caching stays on, clamped to 5m.
+        finalMessages = addBedrockTailCacheControl<BaseMessage>(
+          finalMessages,
+          resolveBedrockPromptCacheTtl(
+            bedrockOptions?.promptCacheTtl,
+            (bedrockOptions as { model?: string } | undefined)?.model
+          )
+        );
       }
 
       if (
@@ -2032,6 +2338,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           sessionId: config.configurable?.thread_id as string | undefined,
           traceMetadata,
           tags: ['librechat', 'agent'],
+          traceIdSeed:
+            langfuse?.deterministicTraceId === true ? this.runId : undefined,
         });
         if (langfuseHandler != null) {
           invokeConfig = {
@@ -2045,8 +2353,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const metadata = config.metadata as Record<string, unknown>;
 
       try {
-        result = await withLangfuseToolOutputTracingConfig(
-          this.langfuse,
+        result = await withLangfuseRuntimeScope(
+          resolveLangfuseRuntimeScope({
+            runLangfuse: this.langfuse,
+            langfuseOverlay: agentContext.langfuse,
+          }),
           () =>
             attemptInvoke(
               {
@@ -2056,27 +2367,172 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 context: this,
               },
               invokeConfig
-            ),
-          agentContext.langfuse
+            )
         );
       } catch (primaryError) {
         clearCurrentDeltaStepMarkers({
           graph: this,
           metadata,
         });
-        result = await withLangfuseToolOutputTracingConfig(
-          this.langfuse,
-          () =>
-            tryFallbackProviders({
-              fallbacks,
-              tools: agentContext.tools,
-              messages: finalMessages,
-              config: invokeConfig,
-              primaryError,
-              context: this,
-            }),
-          agentContext.langfuse
+        /**
+         * A context overflow is a deterministic consequence of the payload,
+         * not a provider being unavailable — so it is answered by compacting
+         * and retrying rather than by re-sending the same oversized prompt
+         * down the fallback chain. Fallbacks still run for every other
+         * failure, and for an overflow whose recovery budget is spent.
+         */
+        /**
+         * Compaction has to have something to work with. Without a token
+         * counter there is no pruner, and with summarization disabled the
+         * summarize node deliberately no-ops — so in that combination the
+         * retry would resend a byte-identical prompt. Skipping the detour
+         * keeps the original error and one round trip instead of three.
+         */
+        const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
+
+        /**
+         * A previous correction that left the prompt no smaller proves this
+         * state has nothing left to compact — an emptied message list whose
+         * content rides along in an injected summary, for instance. Measuring
+         * that beats trying to predict every such configuration.
+         */
+        const recoveryStalled = agentContext.overflowRecoveryStalled(
+          estimatedPromptTokens
         );
+        const canSummarizeOverflow =
+          agentContext.summarizationEnabled === true &&
+          splitAtRecencyBoundary(messages, {
+            turns:
+              agentContext.summarizationConfig?.retainRecent?.turns ??
+              DEFAULT_RETAIN_RECENT_TURNS,
+            tokens: agentContext.summarizationConfig?.retainRecent?.tokens,
+            tokenCounter: agentContext.tokenCounter,
+          }).head.length > 0;
+
+        const planRecovery = (
+          error: unknown,
+          attributedFallbackContext?: FallbackErrorContext
+        ): OverflowRecoveryPlan | null => {
+          if (recoveryStalled) {
+            return null;
+          }
+          /**
+           * When the rejection came from a fallback, plan against *that*
+           * client: its window and output allowance are why it was configured
+           * as an alternative in the first place.
+           */
+          const fallbackContext =
+            attributedFallbackContext ?? getFallbackErrorContext(error);
+          const recovery = planContextOverflowRecovery({
+            error,
+            provider: fallbackContext?.provider ?? agentContext.provider,
+            maxContextTokens:
+              fallbackContext?.maxContextTokens ??
+              agentContext.maxContextTokens,
+            estimatedPromptTokens,
+            calibrationRatio: agentContext.calibrationRatio,
+            instructionTokens: agentContext.instructionTokens,
+            canSummarize: agentContext.summarizationEnabled === true,
+            configuredCompletionTokens: getConfiguredCompletionTokens(
+              fallbackContext?.clientOptions ?? agentContext.clientOptions
+            ),
+            attemptsSoFar: agentContext.overflowRecoveryAttempts,
+          });
+          if (recovery == null) {
+            return null;
+          }
+          const translatedRecovery =
+            fallbackContext != null
+              ? {
+                ...recovery,
+                budgetTokens: minDefined(
+                  getBlindRecoveryBudget(agentContext.maxContextTokens),
+                  translateRecoveryBudget(
+                    recovery.budgetTokens,
+                    recovery.observedCalibrationRatio ??
+                        CALIBRATION_RATIO_MAX,
+                    agentContext.calibrationRatio
+                  )
+                ),
+                observedCalibrationRatio: undefined,
+              }
+              : recovery;
+          const canReduceContext =
+            canSummarizeOverflow ||
+            (agentContext.tokenCounter != null &&
+              translatedRecovery.budgetTokens != null);
+          return canReduceContext ? translatedRecovery : null;
+        };
+
+        const recovery = planRecovery(primaryError);
+        if (recovery != null) {
+          return this.beginOverflowRecovery({
+            recovery,
+            agentContext,
+            agentId,
+            config,
+            originalToolContent: prunedOriginalToolContent,
+            estimatedPromptTokens,
+          });
+        }
+
+        /**
+         * A fallback can reject the same prompt as too large even when the
+         * primary failed for an unrelated reason — a fallback with a smaller
+         * window is the obvious case. Planning against the exhausted-chain
+         * error keeps that path recoverable instead of surfacing it.
+         */
+        try {
+          result = await withLangfuseRuntimeScope(
+            resolveLangfuseRuntimeScope({
+              runLangfuse: this.langfuse,
+              langfuseOverlay: agentContext.langfuse,
+            }),
+            () =>
+              tryFallbackProviders({
+                fallbacks,
+                tools: agentContext.tools,
+                messages: finalMessages,
+                config: invokeConfig,
+                primaryError,
+                context: this,
+                /**
+                 * Lets the chain recognise a fallback overflow whose signature
+                 * carries no reason of its own (Vertex AI's bare 400) and
+                 * surface it rather than a later unrelated failure.
+                 */
+                overflowContext: {
+                  provider: agentContext.provider,
+                  estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
+                  maxContextTokens: agentContext.maxContextTokens,
+                },
+              })
+          );
+        } catch (fallbackError) {
+          const overflowCandidates =
+            getFallbackOverflowCandidates(fallbackError);
+          let fallbackRecovery: OverflowRecoveryPlan | null = null;
+          for (const candidate of overflowCandidates) {
+            fallbackRecovery = planRecovery(candidate.error, candidate.context);
+            if (fallbackRecovery != null) {
+              break;
+            }
+          }
+          if (overflowCandidates.length === 0) {
+            fallbackRecovery = planRecovery(fallbackError);
+          }
+          if (fallbackRecovery == null) {
+            throw fallbackError;
+          }
+          return this.beginOverflowRecovery({
+            recovery: fallbackRecovery,
+            agentContext,
+            agentId,
+            config,
+            originalToolContent: prunedOriginalToolContent,
+            estimatedPromptTokens,
+          });
+        }
       } finally {
         await disposeLangfuseHandler(langfuseHandler);
       }
@@ -2253,7 +2709,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       );
       if (resolvedConfigs.length > 0) {
         const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
-          this.handlerRegistry;
+          this.handlerRegistry ?? this.parentToolHandlerRegistry;
         const executor = new SubagentExecutor({
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
@@ -2270,6 +2726,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
+            const toolHandlerRegistry = createToolHandlerRegistry(
+              getParentHandlerRegistry()
+            );
             childGraph.hookRegistry = this.hookRegistry;
             /**
              * Do not propagate `humanInTheLoop` into the child graph yet:
@@ -2279,10 +2738,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
              */
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
+            childGraph.codeSessionToolNames = this.codeSessionToolNames;
+            // Pure execution-ordering hint (unlike `humanInTheLoop` above).
+            // It ONLY reorders tools already in the child's direct group;
+            // it does not force a name onto the direct path (that fold-in
+            // was removed — Codex review of #294). So for a self-spawned
+            // child that scrubs inherited `graphTools` (keeping only the
+            // event `toolDefinition` / schema-only stub for a name like
+            // `ask_user_question`), the name isn't in the child's direct
+            // group and this is a no-op — the stub is still dispatched via
+            // ON_TOOL_EXECUTE, never invoked directly. Where the child DOES
+            // have the executable graphTool, the guard correctly applies.
+            childGraph.interruptingToolNames = this.interruptingToolNames;
             childGraph.toolExecution = this.toolExecution;
+            childGraph.parentToolHandlerRegistry = toolHandlerRegistry;
             childGraph.eventToolExecutionAvailable =
-              this.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
-              null;
+              toolHandlerRegistry != null;
             return childGraph;
           },
         });
@@ -2420,10 +2891,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
             dispatchRunStep: async (runStep, nodeConfig) => {
+              const resolvedConfig = nodeConfig ?? this.config;
+              if (runStep.agentId != null) {
+                const groupId = this.resolveParallelGroupId(
+                  runStep.agentId,
+                  resolvedConfig?.metadata
+                );
+                if (groupId != null) {
+                  runStep.groupId = groupId;
+                }
+              }
               this.contentData.push(runStep);
               this.contentIndexMap.set(runStep.id, runStep.index);
 
-              const resolvedConfig = nodeConfig ?? this.config;
               const handler = this.handlerRegistry?.getHandler(
                 GraphEvents.ON_RUN_STEP
               );
@@ -2493,6 +2973,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
+    this.hasCompiledCheckpointer = this.compileOptions?.checkpointer != null;
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
@@ -2543,6 +3024,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return undefined;
   }
 
+  protected resolveParallelGroupId(
+    agentId: string,
+    metadata?: Record<string, unknown>
+  ): number | undefined {
+    if (
+      metadata == null ||
+      !Object.prototype.hasOwnProperty.call(
+        metadata,
+        Constants.HANDOFF_GROUP_ID
+      )
+    ) {
+      return this.getParallelGroupIdForAgent(agentId);
+    }
+    const runtimeGroupId = metadata[Constants.HANDOFF_GROUP_ID];
+    if (runtimeGroupId === null) {
+      return undefined;
+    }
+    if (
+      typeof runtimeGroupId === 'number' &&
+      Number.isSafeInteger(runtimeGroupId) &&
+      runtimeGroupId > 0
+    ) {
+      return runtimeGroupId;
+    }
+    return this.getParallelGroupIdForAgent(agentId);
+  }
+
   /* Dispatchers */
 
   /**
@@ -2587,7 +3095,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const agentContext = this.getAgentContext(metadata);
         if (this.isMultiAgentGraph() && agentContext.agentId) {
           runStep.agentId = agentContext.agentId;
-          const groupId = this.getParallelGroupIdForAgent(agentContext.agentId);
+          const groupId = this.resolveParallelGroupId(
+            agentContext.agentId,
+            metadata
+          );
           if (groupId != null) {
             runStep.groupId = groupId;
           }
@@ -2633,32 +3144,38 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /**
    * Static version of handleToolCallError to avoid creating strong references
-   * that prevent garbage collection
+   * that prevent garbage collection.
+   *
+   * Returns whether the error completion event was actually dispatched. A
+   * tool can error before this graph instance has a run step for the call —
+   * on a resume pass the interrupted batch re-executes IMMEDIATELY on graph
+   * re-entry, before any step replay has registered `toolCallStepIds` (a
+   * fast-failing tool, e.g. a schema-validation reject, loses that race).
+   * That is a caller-recoverable condition, not an invariant violation: the
+   * ToolNode falls back to its normal completion dispatch for the error
+   * ToolMessage when this returns `false`, so throwing here would only
+   * replace a recoverable miss with a lost completion event and a scary log.
    */
   static async handleToolCallErrorStatic(
     graph: StandardGraph,
     data: t.ToolErrorData,
     metadata?: Record<string, unknown>
-  ): Promise<void> {
-    if (!graph.config) {
-      throw new Error('No config provided');
-    }
-
+  ): Promise<boolean> {
     if (!data.id) {
       console.warn('No Tool ID provided for Tool Error');
-      return;
+      return false;
     }
 
     const stepId = graph.toolCallStepIds.get(data.id) ?? '';
     if (!stepId) {
-      throw new Error(`No stepId found for tool_call_id ${data.id}`);
+      return false;
     }
 
     const { name, input: args, error } = data;
 
     const runStep = graph.getRunStep(stepId);
     if (!runStep) {
-      throw new Error(`No run step found for stepId ${stepId}`);
+      return false;
     }
 
     const tool_call: t.ProcessedToolCall = {
@@ -2669,21 +3186,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       progress: 1,
     };
 
-    await graph.handlerRegistry
-      ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
-      ?.handle(
-        GraphEvents.ON_RUN_STEP_COMPLETED,
-        {
-          result: {
-            id: stepId,
-            index: runStep.index,
-            type: 'tool_call',
-            tool_call,
-          } as t.ToolCompleteEvent,
-        },
-        metadata,
-        graph
-      );
+    // No registered ON_RUN_STEP_COMPLETED handler ⇒ nothing was dispatched.
+    // Report `false` so the ToolNode runs its own fallback dispatch; returning
+    // `true` here would silently drop the error completion for hosts that wire
+    // completions through callback-based custom events instead of a handler.
+    const handler = graph.handlerRegistry?.getHandler(
+      GraphEvents.ON_RUN_STEP_COMPLETED
+    );
+    if (!handler) {
+      return false;
+    }
+
+    await handler.handle(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: stepId,
+          index: runStep.index,
+          type: 'tool_call',
+          tool_call,
+        } as t.ToolCompleteEvent,
+      },
+      metadata,
+      graph
+    );
+    return true;
   }
 
   /**
@@ -2693,8 +3220,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   async handleToolCallError(
     data: t.ToolErrorData,
     metadata?: Record<string, unknown>
-  ): Promise<void> {
-    await StandardGraph.handleToolCallErrorStatic(this, data, metadata);
+  ): Promise<boolean> {
+    return StandardGraph.handleToolCallErrorStatic(this, data, metadata);
   }
 
   async dispatchRunStepDelta(

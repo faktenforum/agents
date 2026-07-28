@@ -3,6 +3,7 @@ import { createTwoFilesPatch } from 'diff';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import {
   createLocalBashProgrammaticToolCallingTool,
   createLocalProgrammaticToolCallingTool,
@@ -49,7 +50,7 @@ export const LocalListDirectoryToolName = Constants.LIST_DIRECTORY;
 export const LocalReadFileToolSchema: t.JsonSchemaType = {
   type: 'object',
   properties: {
-    file_path: {
+    path: {
       type: 'string',
       description:
         'Path to a local file, relative to the configured cwd unless absolute paths are allowed.',
@@ -63,13 +64,13 @@ export const LocalReadFileToolSchema: t.JsonSchemaType = {
       description: 'Optional maximum number of lines to return.',
     },
   },
-  required: ['file_path'],
+  required: ['path'],
 };
 
 export const LocalWriteFileToolSchema: t.JsonSchemaType = {
   type: 'object',
   properties: {
-    file_path: {
+    path: {
       type: 'string',
       description:
         'Path to write, relative to the configured cwd unless absolute paths are allowed.',
@@ -79,13 +80,13 @@ export const LocalWriteFileToolSchema: t.JsonSchemaType = {
       description: 'Complete file contents to write.',
     },
   },
-  required: ['file_path', 'content'],
+  required: ['path', 'content'],
 };
 
 export const LocalEditFileToolSchema: t.JsonSchemaType = {
   type: 'object',
   properties: {
-    file_path: {
+    path: {
       type: 'string',
       description:
         'Path to edit, relative to the configured cwd unless absolute paths are allowed.',
@@ -112,7 +113,7 @@ export const LocalEditFileToolSchema: t.JsonSchemaType = {
       },
     },
   },
-  required: ['file_path'],
+  required: ['path'],
 };
 
 export const LocalGrepSearchToolSchema: t.JsonSchemaType = {
@@ -294,8 +295,14 @@ async function revertStrictWrite(
     } else {
       await fs.unlink(path);
     }
-  } catch {
-    /* best-effort: caller still sees the original syntax error */
+  } catch (error) {
+    // A timed-out revert leaves the rejected write on disk — the caller would
+    // otherwise claim "reverted to pre-write state" while the bad bytes remain.
+    // Surface it; for other failures stay best-effort (caller sees the original
+    // syntax error).
+    if (isWorkspaceClientTimeoutError(error)) {
+      throw error;
+    }
   }
 }
 
@@ -391,18 +398,18 @@ export function createLocalReadFileTool(
   return tool(
     async (rawInput) => {
       const input = rawInput as {
-        file_path: string;
+        path: string;
         offset?: number;
         limit?: number;
       };
       const path = await resolveWorkspacePathSafe(
-        input.file_path,
+        input.path,
         config,
         'read'
       );
       const fileStat = await fs.stat(path);
       if (!fileStat.isFile()) {
-        throw new Error(`Path is not a file: ${input.file_path}`);
+        throw new Error(`Path is not a file: ${input.path}`);
       }
       const maxBytes = Math.max(
         config.maxReadBytes ?? DEFAULT_MAX_READ_BYTES,
@@ -514,12 +521,12 @@ export function createLocalWriteFileTool(
   const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
-      const input = rawInput as { file_path: string; content: string };
+      const input = rawInput as { path: string; content: string };
       if (config.readOnly === true) {
         throw new Error('write_file is blocked in read-only local mode.');
       }
       const path = await resolveWorkspacePathSafe(
-        input.file_path,
+        input.path,
         config,
         'write'
       );
@@ -538,7 +545,12 @@ export function createLocalWriteFileTool(
         before = decoded.text;
         encoding = decoded;
         existed = true;
-      } catch {
+      } catch (error) {
+        // A stalled-RPC timeout is NOT "file absent" — treating it as such would
+        // overwrite an existing file with fresh content. Surface it instead.
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
         existed = false;
       }
 
@@ -546,7 +558,21 @@ export function createLocalWriteFileTool(
       const finalText = encodeFile(input.content, encoding);
       await fs.writeFile(path, finalText, 'utf8');
 
-      const syntax = await maybeRunSyntaxCheck(path, config);
+      let syntax;
+      try {
+        syntax = await maybeRunSyntaxCheck(path, config);
+      } catch (error) {
+        // A validation-read timeout must still honor strict mode's revert
+        // contract: restore the pre-write state before surfacing (best-effort —
+        // the revert may itself time out on the same stalled container).
+        if (
+          isWorkspaceClientTimeoutError(error) &&
+          config.postEditSyntaxCheck === 'strict'
+        ) {
+          await revertStrictWrite(fs, path, existed, before, encoding);
+        }
+        throw error;
+      }
 
       const diff = existed
         ? summariseDiff(path, before, input.content)
@@ -598,7 +624,7 @@ export function createLocalEditFileTool(
   return tool(
     async (rawInput) => {
       const input = rawInput as {
-        file_path: string;
+        path: string;
         old_text?: string;
         new_text?: string;
         edits?: Array<{ old_text?: string; new_text?: string }>;
@@ -612,7 +638,7 @@ export function createLocalEditFileTool(
       }
 
       const path = await resolveWorkspacePathSafe(
-        input.file_path,
+        input.path,
         config,
         'write'
       );
@@ -627,7 +653,7 @@ export function createLocalEditFileTool(
         const match = locateEdit(next, edit.oldText);
         if (match == null) {
           throw new Error(
-            `Edit ${i + 1}/${edits.length}: could not locate old_text in ${input.file_path}. ` +
+            `Edit ${i + 1}/${edits.length}: could not locate old_text in ${input.path}. ` +
               'Tried exact, line-trimmed, whitespace-normalized, and indentation-flexible matching. ' +
               'Re-read the file and copy the literal lines.'
           );
@@ -642,7 +668,20 @@ export function createLocalEditFileTool(
       const finalText = encodeFile(next, encoding);
       await fs.writeFile(path, finalText, 'utf8');
 
-      const syntax = await maybeRunSyntaxCheck(path, config);
+      let syntax;
+      try {
+        syntax = await maybeRunSyntaxCheck(path, config);
+      } catch (error) {
+        // As in write_file: a validation-read timeout still triggers strict
+        // mode's revert (edit_file always operates on an existing file).
+        if (
+          isWorkspaceClientTimeoutError(error) &&
+          config.postEditSyntaxCheck === 'strict'
+        ) {
+          await revertStrictWrite(fs, path, true, original, encoding);
+        }
+        throw error;
+      }
 
       const diff = summariseDiff(path, original, next);
       const fuzzy = strategiesUsed.some((s) => s !== 'exact');
@@ -826,7 +865,12 @@ async function* walkFiles(
     let entries;
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout must surface, not be silently skipped as an
+      // unreadable directory — that would corrupt search results ("no matches").
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     for (const entry of entries) {
@@ -1009,7 +1053,12 @@ async function fallbackGrep(
     let stat;
     try {
       stat = await fs.stat(file);
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout must surface, not be skipped — skipping a file can
+      // report "no matches" even when the (unreadable-due-to-stall) file matched.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     if (stat.size > FALLBACK_GREP_MAX_FILE_BYTES) {
@@ -1021,7 +1070,11 @@ async function fallbackGrep(
     let content;
     try {
       content = await fs.readFile(file, 'utf8');
-    } catch {
+    } catch (error) {
+      // As above: a client-timeout means a stalled read, not an unreadable file.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     if (content.includes('\0')) {

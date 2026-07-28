@@ -9,36 +9,43 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import {
+  addTailCacheControl,
+  addCacheControlToStablePrefixMessages,
+  buildAnthropicCacheControl,
+  buildBedrockCachePoint,
+  resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
+  cloneMessage,
+  type PromptCacheTtl,
+} from '@/messages/cache';
+import {
+  DEFAULT_RESERVE_RATIO,
+  ORIGINAL_CONTENT_MAX_CHARS,
+  clampCalibrationRatio,
+  createPruneMessages,
+  syncBudgetDerivedFields,
+} from '@/messages';
+import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
   Constants,
   Providers,
 } from '@/common';
-import {
-  addTailCacheControl,
-  addCacheControlToStablePrefixMessages,
-  cloneMessage,
-} from '@/messages/cache';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
-import {
-  DEFAULT_RESERVE_RATIO,
-  createPruneMessages,
-  syncBudgetDerivedFields,
-} from '@/messages';
 import { isThinkingEnabled } from '@/llm/request';
 import { toJsonSchema } from '@/utils/schema';
 
 type AgentSystemTextBlock = {
   type: 'text';
   text: string;
-  cache_control?: { type: 'ephemeral' };
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' };
 };
 
 type AgentSystemContentBlock =
   | AgentSystemTextBlock
-  | { cachePoint: { type: 'default' } };
+  | { cachePoint: { type: 'default'; ttl?: '1h' } };
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 
@@ -81,6 +88,7 @@ export class AgentContext {
       toolSchemaTokens,
       subagentConfigs,
       maxSubagentDepth,
+      graphTools,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -113,6 +121,14 @@ export class AgentContext {
     agentContext._sourceInputs = agentConfig;
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
+    /**
+     * Host-supplied direct tools (see `AgentInputs.graphTools`). Copied — never
+     * aliased — because the SDK later pushes graph-managed tools (handoff /
+     * subagent) into this same array and must not mutate the host's input.
+     */
+    if (graphTools && graphTools.length > 0) {
+      agentContext.graphTools = [...graphTools];
+    }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setInitialSummary(
@@ -208,8 +224,22 @@ export class AgentContext {
   calibrationRatio: number = 1;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
   resolvedInstructionOverhead?: number;
+  private _pendingOriginalToolContent?: Map<number, string>;
+  private pendingOriginalToolContentChars = 0;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
-  pendingOriginalToolContent?: Map<number, string>;
+  get pendingOriginalToolContent(): Map<number, string> | undefined {
+    return this._pendingOriginalToolContent;
+  }
+  set pendingOriginalToolContent(value: Map<number, string> | undefined) {
+    this._pendingOriginalToolContent = value;
+    this.pendingOriginalToolContentChars = 0;
+    if (value != null) {
+      for (const content of value.values()) {
+        this.pendingOriginalToolContentChars += content.length;
+      }
+      this.enforcePendingOriginalContentCap();
+    }
+  }
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
@@ -315,6 +345,25 @@ export class AgentContext {
    * Defaults to false if not explicitly set.
    */
   vision?: boolean;
+  /**
+   * Forced compactions performed after a provider rejected a prompt as too
+   * large. Bounds the recovery loop so a model that keeps refusing cannot
+   * make the run compact indefinitely.
+   */
+  private _overflowRecoveryAttempts: number = 0;
+  /**
+   * Budget in force before the first overflow correction of the current run.
+   * Recorded so `reset()` can undo the correction for the next run without
+   * disturbing a `maxContextTokens` that no correction ever touched.
+   */
+  private _preOverflowMaxContextTokens?: number;
+  /**
+   * Prompt size, normalized into the local counter's uncalibrated units, at
+   * the last overflow correction. Keeping both measurements in the same units
+   * lets a later overflow prove whether compaction changed anything even when
+   * the provider observation updated calibration between attempts.
+   */
+  private _lastOverflowPromptTokens?: number;
   /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
@@ -699,7 +748,10 @@ export class AgentContext {
         dynamicTail.length === 0 &&
         body.length >= 2
       ) {
-        body = addTailCacheControl(body);
+        body = addTailCacheControl(
+          body,
+          this.getPromptCacheTtl(promptCacheProvider)
+        );
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
@@ -723,7 +775,9 @@ export class AgentContext {
         {
           type: 'text',
           text: wrappedSummary,
-          cache_control: { type: 'ephemeral' },
+          cache_control: buildAnthropicCacheControl(
+            this.getPromptCacheTtl(Providers.ANTHROPIC)
+          ),
         },
       ],
     });
@@ -770,7 +824,10 @@ export class AgentContext {
     );
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
-    const cacheablePrefix = this.addStablePromptCacheMarkers(stablePrefix);
+    const cacheablePrefix = this.addStablePromptCacheMarkers(
+      stablePrefix,
+      this.getPromptCacheTtl(promptCacheProvider)
+    );
 
     return [...cacheablePrefix, ...tail, ...trailingMessages];
   }
@@ -801,14 +858,17 @@ export class AgentContext {
     return messages.length;
   }
 
-  private addStablePromptCacheMarkers(messages: BaseMessage[]): BaseMessage[] {
+  private addStablePromptCacheMarkers(
+    messages: BaseMessage[],
+    ttl?: PromptCacheTtl
+  ): BaseMessage[] {
     if (messages.length <= 1) {
       return messages;
     }
 
     return [
       messages[0],
-      ...addCacheControlToStablePrefixMessages(messages.slice(1), 2),
+      ...addCacheControlToStablePrefixMessages(messages.slice(1), 2, ttl),
     ];
   }
 
@@ -841,7 +901,41 @@ export class AgentContext {
     const bedrockOptions = this.clientOptions as
       | t.BedrockAnthropicClientOptions
       | undefined;
+    // Nova accepts system/message cachePoints (only the tool checkpoint is
+    // Claude-only), so this is gated on promptCache alone.
     return bedrockOptions?.promptCache === true;
+  }
+
+  /**
+   * Resolved TTL for the active prompt-cache provider (Anthropic or OpenRouter).
+   * Both expose `promptCacheTtl` and use the Anthropic `cache_control` format, so
+   * the configured value resolves the same way (default `'1h'` extended cache).
+   */
+  private getPromptCacheTtl(
+    provider: PromptCacheProvider | undefined
+  ): PromptCacheTtl | undefined {
+    if (provider == null) {
+      return undefined;
+    }
+    return resolvePromptCacheTtl(
+      (this.clientOptions as { promptCacheTtl?: PromptCacheTtl } | undefined)
+        ?.promptCacheTtl
+    );
+  }
+
+  /**
+   * Resolved TTL for Bedrock prompt-cache checkpoints (default `'1h'` on Claude).
+   * Claude models downgrade an unsupported 1h to 5m server-side; non-Claude
+   * models (Nova) reject the extended TTL, so they are clamped to 5m.
+   */
+  private getBedrockPromptCacheTtl(): PromptCacheTtl {
+    const bedrockOptions = this.clientOptions as
+      | t.BedrockAnthropicClientOptions
+      | undefined;
+    return resolveBedrockPromptCacheTtl(
+      bedrockOptions?.promptCacheTtl,
+      (bedrockOptions as { model?: string } | undefined)?.model
+    );
   }
 
   private buildSystemMessage({
@@ -865,7 +959,9 @@ export class AgentContext {
         content.push({
           type: 'text',
           text: stableInstructions,
-          cache_control: { type: 'ephemeral' },
+          cache_control: buildAnthropicCacheControl(
+            this.getPromptCacheTtl(promptCacheProvider)
+          ),
         });
       }
       if (dynamicInstructions && !shouldMoveDynamicInstructions) {
@@ -884,7 +980,9 @@ export class AgentContext {
           {
             type: 'text',
             text: stableInstructions,
-            cache_control: { type: 'ephemeral' },
+            cache_control: buildAnthropicCacheControl(
+              this.getPromptCacheTtl(promptCacheProvider)
+            ),
           },
         ],
       } as BaseMessageFields);
@@ -893,7 +991,7 @@ export class AgentContext {
     if (this.hasBedrockPromptCache() && stableInstructions) {
       const content: AgentSystemContentBlock[] = [
         { type: 'text', text: stableInstructions },
-        { cachePoint: { type: 'default' } },
+        { cachePoint: buildBedrockCachePoint(this.getBedrockPromptCacheTtl()) },
       ];
       if (dynamicInstructions) {
         content.push({ type: 'text', text: dynamicInstructions });
@@ -911,7 +1009,7 @@ export class AgentContext {
   /**
    * Reset context for a new run
    */
-  reset(): void {
+  reset(options?: { preserveOriginalToolContent?: boolean }): void {
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
@@ -929,12 +1027,16 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
+    if (options?.preserveOriginalToolContent !== true) {
+      this.pendingOriginalToolContent = undefined;
+    }
 
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
     this._lastSummarizationMsgCount = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
+    this.restoreContextBudgetAfterOverflow();
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -1253,6 +1355,148 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
+  }
+
+  get overflowRecoveryAttempts(): number {
+    return this._overflowRecoveryAttempts;
+  }
+
+  shouldSummarizeOverflow(): boolean {
+    return (
+      this.summarizationEnabled === true &&
+      (this.tokenCounter == null ||
+        this.maxContextTokens == null ||
+        this._overflowRecoveryAttempts > 0)
+    );
+  }
+
+  /** Preserves the earliest full tool output recorded for each message index. */
+  preserveOriginalToolContent(
+    originalToolContent: Map<number, string> | undefined
+  ): void {
+    if (originalToolContent == null || originalToolContent.size === 0) {
+      return;
+    }
+    if (this.pendingOriginalToolContent == null) {
+      this.pendingOriginalToolContent = new Map();
+    }
+    for (const [index, content] of originalToolContent) {
+      if (!this.pendingOriginalToolContent.has(index)) {
+        this.pendingOriginalToolContent.set(index, content);
+        this.pendingOriginalToolContentChars += content.length;
+      }
+    }
+    this.enforcePendingOriginalContentCap();
+  }
+
+  private enforcePendingOriginalContentCap(): void {
+    const pending = this._pendingOriginalToolContent;
+    if (pending == null) {
+      return;
+    }
+    while (
+      this.pendingOriginalToolContentChars > ORIGINAL_CONTENT_MAX_CHARS &&
+      pending.size > 0
+    ) {
+      const oldest = pending.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      const removed = pending.get(oldest.value);
+      if (removed != null) {
+        this.pendingOriginalToolContentChars -= removed.length;
+      }
+      pending.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Retargets the context budget after a provider rejected the prompt as too
+   * large, and clears the memoized pruner so the next call is planned against
+   * the corrected budget rather than the one that was evidently wrong.
+   *
+   * Also clears the "already summarized at this message count" guard: that
+   * guard exists to stop redundant summarization of an unchanged history, but
+   * here the history has not changed and compaction is exactly what is
+   * needed.
+   */
+  applyContextBudgetCorrection(
+    budgetTokens: number | undefined,
+    promptTokens?: number
+  ): void {
+    if (this._overflowRecoveryAttempts === 0) {
+      this._preOverflowMaxContextTokens = this.maxContextTokens;
+    }
+    if (budgetTokens != null) {
+      this.maxContextTokens = budgetTokens;
+    }
+    this.pruneMessages = undefined;
+    this._lastSummarizationMsgCount = 0;
+    this._lastOverflowPromptTokens =
+      promptTokens != null
+        ? this.normalizePromptTokens(promptTokens)
+        : promptTokens;
+    this._overflowRecoveryAttempts += 1;
+  }
+
+  /** Applies token calibration only when the observation came from this provider. */
+  applyObservedOverflowCalibration(
+    provider: Providers | undefined,
+    observedCalibrationRatio: number | undefined
+  ): void {
+    if (
+      provider !== this.provider ||
+      observedCalibrationRatio == null ||
+      observedCalibrationRatio <= 0
+    ) {
+      return;
+    }
+    this.calibrationRatio = clampCalibrationRatio(observedCalibrationRatio);
+  }
+
+  /**
+   * True when a previous correction failed to make the prompt any smaller —
+   * the signature of a state nothing can compact further (an emptied message
+   * list carrying its content in an injected summary, for example). Retrying
+   * from there resends a byte-identical prompt, so the caller should stop.
+   */
+  overflowRecoveryStalled(currentPromptTokens?: number): boolean {
+    const previous = this._lastOverflowPromptTokens;
+    if (
+      previous == null ||
+      currentPromptTokens == null ||
+      !Number.isFinite(currentPromptTokens)
+    ) {
+      return false;
+    }
+    const rawCurrent = this.normalizePromptTokens(currentPromptTokens);
+    return rawCurrent >= previous;
+  }
+
+  private normalizePromptTokens(promptTokens: number): number {
+    if (this.calibrationRatio <= 0) {
+      return promptTokens;
+    }
+    const messageTokens = Math.max(0, promptTokens - this.instructionTokens);
+    return this.instructionTokens + messageTokens / this.calibrationRatio;
+  }
+
+  /**
+   * Undoes overflow corrections so a reused context starts the next run with
+   * the budget it was configured with and a fresh recovery allowance.
+   *
+   * Without this, a single overflow would permanently shrink the budget for
+   * every later turn, and two would exhaust the per-run allowance for the
+   * lifetime of the context.
+   */
+  private restoreContextBudgetAfterOverflow(): void {
+    if (this._overflowRecoveryAttempts === 0) {
+      return;
+    }
+    this.maxContextTokens = this._preOverflowMaxContextTokens;
+    this._preOverflowMaxContextTokens = undefined;
+    this._lastOverflowPromptTokens = undefined;
+    this._overflowRecoveryAttempts = 0;
   }
 
   clearSummary(): void {

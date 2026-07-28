@@ -130,9 +130,21 @@ jobs:
           BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
 
   summarization-tests:
-    name: 'summarization tests'
+    name: 'summarization tests (${{ matrix.group }})'
     needs: install
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: anthropic
+            pattern: 'Anthropic Summarization E2E|Token accounting audit'
+          - group: openai
+            pattern: 'OpenAI Summarization E2E'
+          - group: bedrock
+            pattern: 'Bedrock Summarization E2E'
+          - group: local
+            pattern: 'no API keys'
     steps:
       - uses: actions/checkout@v4
 
@@ -146,8 +158,8 @@ jobs:
           path: node_modules
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
-      - name: Run summarization tests
-        run: npx jest src/specs/summarization.test.ts --maxWorkers=50%
+      - name: Run summarization tests (${{ matrix.group }})
+        run: npx jest src/specs/summarization.test.ts -t "${{ matrix.pattern }}" --maxWorkers=50%
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
@@ -303,3 +315,20 @@ jobs:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
+
+      - name: Check for durability changes
+        id: durability_changes
+        run: |
+          if git diff --name-only $DIFF_RANGE 2>/dev/null | grep -qE "^src/run\.ts|^src/types/run\.ts|^src/specs/durability-checkpoint\.integration\.test\.ts"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run durability checkpoint integration test (downloads a mongod binary)
+        if: steps.durability_changes.outputs.changed == 'true'
+        timeout-minutes: 6
+        run: npx jest src/specs/durability-checkpoint.integration.test.ts
+        env:
+          NODE_OPTIONS: '--experimental-vm-modules'
+          NODE_ENV: test

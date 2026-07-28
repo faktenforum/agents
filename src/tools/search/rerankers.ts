@@ -4,6 +4,11 @@ import { createDefaultLogger, formatErrorForLog } from './utils';
 
 const DEFAULT_JINA_API_URL = 'https://api.jina.ai/v1/rerank';
 
+/** Every other network call in the search pipeline is bounded (scrapers,
+ * search providers); rerank requests must be too, or a hung rerank API
+ * stalls the whole tool. */
+const DEFAULT_RERANKER_TIMEOUT = 10000;
+
 const getDefaultJinaApiUrl = (): string =>
   process.env.JINA_API_URL != null && process.env.JINA_API_URL !== ''
     ? process.env.JINA_API_URL
@@ -36,19 +41,23 @@ export abstract class BaseReranker {
 
 export class JinaReranker extends BaseReranker {
   private apiUrl: string;
+  private timeout: number;
 
   constructor({
     apiKey = process.env.JINA_API_KEY,
     apiUrl = getDefaultJinaApiUrl(),
+    timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
   }: {
     apiKey?: string;
     apiUrl?: string;
+    timeout?: number;
     logger?: t.Logger;
   }) {
     super(logger);
     this.apiKey = apiKey;
     this.apiUrl = apiUrl;
+    this.timeout = timeout;
   }
 
   async rerank(
@@ -82,6 +91,7 @@ export class JinaReranker extends BaseReranker {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
+          timeout: this.timeout,
         }
       );
 
@@ -124,15 +134,20 @@ export class JinaReranker extends BaseReranker {
 }
 
 export class CohereReranker extends BaseReranker {
+  private timeout: number;
+
   constructor({
     apiKey = process.env.COHERE_API_KEY,
+    timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
   }: {
     apiKey?: string;
+    timeout?: number;
     logger?: t.Logger;
   }) {
     super(logger);
     this.apiKey = apiKey;
+    this.timeout = timeout;
   }
 
   async rerank(
@@ -163,6 +178,7 @@ export class CohereReranker extends BaseReranker {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
+          timeout: this.timeout,
         }
       );
 
@@ -196,22 +212,26 @@ export class CohereReranker extends BaseReranker {
 export class CustomReranker extends BaseReranker {
   private apiUrl: string | undefined;
   private model: string | undefined;
+  private timeout: number;
 
   constructor({
     apiUrl = process.env.CUSTOM_RERANKER_API_URL,
     apiKey = process.env.CUSTOM_RERANKER_API_KEY,
     model = process.env.CUSTOM_RERANKER_MODEL,
+    timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
   }: {
     apiUrl?: string;
     apiKey?: string;
     model?: string;
+    timeout?: number;
     logger?: t.Logger;
   }) {
     super(logger);
     this.apiKey = apiKey;
     this.apiUrl = apiUrl;
     this.model = model;
+    this.timeout = timeout;
   }
 
   async rerank(
@@ -257,7 +277,7 @@ export class CustomReranker extends BaseReranker {
       const response = await axios.post<t.JinaRerankerResponse | undefined>(
         this.apiUrl,
         requestData,
-        { headers }
+        { headers, timeout: this.timeout }
       );
 
       this.logger.debug('Custom Reranker API Model:', response.data?.model);
@@ -335,6 +355,7 @@ export const createReranker = (config: {
   customRerankerApiUrl?: string;
   customRerankerApiKey?: string;
   customRerankerModel?: string;
+  rerankerTimeout?: number;
   logger?: t.Logger;
 }): BaseReranker | undefined => {
   const {
@@ -345,6 +366,7 @@ export const createReranker = (config: {
     customRerankerApiUrl,
     customRerankerApiKey,
     customRerankerModel,
+    rerankerTimeout,
     logger,
   } = config;
 
@@ -356,11 +378,13 @@ export const createReranker = (config: {
     return new JinaReranker({
       apiKey: jinaApiKey,
       apiUrl: jinaApiUrl,
+      timeout: rerankerTimeout,
       logger: defaultLogger,
     });
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
+      timeout: rerankerTimeout,
       logger: defaultLogger,
     });
   case 'custom':
@@ -368,6 +392,7 @@ export const createReranker = (config: {
       apiUrl: customRerankerApiUrl,
       apiKey: customRerankerApiKey,
       model: customRerankerModel,
+      timeout: rerankerTimeout,
       logger: defaultLogger,
     });
   case 'infinity':
@@ -382,6 +407,7 @@ export const createReranker = (config: {
     return new JinaReranker({
       apiKey: jinaApiKey,
       apiUrl: jinaApiUrl,
+      timeout: rerankerTimeout,
       logger: defaultLogger,
     });
   }

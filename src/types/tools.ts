@@ -38,6 +38,16 @@ export type EagerEventToolExecutionConfig = {
    * ToolMessages so provider message ordering is preserved.
    */
   enabled?: boolean;
+  /**
+   * Tool names that must never be started eagerly. Eager execution
+   * speculates on tool args before the model turn commits, so
+   * side-effecting tools (e.g. file writes) should opt out: a
+   * speculative write can land even if the turn is superseded, and a
+   * later arg revision would otherwise trip the "changed after eager
+   * execution" guard. Excluded calls fall through to normal ToolNode
+   * execution with final args.
+   */
+  excludeToolNames?: string[];
 };
 
 export type EagerEventToolExecutionOutcome =
@@ -79,10 +89,18 @@ export type ToolNodeOptions = {
   handleToolErrors?: boolean;
   loadRuntimeTools?: ToolRefGenerator;
   toolCallStepIds?: Map<string, string>;
+  /**
+   * Dispatches the error completion event for a failed tool call. Returns
+   * whether the event was actually dispatched — `false` (e.g. no run step is
+   * registered for the call yet, which happens when a tool fails fast on a
+   * resume pass) tells the ToolNode to fall back to its own completion
+   * dispatch for the error ToolMessage. A `void` resolution is treated as
+   * dispatched for backward compatibility.
+   */
   errorHandler?: (
     data: ToolErrorData,
     metadata?: Record<string, unknown>
-  ) => Promise<void>;
+  ) => Promise<boolean | void>;
   /** Tool registry for lazy computation of programmatic tools and tool search */
   toolRegistry?: LCToolRegistry;
   /** Reference to Graph's sessions map for automatic session injection */
@@ -98,8 +116,42 @@ export type ToolNodeOptions = {
   executingAgentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
+  /**
+   * Tool names whose in-process body may raise a LangGraph `interrupt()`
+   * mid-execution — e.g. an `ask_user_question` tool that suspends the
+   * run to collect a human answer.
+   *
+   * Within a single tool-call batch, a named tool that is *already*
+   * direct (a real in-process graphTool — the only kind whose body can
+   * reach `interrupt()`; graphTools are auto-marked direct by the graph)
+   * is executed as its own awaited group **before** its non-interrupting
+   * direct siblings. If it interrupts, the ToolNode unwinds before any
+   * sibling runs, so a non-idempotent sibling (send_email, billing)
+   * cannot execute once on the first pass and AGAIN when LangGraph re-runs
+   * the interrupted batch on resume.
+   *
+   * This set only REORDERS the direct group; it does NOT promote a name
+   * into it. A name that resolves to a schema-only event stub (an
+   * inherited `toolDefinition` with no executable instance — e.g. in a
+   * self-spawned child that scrubs `graphTools`) stays event-dispatched.
+   * Forcing such a name direct would invoke the stub, which throws
+   * "should not be invoked directly in event-driven mode". For the guard
+   * to apply, the interrupting tool must independently be direct.
+   *
+   * Opt-in and empty by default: when unset (or when no direct batch call
+   * matches), direct-batch execution is byte-for-byte unchanged. See the
+   * "Resume re-execution" section of {@link HumanInTheLoopConfig} for the
+   * batch re-execution contract this guards against.
+   */
+  interruptingToolNames?: Set<string>;
   /** Opt-in eager execution for event-driven tool calls. */
   eagerEventToolExecution?: EagerEventToolExecutionConfig;
+  /**
+   * Host tool names that write to the code-execution sandbox but are not
+   * built-in `CODE_EXECUTION_TOOLS`. Their exec `session_id` is folded into the
+   * shared code session so later bash_tool/execute_code calls see written files.
+   */
+  codeSessionToolNames?: string[];
   /** Shared per-run eager execution registry populated by the stream handler. */
   eagerEventToolExecutions?: Map<string, EagerEventToolExecution>;
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
@@ -276,6 +328,15 @@ export type CodeExecutionToolParams =
       files?: CodeEnvFile[];
       /** Optional host-supplied Code API auth headers. */
       authHeaders?: CodeApiAuthHeaders;
+      /**
+       * Advertise best-effort stateful sessions in the tool description
+       * (variables/files may persist between calls, may reset). Prompt text
+       * only, and it must be set here because the description is bound to the
+       * LLM at construction time. Pair it with the run-scoped
+       * `toolExecution.sandbox.statefulSessions` gate, which drives the wire
+       * hint — set both from one flag so the prompt and the backend agree.
+       */
+      statefulSessions?: boolean;
     };
 
 export type CodeApiAuthHeaderMap = Record<string, string>;
@@ -331,6 +392,13 @@ export type ExecuteResult = {
   stdout: string;
   stderr: string;
   files?: FileRefs;
+  /**
+   * Durable runtime session id echoed by a stateful Code API backend
+   * (hash of tenant+user+hint). Additive; absent on stateless servers.
+   */
+  runtime_session_id?: string;
+  /** Whether this execution reused a warm runtime session or started fresh. */
+  runtime_status?: 'new' | 'reused';
 };
 
 /** JSON Schema type definition for tool parameters */
@@ -397,6 +465,12 @@ export type ToolCallRequest = {
     session_id: string;
     files?: CodeEnvFile[];
   };
+  /**
+   * Stable runtime session hint for stateful sandbox sessions. Orthogonal to
+   * `codeSessionContext` (which threads the transient exec-session for file
+   * continuity): the hint identifies the durable server-side runtime session.
+   */
+  runtimeSessionHint?: string;
 };
 
 /** Batch request containing ALL tool calls for a graph step */
@@ -442,7 +516,7 @@ export type InjectedMessage = {
   /** When true, the message is framework-internal: not shown in UI, not counted as a user turn */
   isMeta?: boolean;
   /** Origin tag for downstream consumers (UI, pruner, compaction) */
-  source?: 'skill' | 'hook' | 'system';
+  source?: 'skill' | 'hook' | 'system' | 'steer';
   /** Only set when source is 'skill', for compaction preservation */
   skillName?: string;
 };
@@ -953,6 +1027,32 @@ export type CloudflareSandboxExecutionConfig = {
   postEditSyntaxCheck?: LocalExecutionConfig['postEditSyntaxCheck'];
 };
 
+export type SandboxExecutionConfig = {
+  /**
+   * Opt into best-effort stateful runtime sessions on the remote Code API
+   * (its warm per-session MicroVM backend). This gate is run-scoped: it only
+   * controls the wire behavior (ToolNode injecting the session hint on
+   * execute_code/bash calls). The transport is otherwise unchanged.
+   *
+   * It does NOT change the model-facing tool description. Tool descriptions are
+   * bound to the LLM at construction time (`createCodeExecutionTool` /
+   * `createBashExecutionTool`), before this run config is applied inside the
+   * graph, so they can only be adjusted via the tools' own `statefulSessions`
+   * factory param. Set BOTH from one flag (as LibreChat does): with this on but
+   * the factory param off, the backend runs statefully while the model is still
+   * told the environment is stateless (non-corrupting — the model just won't
+   * exploit persistence).
+   */
+  statefulSessions?: boolean;
+  /**
+   * Stable identity for the runtime session (e.g. the conversation id). The
+   * server derives the real session id as hash(tenant, user, hint), so this
+   * is never a security boundary. Falls back to `configurable.thread_id` when
+   * omitted.
+   */
+  runtimeSessionHint?: string;
+};
+
 export type ToolExecutionConfig = {
   /** `sandbox` preserves the remote Code API behavior and is the default. */
   engine?: ToolExecutionEngine;
@@ -960,6 +1060,8 @@ export type ToolExecutionConfig = {
   local?: LocalExecutionConfig;
   /** Cloudflare Sandbox execution settings used when `engine` is `cloudflare-sandbox`. */
   cloudflare?: CloudflareSandboxExecutionConfig;
+  /** Remote sandbox settings; applies when `engine` is `sandbox` or omitted. */
+  sandbox?: SandboxExecutionConfig;
 };
 
 export type ProgrammaticCache = {
@@ -1083,6 +1185,10 @@ export type ProgrammaticExecutionResponse = {
   stderr?: string;
   files?: FileRefs;
 
+  /** Durable runtime session echo from a stateful backend (additive). */
+  runtime_session_id?: string;
+  runtime_status?: 'new' | 'reused';
+
   /** Present when status='error' */
   error?: string;
 };
@@ -1094,6 +1200,9 @@ export type ProgrammaticExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  /** Durable runtime session echo from a stateful backend (additive). */
+  runtime_session_id?: string;
+  runtime_status?: 'new' | 'reused';
 };
 
 /** Parameters for creating a bash execution tool (same API as CodeExecutor, bash-only) */
@@ -1118,6 +1227,11 @@ export type ProgrammaticToolCallingParams = {
   debug?: boolean;
   /** Optional host-supplied Code API auth headers. */
   authHeaders?: CodeApiAuthHeaders;
+  /* No `statefulSessions` here: PTC is stateless in v1. The initial
+   * /exec/programmatic request still forwards a ToolNode-injected
+   * `_runtime_session_hint` when present, but there is no factory-level opt-in
+   * to advertise (it would be a no-op). Re-add with real behavior when PTC
+   * stateful prompting lands. */
 };
 
 // ============================================================================
@@ -1150,6 +1264,9 @@ export type CodeExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  /** Durable runtime session echo from a stateful backend (additive). */
+  runtime_session_id?: string;
+  runtime_status?: 'new' | 'reused';
 };
 
 /**

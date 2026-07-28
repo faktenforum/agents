@@ -185,6 +185,36 @@ export type RunConfig = {
    */
   eagerEventToolExecution?: EagerEventToolExecutionConfig;
   /**
+   * Names of host tools that write to the code-execution sandbox but are not
+   * built-in `CODE_EXECUTION_TOOLS` (e.g. LibreChat's create_file/edit_file).
+   * Their successful results fold the returned exec `session_id` into the
+   * shared code session, so a file such a tool writes is visible to later
+   * bash_tool/execute_code calls running in the same sandbox. Host-declared so
+   * the SDK stays name-agnostic.
+   */
+  codeSessionToolNames?: string[];
+  /**
+   * Names of host tools whose in-process body may raise a LangGraph
+   * `interrupt()` mid-execution — the canonical example is an
+   * `ask_user_question` tool that suspends the run to collect a human
+   * answer. Within a single tool-call batch, a named tool that is a real
+   * in-process graphTool (the only kind whose body can reach `interrupt()`;
+   * graphTools are auto-marked direct) is scheduled **ahead of** its
+   * non-interrupting direct siblings. That ordering guarantees a mid-body
+   * interrupt unwinds the tool batch before a non-idempotent sibling
+   * (send_email, billing) executes, so the sibling cannot run once on the
+   * first pass and AGAIN when LangGraph re-runs the interrupted batch on
+   * resume.
+   *
+   * This only reorders the direct group — it does NOT force a name onto
+   * the direct path. A name that is only an inherited event `toolDefinition`
+   * (schema-only stub, e.g. in a self-spawned child) stays event-dispatched;
+   * the guard applies only to tools that are independently direct.
+   * Host-declared so the SDK stays name-agnostic; omit to keep the prior
+   * (unguarded) behavior.
+   */
+  interruptingToolNames?: string[];
+  /**
    * Selects the execution backend for built-in code tools. Omit this to keep
    * the remote LibreChat Code API sandbox. Set `{ engine: 'local' }` to run
    * code execution locally and auto-bind the local coding tool suite unless
@@ -260,4 +290,23 @@ export type TokenBudgetBreakdown = {
 export type EventStreamOptions = {
   callbacks?: g.ClientCallbacks;
   keepContent?: boolean;
+};
+
+/**
+ * When to persist checkpoints during a run. Mirrors langgraph's option:
+ * `'async'`/`'sync'` checkpoint every superstep; `'exit'` checkpoints only
+ * at the graph's exit/interrupt boundary. Kept as a local union to avoid
+ * coupling to langgraph internals (it is not exported from the root).
+ */
+export type Durability = 'async' | 'sync' | 'exit';
+
+/**
+ * Config accepted by `processStream`/`resume`. Extends `RunnableConfig` with
+ * the stream `version`, an optional `run_id`, and an optional `durability`
+ * override forwarded to langgraph's run options.
+ */
+export type RunStreamConfig = Partial<RunnableConfig> & {
+  version: 'v1' | 'v2';
+  run_id?: string;
+  durability?: Durability;
 };

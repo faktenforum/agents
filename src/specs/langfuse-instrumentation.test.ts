@@ -33,16 +33,17 @@ type BasicTracerProviderInput = {
     shutdown?: unknown;
   }>;
 };
-type RoutingSpanProcessorForTest = BasicTracerProviderInput['spanProcessors'][0] & {
-  processors: Map<
-    string,
-    {
-      fallbackConfig?: {
-        enabled?: boolean;
-      };
-    }
-  >;
-};
+type RoutingSpanProcessorForTest =
+  BasicTracerProviderInput['spanProcessors'][0] & {
+    processors: Map<
+      string,
+      {
+        fallbackConfig?: {
+          enabled?: boolean;
+        };
+      }
+    >;
+  };
 const mockBasicTracerProvider = jest.fn(
   (_input?: BasicTracerProviderInput) => mockTracerProvider
 );
@@ -183,6 +184,70 @@ describe('Langfuse instrumentation', () => {
     expect(mockBasicTracerProvider).toHaveBeenCalledTimes(1);
   });
 
+  it('resolves environment from LANGFUSE_TRACING_ENVIRONMENT', async () => {
+    process.env.LANGFUSE_TRACING_ENVIRONMENT = 'staging';
+
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({ environment: 'staging' })
+    );
+  });
+
+  it('falls back to NODE_ENV when LANGFUSE_TRACING_ENVIRONMENT is unset', async () => {
+    delete process.env.LANGFUSE_TRACING_ENVIRONMENT;
+    process.env.NODE_ENV = 'production';
+
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({ environment: 'production' })
+    );
+  });
+
+  it('falls through blank environment overrides and trims the selected value', async () => {
+    process.env.LANGFUSE_TRACING_ENVIRONMENT = '   ';
+    process.env.NODE_ENV = ' production ';
+
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+      environment: '',
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({ environment: 'production' })
+    );
+  });
+
+  it('prefers an explicit config environment over environment variables', async () => {
+    process.env.LANGFUSE_TRACING_ENVIRONMENT = 'staging';
+
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+      environment: 'canary',
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({ environment: 'canary' })
+    );
+  });
+
   it('does not replace the global provider when explicit credentials change', async () => {
     const { initializeLangfuseTracing } = await import('@/instrumentation');
     initializeLangfuseTracing({
@@ -217,6 +282,25 @@ describe('Langfuse instrumentation', () => {
     expect(mockSetLangfuseTracerProvider).toHaveBeenCalledTimes(1);
   });
 
+  it('does not store raw secret keys in processor cache keys', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-cache',
+      secretKey: 'sk-cache-secret',
+      baseUrl: 'https://langfuse.cache',
+    });
+
+    const providerInput = mockBasicTracerProvider.mock
+      .calls[0][0] as BasicTracerProviderInput;
+    const routingProcessor = providerInput
+      .spanProcessors[0] as RoutingSpanProcessorForTest;
+    const processorKeys = Array.from(routingProcessor.processors.keys());
+
+    expect(processorKeys).toHaveLength(1);
+    expect(processorKeys[0]).toContain('secretKeyHash');
+    expect(processorKeys[0]).not.toContain('sk-cache-secret');
+  });
+
   it('passes explicit redaction config into the redacting processor fallback', async () => {
     const { initializeLangfuseTracing } = await import('@/instrumentation');
     initializeLangfuseTracing({
@@ -228,8 +312,8 @@ describe('Langfuse instrumentation', () => {
 
     const providerInput = mockBasicTracerProvider.mock
       .calls[0][0] as BasicTracerProviderInput;
-    const routingProcessor =
-      providerInput.spanProcessors[0] as RoutingSpanProcessorForTest;
+    const routingProcessor = providerInput
+      .spanProcessors[0] as RoutingSpanProcessorForTest;
     const childProcessors = Array.from(routingProcessor.processors.values());
     expect(childProcessors[0]?.fallbackConfig).toMatchObject({
       enabled: false,

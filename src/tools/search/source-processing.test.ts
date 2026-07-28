@@ -14,6 +14,7 @@ const silentLogger = {
 
 class RecordingReranker extends BaseReranker {
   public rerankCalls: string[][] = [];
+  public topKCalls: number[] = [];
 
   constructor() {
     super(silentLogger);
@@ -25,6 +26,7 @@ class RecordingReranker extends BaseReranker {
     topK: number = 5
   ): Promise<t.Highlight[]> {
     this.rerankCalls.push(documents);
+    this.topKCalls.push(topK);
     return this.getDefaultRanking(documents, topK);
   }
 }
@@ -139,6 +141,63 @@ describe('expandHighlights content stripping', () => {
     expect(result.organic?.[0].content).toBeUndefined();
     expect(result.organic?.[0].references).toBeUndefined();
   });
+
+  test('honors a custom mainExpandBy when expanding highlights', () => {
+    const highlightText = 'KEYFACT';
+    // Boundary-free filler so expansion is governed purely by mainExpandBy,
+    // not by where natural separators happen to fall.
+    const content = `${'x'.repeat(1000)}${highlightText}${'y'.repeat(1000)}`;
+    const makeData = (): t.SearchResultData => ({
+      organic: [
+        {
+          ...makeOrganic('https://a.com'),
+          content,
+          highlights: [{ text: highlightText, score: 0.9 }],
+        },
+      ],
+    });
+
+    // separatorExpandBy 0 isolates the mainExpandBy effect.
+    const narrow = expandHighlights(makeData(), 50, 0).organic?.[0]
+      .highlights?.[0];
+    const wide = expandHighlights(makeData(), 500, 0).organic?.[0]
+      .highlights?.[0];
+
+    expect(narrow?.text).toContain(highlightText);
+    expect(wide?.text).toContain(highlightText);
+    // 50 chars of context each side vs. 500 → wide must be markedly longer.
+    expect(wide!.text.length).toBeGreaterThan(narrow!.text.length);
+    expect(narrow!.text.length).toBe(highlightText.length + 100);
+    expect(wide!.text.length).toBe(highlightText.length + 1000);
+  });
+
+  test('honors a custom separatorExpandBy when seeking boundaries', () => {
+    const highlightText = 'KEYFACT';
+    // The main window lands inside a boundary-free 'y' run; the only natural
+    // boundary ('. ') sits 250 chars past the main window's end. A small
+    // separator range can't reach it; a large one can.
+    const content = `${'x'.repeat(100)}${highlightText}${'y'.repeat(300)}. ${'z'.repeat(300)}`;
+    const makeData = (): t.SearchResultData => ({
+      organic: [
+        {
+          ...makeOrganic('https://a.com'),
+          content,
+          highlights: [{ text: highlightText, score: 0.9 }],
+        },
+      ],
+    });
+
+    // Same mainExpandBy; only the separator search range differs.
+    const narrow = expandHighlights(makeData(), 50, 100).organic?.[0]
+      .highlights?.[0];
+    const wide = expandHighlights(makeData(), 50, 400).organic?.[0]
+      .highlights?.[0];
+
+    expect(narrow?.text).toContain(highlightText);
+    expect(wide?.text).toContain(highlightText);
+    // Only the wider separator range reaches the trailing sentence boundary.
+    expect(wide!.text.length).toBeGreaterThan(narrow!.text.length);
+  });
 });
 
 describe('createSourceProcessor content capping', () => {
@@ -211,6 +270,90 @@ describe('createSourceProcessor content capping', () => {
     });
 
     expect(data.organic?.[0].content?.length).toBe(50000);
+  });
+
+  test('passes configured topResults through to the reranker', async () => {
+    const reranker = new RecordingReranker();
+    const scraper = createFakeScraper({ [link]: makeLongContent(3000) });
+    const processor = createSourceProcessor(
+      { reranker, topResults: 2, logger: silentLogger },
+      scraper
+    );
+
+    await processor.processSources({
+      ...baseFields,
+      news: false,
+      numElements: 5,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    expect(reranker.topKCalls).toEqual([2]);
+  });
+});
+
+describe('createSourceProcessor reranker chunking', () => {
+  const link = 'https://a.com';
+  const baseFields = {
+    query: 'test query',
+    proMode: true,
+    onGetHighlights: undefined,
+  };
+
+  const runWithConfig = async (
+    config: Partial<t.ProcessSourcesConfig>
+  ): Promise<string[]> => {
+    const reranker = new RecordingReranker();
+    const scraper = createFakeScraper({ [link]: makeLongContent(10000) });
+    const processor = createSourceProcessor(
+      { reranker, logger: silentLogger, ...config },
+      scraper
+    );
+
+    await processor.processSources({
+      ...baseFields,
+      news: false,
+      numElements: 5,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    return reranker.rerankCalls[0] ?? [];
+  };
+
+  test('configured chunkSize produces fewer, larger chunks', async () => {
+    const defaultDocs = await runWithConfig({});
+    const largeDocs = await runWithConfig({
+      chunkSize: 500,
+      chunkOverlap: 100,
+    });
+
+    expect(defaultDocs.length).toBeGreaterThan(0);
+    expect(largeDocs.length).toBeGreaterThan(0);
+    expect(largeDocs.length).toBeLessThan(defaultDocs.length);
+    expect(Math.max(...defaultDocs.map((d) => d.length))).toBeLessThanOrEqual(
+      150
+    );
+    expect(Math.max(...largeDocs.map((d) => d.length))).toBeLessThanOrEqual(
+      500
+    );
+  });
+
+  test('respects SEARCH_CHUNK_SIZE env vars when config is not set', async () => {
+    process.env.SEARCH_CHUNK_SIZE = '500';
+    process.env.SEARCH_CHUNK_OVERLAP = '100';
+    try {
+      const docs = await runWithConfig({});
+      expect(docs.length).toBeGreaterThan(0);
+      expect(Math.max(...docs.map((d) => d.length))).toBeLessThanOrEqual(500);
+    } finally {
+      delete process.env.SEARCH_CHUNK_SIZE;
+      delete process.env.SEARCH_CHUNK_OVERLAP;
+    }
+  });
+
+  test('clamps overlap below chunk size instead of throwing', async () => {
+    const docs = await runWithConfig({ chunkSize: 200, chunkOverlap: 300 });
+    expect(docs.length).toBeGreaterThan(0);
+    expect(Math.max(...docs.map((d) => d.length))).toBeLessThanOrEqual(200);
   });
 });
 
