@@ -351,6 +351,30 @@ function filterImagePartsIfNeeded(
  * input"). Covers both OpenAI `image_url` parts and standard `image` data content
  * blocks. Returns the input unchanged when visionCapable is true.
  */
+/**
+ * Collapses tool content parts to the single string the OpenAI tool role requires. Stripping
+ * images can empty the array or leave one lone text part, so both are unwrapped rather than
+ * JSON-encoded - a model reading `[{"type":"text","text":"..."}]` sees noise, not the result.
+ */
+function toolContentToString(parts: unknown[]): string {
+  if (parts.length === 0) {
+    return IMAGE_OMITTED_PLACEHOLDER;
+  }
+  if (parts.length === 1) {
+    const only = parts[0];
+    if (
+      typeof only === 'object' &&
+      only !== null &&
+      'type' in only &&
+      (only as { type: string }).type === 'text' &&
+      'text' in only
+    ) {
+      return (only as { text: string }).text;
+    }
+  }
+  return JSON.stringify(parts);
+}
+
 export function stripImagesFromMessages(
   messages: BaseMessage[],
   visionCapable: boolean
@@ -439,17 +463,7 @@ export function _convertMessagesToOpenAIParams(
     content = filterImagePartsIfNeeded(content, visionCapable);
     // OpenAI tool/output messages require string content
     if (role === 'tool' && Array.isArray(content)) {
-      content =
-        content.length === 0
-          ? (IMAGE_OMITTED_PLACEHOLDER as unknown as string)
-          : content.length === 1 &&
-              typeof content[0] === 'object' &&
-              content[0] !== null &&
-              'type' in content[0] &&
-              (content[0] as { type: string }).type === 'text' &&
-              'text' in content[0]
-            ? ((content[0] as { text: string }).text as unknown as string)
-            : (JSON.stringify(content) as unknown as string);
+      content = toolContentToString(content) as unknown as typeof content;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const completionParam: Record<string, any> = {
