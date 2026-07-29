@@ -3,7 +3,6 @@
 import { type OpenAI as OpenAIClient } from 'openai';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import {
-  convertLangChainToolCallToOpenAI,
   makeInvalidToolCall,
   parseToolCall,
 } from '@langchain/core/output_parsers/openai_tools';
@@ -38,10 +37,22 @@ import type {
 } from '@langchain/openai';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import {
+  getBoundedCacheControlledTextToolContent,
+  getComputerCallOutputScreenshot,
+  isComputerCallOutputMessage,
+  serializeStructuredValueBounded,
+} from '@/utils/toolContent';
+import {
   STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import {
+  calculateMaxToolCallInputChars,
+  projectToolCallInputs,
+  serializeToolCallInput,
+} from '@/messages/prune';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };
@@ -82,6 +93,32 @@ type OpenAIRoleEnum =
 
 type OpenAICompletionParam =
   OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
+
+const MAX_PROVIDER_TOOL_CALL_INPUT_CHARS = calculateMaxToolCallInputChars();
+
+function convertLangChainToolCallToBoundedOpenAI(toolCall: ToolCall): {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+} {
+  if (toolCall.id == null) {
+    throw new Error('All OpenAI tool calls must have an "id" field.');
+  }
+  return {
+    id: toolCall.id,
+    type: 'function',
+    function: {
+      name: toolCall.name,
+      arguments: serializeToolCallInput(
+        toolCall.args,
+        MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+      ),
+    },
+  };
+}
 
 function extractGenericMessageCustomRole(message: ChatMessage) {
   if (
@@ -300,24 +337,19 @@ export interface ConvertMessagesOptions {
   includeReasoningDetails?: boolean;
   /** Convert reasoning_details to content blocks for Claude (requires content array format) */
   convertReasoningDetailsToContent?: boolean;
-  /**
-   * When false, image content (OpenAI `image_url` parts and standard `image` data
-   * content blocks) is stripped from all message content before sending. Prevents
-   * "model is not a multimodal model" / "No endpoints found that support image input" errors.
-   */
-  visionCapable?: boolean;
+  /** Preserve OpenRouter's canonical cache-decorated tool text block. */
+  preserveToolCacheControl?: boolean;
 }
 
-/** Placeholder text when image content is stripped for non-vision models */
+/** Placeholder kept in place of stripped images so a message never ends up empty. */
 const IMAGE_OMITTED_PLACEHOLDER =
   '(Image content omitted — model does not support vision)';
 
 /**
  * True for image content parts a non-vision model cannot accept: OpenAI-style
- * `image_url` parts and standard `image` data content blocks. Data content blocks
- * are converted to `image_url` downstream (see `fromStandardImageBlock`), so they
- * must be dropped here too or they still reach a text-only model and trigger a
- * "not a multimodal model" error.
+ * `image_url` parts and standard `image` data content blocks. Data content blocks are
+ * converted to `image_url` further downstream, so dropping only `image_url` here would
+ * still let them reach a text-only model.
  */
 function isImageContentPart(part: unknown): boolean {
   if (part == null || typeof part !== 'object' || !('type' in part)) {
@@ -327,54 +359,19 @@ function isImageContentPart(part: unknown): boolean {
   return type === 'image_url' || type === 'image';
 }
 
-function filterImagePartsIfNeeded(
-  content: string | unknown[],
-  visionCapable: boolean
-): string | unknown[] {
-  if (visionCapable) {
-    return content;
-  }
-  if (typeof content === 'string') {
-    return content;
-  }
-  const filtered = content.filter((m: unknown) => !isImageContentPart(m));
-  return filtered.length > 0
-    ? filtered
-    : [{ type: 'text' as const, text: IMAGE_OMITTED_PLACEHOLDER }];
-}
-
 /**
- * Strips image content parts from messages for non-vision models, at the message
- * level (mirrors filterImagePartsIfNeeded). Used as the single choke point before
- * delegating to the base streaming so images never reach a model that would reject
- * them ("model is not a multimodal model" / "No endpoints found that support image
- * input"). Covers both OpenAI `image_url` parts and standard `image` data content
- * blocks. Returns the input unchanged when visionCapable is true.
+ * Removes image content from messages bound for a model without vision support.
+ *
+ * OpenAI-compatible providers reject the whole request when an image reaches a
+ * text-only model ("model is not a multimodal model", "No endpoints found that support
+ * image input"), and callers routinely cannot control the history: a tool that returns
+ * an image, or an agent handoff from a vision model to a text-only one, both put image
+ * parts into the messages.
+ *
+ * Returns the input untouched when `visionCapable` is true, and clones only the messages
+ * that actually carry an image. A message whose content was nothing but images keeps a
+ * short text placeholder so it does not become empty.
  */
-/**
- * Collapses tool content parts to the single string the OpenAI tool role requires. Stripping
- * images can empty the array or leave one lone text part, so both are unwrapped rather than
- * JSON-encoded - a model reading `[{"type":"text","text":"..."}]` sees noise, not the result.
- */
-function toolContentToString(parts: unknown[]): string {
-  if (parts.length === 0) {
-    return IMAGE_OMITTED_PLACEHOLDER;
-  }
-  if (parts.length === 1) {
-    const only = parts[0];
-    if (
-      typeof only === 'object' &&
-      only !== null &&
-      'type' in only &&
-      (only as { type: string }).type === 'text' &&
-      'text' in only
-    ) {
-      return (only as { text: string }).text;
-    }
-  }
-  return JSON.stringify(parts);
-}
-
 export function stripImagesFromMessages(
   messages: BaseMessage[],
   visionCapable: boolean
@@ -386,17 +383,18 @@ export function stripImagesFromMessages(
     if (!Array.isArray(msg.content)) {
       return msg;
     }
-    const hasImage = msg.content.some((part) => isImageContentPart(part));
-    if (!hasImage) {
+    if (!msg.content.some(isImageContentPart)) {
       return msg;
     }
+    const kept = msg.content.filter((part) => !isImageContentPart(part));
     const clone = Object.assign(
       Object.create(Object.getPrototypeOf(msg)),
       msg
     ) as BaseMessage;
-    clone.content = filterImagePartsIfNeeded(
-      msg.content,
-      false
+    clone.content = (
+      kept.length > 0
+        ? kept
+        : [{ type: 'text' as const, text: IMAGE_OMITTED_PLACEHOLDER }]
     ) as BaseMessage['content'];
     return clone;
   });
@@ -408,10 +406,13 @@ export function _convertMessagesToOpenAIParams(
   model?: string,
   options?: ConvertMessagesOptions
 ): OpenAICompletionParam[] {
-  const visionCapable = options?.visionCapable ?? true;
+  const projectedMessages = projectToolCallInputs(
+    messages,
+    MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+  );
   let hasReasoningToolCallContext = false;
   // TODO: Function messages do not support array content, fix cast
-  return messages.flatMap((message) => {
+  return projectedMessages.flatMap((message) => {
     let role = messageToOpenAIRole(message);
     if (role === 'system' && isReasoningModel(model)) {
       role = 'developer';
@@ -419,51 +420,39 @@ export function _convertMessagesToOpenAIParams(
 
     let hasAnthropicThinkingBlock: boolean = false;
 
-    let content: string | unknown[] =
-      typeof message.content === 'string'
-        ? message.content
-        : message.content.map((m) => {
-          if ('type' in m && m.type === 'thinking') {
-            hasAnthropicThinkingBlock = true;
-            return m;
-          }
-          if (isDataContentBlock(m)) {
-            return convertToProviderContentBlock(
-              m,
-              completionsApiContentBlockConverter
-            );
-          }
-          // Ensure image_url items are in correct format for OpenAI API
-          if ('type' in m && m.type === 'image_url') {
-            const imageItem = m as {
-                type: 'image_url';
-                image_url: string | { url: string; detail?: string };
-              };
-
-            // Normalize to OpenAI format: image_url must be an object with url property
-            const imageUrl = imageItem.image_url;
-            const normalizedUrl =
-                typeof imageUrl === 'string'
-                  ? { url: imageUrl }
-                  : { url: imageUrl.url, detail: imageUrl.detail };
-
-            return {
-              type: 'image_url' as const,
-              image_url: {
-                url: normalizedUrl.url,
-                ...(normalizedUrl.detail
-                  ? { detail: normalizedUrl.detail }
-                  : {}),
-              },
-            };
-          }
+    let content: unknown;
+    if (
+      role === 'tool' &&
+      typeof message.content !== 'string' &&
+      !isComputerCallOutputMessage(message)
+    ) {
+      content =
+        options?.preserveToolCacheControl === true
+          ? getBoundedCacheControlledTextToolContent(
+            message.content,
+            HARD_MAX_TOOL_RESULT_CHARS
+          )
+          : undefined;
+      content ??= serializeStructuredValueBounded(
+        message.content,
+        HARD_MAX_TOOL_RESULT_CHARS
+      ).content;
+    } else if (typeof message.content === 'string') {
+      content = message.content;
+    } else {
+      content = message.content.map((m) => {
+        if ('type' in m && m.type === 'thinking') {
+          hasAnthropicThinkingBlock = true;
           return m;
-        });
-
-    content = filterImagePartsIfNeeded(content, visionCapable);
-    // OpenAI tool/output messages require string content
-    if (role === 'tool' && Array.isArray(content)) {
-      content = toolContentToString(content) as unknown as typeof content;
+        }
+        if (isDataContentBlock(m)) {
+          return convertToProviderContentBlock(
+            m,
+            completionsApiContentBlockConverter
+          );
+        }
+        return m;
+      });
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const completionParam: Record<string, any> = {
@@ -482,7 +471,7 @@ export function _convertMessagesToOpenAIParams(
     if (isAIMessage(message) && !!message.tool_calls?.length) {
       messageHasToolCalls = true;
       completionParam.tool_calls = message.tool_calls.map(
-        convertLangChainToolCallToOpenAI
+        convertLangChainToolCallToBoundedOpenAI
       );
       completionParam.content = hasAnthropicThinkingBlock ? content : '';
       if (
@@ -656,10 +645,13 @@ function _convertReasoningSummaryToOpenAIResponsesParams(
 export function _convertMessagesToOpenAIResponsesParams(
   messages: BaseMessage[],
   model?: string,
-  zdrEnabled?: boolean,
-  visionCapable: boolean = true
+  zdrEnabled?: boolean
 ): ResponsesInputItem[] {
-  return messages.flatMap(
+  const projectedMessages = projectToolCallInputs(
+    messages,
+    MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+  );
+  return projectedMessages.flatMap(
     (lcMsg): ResponsesInputItem | ResponsesInputItem[] => {
       const additional_kwargs =
         lcMsg.additional_kwargs as BaseMessageFields['additional_kwargs'] & {
@@ -681,73 +673,32 @@ export function _convertMessagesToOpenAIResponsesParams(
 
       if (role === 'tool') {
         const toolMessage = lcMsg as ToolMessage;
-        let toolContent = toolMessage.content;
-        if (!visionCapable && Array.isArray(toolContent)) {
-          const filtered = toolContent.filter(
-            (i: unknown) =>
-              !(
-                i &&
-                typeof i === 'object' &&
-                'type' in i &&
-                (i as { type: string }).type === 'image_url'
-              )
-          );
-          toolContent =
-            filtered.length > 0 ? filtered : IMAGE_OMITTED_PLACEHOLDER;
-        }
 
         // Handle computer call output
         if (additional_kwargs.type === 'computer_call_output') {
-          if (!visionCapable) {
-            return {
-              type: 'function_call_output',
-              call_id: toolMessage.tool_call_id,
-              id: toolMessage.id?.startsWith('fc_')
-                ? toolMessage.id
-                : undefined,
-              output: IMAGE_OMITTED_PLACEHOLDER,
-            };
-          }
-          const output = (() => {
-            if (typeof toolContent === 'string') {
-              return {
-                type: 'computer_screenshot' as const,
-                image_url: toolContent,
-              };
-            }
-
-            if (Array.isArray(toolContent)) {
-              const oaiScreenshot = toolContent.find(
-                (i: { type?: string }) => i.type === 'computer_screenshot'
-              ) as
-                | { type: 'computer_screenshot'; image_url: string }
-                | undefined;
-
-              if (oaiScreenshot) return oaiScreenshot;
-
-              const lcImage = toolContent.find(
-                (i: { type?: string }) => i.type === 'image_url'
-              ) as MessageContentImageUrl | undefined;
-
-              if (lcImage) {
-                return {
-                  type: 'computer_screenshot' as const,
-                  image_url:
-                    typeof lcImage.image_url === 'string'
-                      ? lcImage.image_url
-                      : lcImage.image_url.url,
-                };
-              }
-            }
-
+          const screenshot = getComputerCallOutputScreenshot(
+            toolMessage.content
+          );
+          if (screenshot == null) {
             throw new Error('Invalid computer call output');
-          })();
+          }
 
-          return {
+          const output: OpenAIClient.Responses.ResponseComputerToolCallOutputScreenshot =
+            'image_url' in screenshot
+              ? {
+                type: 'computer_screenshot',
+                image_url: screenshot.image_url,
+              }
+              : {
+                type: 'computer_screenshot',
+                file_id: screenshot.file_id,
+              };
+          const computerCallOutput: ResponsesInputItem = {
             type: 'computer_call_output',
             output,
             call_id: toolMessage.tool_call_id,
           };
+          return computerCallOutput;
         }
 
         return {
@@ -755,9 +706,12 @@ export function _convertMessagesToOpenAIResponsesParams(
           call_id: toolMessage.tool_call_id,
           id: toolMessage.id?.startsWith('fc_') ? toolMessage.id : undefined,
           output:
-            typeof toolContent !== 'string'
-              ? JSON.stringify(toolContent)
-              : toolContent,
+            typeof toolMessage.content !== 'string'
+              ? serializeStructuredValueBounded(
+                toolMessage.content,
+                HARD_MAX_TOOL_RESULT_CHARS
+              ).content
+              : toolMessage.content,
         };
       }
 
@@ -840,7 +794,10 @@ export function _convertMessagesToOpenAIResponsesParams(
               (toolCall): ResponsesInputItem => ({
                 type: 'function_call',
                 name: toolCall.name,
-                arguments: JSON.stringify(toolCall.args),
+                arguments: serializeToolCallInput(
+                  toolCall.args,
+                  MAX_PROVIDER_TOOL_CALL_INPUT_CHARS
+                ),
                 call_id: toolCall.id!,
                 ...(zdrEnabled ? { id: functionCallIds?.[toolCall.id!] } : {}),
               })

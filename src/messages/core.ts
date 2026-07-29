@@ -1,4 +1,5 @@
 // src/messages.ts
+import { isProxy } from 'node:util/types';
 import {
   AIMessage,
   BaseMessage,
@@ -6,8 +7,20 @@ import {
   HumanMessage,
   AIMessageChunk,
 } from '@langchain/core/messages';
-import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
+import {
+  cloneToolMessageWithContent,
+  compactToolContent,
+  getBoundedCacheControlledTextToolContent,
+  getBoundedSingleTextToolContent,
+  getComputerCallOutputScreenshot,
+  hasComputerCallOutputMarker,
+  isComputerCallOutputMessage,
+  serializeToolContentBounded,
+} from '@/utils/toolContent';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { stripAnthropicCacheControl } from './cache';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
 
@@ -75,10 +88,11 @@ const modifyContent = ({
     allowedTypesByProvider[provider] ?? allowedTypesByProvider.default;
   return content.map((item: t.ExtendedMessageContent | null) => {
     if (
+      item &&
       typeof item === 'object' &&
-      item !== null &&
       'type' in item &&
-      typeof item.type === 'string'
+      item.type != null &&
+      item.type
     ) {
       let newType = item.type;
       if (newType.endsWith('_delta')) {
@@ -468,24 +482,545 @@ function stringifyToolMessageContent(
   return content == null ? '' : String(content);
 }
 
-export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
+function appendContentBlocks(
+  target: t.MessageContentComplex[],
+  content: BaseMessage['content']
+): void {
+  if (typeof content === 'string') {
+    target.push({ type: ContentTypes.TEXT, text: content });
+    return;
+  }
+  for (const block of content) {
+    target.push(block as t.MessageContentComplex);
+  }
+}
+
+/**
+ * Appends one artifact/tool-content segment without retaining an unbounded
+ * intermediate block array. Both operands are compacted before they are
+ * combined, and the combined result is compacted again under the aggregate
+ * cap.
+ */
+function appendBoundedContent(
+  current: BaseMessage['content'] | undefined,
+  next: unknown,
+  maxChars: number
+): BaseMessage['content'] {
+  const boundedNext = compactToolContent(next, maxChars).content;
+  if (current == null) {
+    return boundedNext;
+  }
+
+  const combined: t.MessageContentComplex[] = [];
+  appendContentBlocks(combined, current);
+  appendContentBlocks(combined, boundedNext);
+  return compactToolContent(toLangChainContent(combined), maxChars).content;
+}
+
+function cloneAIMessageWithToolCalls(
+  message: AIMessage,
+  toolCalls: ToolCall[],
+  removedCallIds: ReadonlySet<string>
+): AIMessage {
+  const descriptors = Object.getOwnPropertyDescriptors(message) as Record<
+    string,
+    PropertyDescriptor | undefined
+  >;
+  let descriptor = descriptors.tool_calls;
+  descriptors.tool_calls = {
+    configurable: descriptor?.configurable ?? true,
+    enumerable: descriptor?.enumerable ?? true,
+    value: toolCalls,
+    writable: descriptor?.writable ?? true,
+  };
+  const toolCallChunks = descriptors.tool_call_chunks?.value as
+    | ToolCallChunk[]
+    | undefined;
+  if (Array.isArray(toolCallChunks)) {
+    descriptor = descriptors.tool_call_chunks;
+    descriptors.tool_call_chunks = {
+      configurable: descriptor?.configurable ?? true,
+      enumerable: descriptor?.enumerable ?? true,
+      value: toolCallChunks.filter(
+        (chunk) => typeof chunk.id !== 'string' || !removedCallIds.has(chunk.id)
+      ),
+      writable: descriptor?.writable ?? true,
+    };
+  }
+  return Object.create(
+    Object.getPrototypeOf(message),
+    descriptors as PropertyDescriptorMap
+  ) as AIMessage;
+}
+
+function cloneAIMessageWithContent(
+  message: AIMessage,
+  content: AIMessage['content']
+): AIMessage {
+  const descriptors = Object.getOwnPropertyDescriptors(message) as Record<
+    string,
+    PropertyDescriptor | undefined
+  >;
+  const descriptor = descriptors.content;
+  descriptors.content = {
+    configurable: descriptor?.configurable ?? true,
+    enumerable: descriptor?.enumerable ?? true,
+    value: content,
+    writable: descriptor?.writable ?? true,
+  };
+  const lcKwargs = descriptors.lc_kwargs;
+  if (
+    lcKwargs != null &&
+    'value' in lcKwargs &&
+    typeof lcKwargs.value === 'object' &&
+    lcKwargs.value != null
+  ) {
+    descriptors.lc_kwargs = {
+      ...lcKwargs,
+      value: {
+        ...(lcKwargs.value as Record<string, unknown>),
+        content,
+      },
+    };
+  }
+  return Object.create(
+    Object.getPrototypeOf(message),
+    descriptors as PropertyDescriptorMap
+  ) as AIMessage;
+}
+
+/**
+ * Drops incomplete streamed text-input fragments that some providers retain
+ * beside the assembled parsed tool call. They are neither user-visible text
+ * nor valid content blocks for a subsequent provider.
+ */
+export function projectToolStreamContentForProvider(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  let projected: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.getType() !== 'ai' || !Array.isArray(message.content)) {
+      continue;
+    }
+    const content = message.content.filter((block) => {
+      if (block == null || typeof block !== 'object') {
+        return true;
+      }
+      try {
+        if (isProxy(block)) {
+          return false;
+        }
+        const type = Object.getOwnPropertyDescriptor(block, 'type');
+        if (type == null) {
+          return true;
+        }
+        if (type.enumerable !== true || !('value' in type)) {
+          return false;
+        }
+        if (type.value !== 'text') {
+          return true;
+        }
+        const text = Object.getOwnPropertyDescriptor(block, 'text');
+        return (
+          text?.enumerable === true &&
+          'value' in text &&
+          typeof text.value === 'string' &&
+          text.value !== ''
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (content.length === message.content.length) {
+      continue;
+    }
+    projected ??= [...messages];
+    projected[i] = cloneAIMessageWithContent(
+      message as AIMessage,
+      toLangChainContent(content)
+    );
+  }
+  return projected ?? messages;
+}
+
+type CacheControlledTextProjection = 'serialize' | 'preserve' | 'text';
+
+function projectStructuredOpenAIToolContent(
+  content: ToolMessage['content'],
+  maxChars: number,
+  cacheControlledTextProjection: CacheControlledTextProjection
+): ToolMessage['content'] {
+  if (cacheControlledTextProjection !== 'serialize') {
+    const cacheControlledContent = getBoundedCacheControlledTextToolContent(
+      content,
+      maxChars
+    );
+    if (cacheControlledContent != null) {
+      return cacheControlledTextProjection === 'preserve'
+        ? cacheControlledContent
+        : cacheControlledContent[0].text;
+    }
+    const singleTextContent = getBoundedSingleTextToolContent(
+      content,
+      maxChars
+    );
+    if (singleTextContent != null) {
+      return singleTextContent;
+    }
+  }
+  const serializableContent =
+    cacheControlledTextProjection === 'preserve'
+      ? stripAnthropicCacheControl([{ content }])[0].content
+      : content;
+  return serializeToolContentBounded(serializableContent, maxChars);
+}
+
+/**
+ * OpenAI Chat tool messages only accept strings or text-only parts, while the
+ * Responses API serializes any structured ToolMessage after graph accounting.
+ * Project every non-string tool result to one bounded string before the final
+ * provider payload is measured so both APIs receive the exact representation
+ * the budget guard counted. Native Responses computer screenshots stay
+ * structured because their dedicated converter sends the media block directly.
+ */
+function projectOpenAIToolMessageContentInternal(
+  messages: BaseMessage[],
+  maxChars: number,
+  deduplicateResponsesComputerCalls: boolean,
+  cacheControlledTextProjection: CacheControlledTextProjection
+): BaseMessage[] {
+  const pendingComputerCallIds: string[] = [];
+  const seenComputerCallIds = new Set<string>();
+  let projected: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    const messageRole = (message as BaseMessage & { role?: unknown }).role;
+    const isAssistant =
+      message.getType() === 'ai' || messageRole === 'assistant';
+    if (isAssistant) {
+      const parsedComputerCallIds = new Set<string>();
+      const toolCalls = (message as AIMessage).tool_calls;
+      if (Array.isArray(toolCalls)) {
+        for (const toolCall of toolCalls) {
+          const record = toolCall as ToolCall & {
+            isComputerTool?: unknown;
+          };
+          if (
+            record.type !== 'tool_call' ||
+            record.isComputerTool !== true ||
+            typeof record.id !== 'string' ||
+            record.id === ''
+          ) {
+            continue;
+          }
+          if (parsedComputerCallIds.has(record.id)) {
+            throw new Error(`Duplicate computer call id "${record.id}"`);
+          }
+          parsedComputerCallIds.add(record.id);
+          if (seenComputerCallIds.has(record.id)) {
+            throw new Error(`Duplicate computer call id "${record.id}"`);
+          }
+          seenComputerCallIds.add(record.id);
+          pendingComputerCallIds.push(record.id);
+        }
+      }
+
+      const rawOutput = (
+        message.response_metadata as {
+          output?: unknown;
+        }
+      ).output;
+      const fallbackOutput = (
+        message.additional_kwargs as {
+          tool_outputs?: unknown;
+        }
+      ).tool_outputs;
+      let actualToolOutputs: unknown[] = [];
+      if (Array.isArray(rawOutput) && rawOutput.length > 0) {
+        actualToolOutputs = rawOutput;
+      } else if (Array.isArray(fallbackOutput)) {
+        actualToolOutputs = fallbackOutput;
+      }
+      const rawComputerCallIds = new Set<string>();
+      for (const item of actualToolOutputs) {
+        if (item == null || typeof item !== 'object') {
+          continue;
+        }
+        const record = item as {
+          type?: unknown;
+          call_id?: unknown;
+        };
+        if (
+          record.type !== 'computer_call' ||
+          typeof record.call_id !== 'string' ||
+          record.call_id === ''
+        ) {
+          continue;
+        }
+        if (rawComputerCallIds.has(record.call_id)) {
+          throw new Error(`Duplicate computer call id "${record.call_id}"`);
+        }
+        rawComputerCallIds.add(record.call_id);
+        // LangChain can retain the same call in parsed and raw forms. It sends
+        // one logical call, so collapse that representation duplicate.
+        if (parsedComputerCallIds.has(record.call_id)) {
+          continue;
+        }
+        if (seenComputerCallIds.has(record.call_id)) {
+          throw new Error(`Duplicate computer call id "${record.call_id}"`);
+        }
+        seenComputerCallIds.add(record.call_id);
+        pendingComputerCallIds.push(record.call_id);
+      }
+
+      if (
+        deduplicateResponsesComputerCalls &&
+        Array.isArray(toolCalls) &&
+        rawComputerCallIds.size > 0
+      ) {
+        /**
+         * The non-streaming Responses converter marks parsed computer calls,
+         * but the streaming converter currently emits the same call as an
+         * ordinary parsed `computer_use` tool call. In both cases the raw
+         * `computer_call` item is authoritative and is replayed by LangChain,
+         * so remove every parsed representation with the same call id.
+         */
+        const projectedToolCalls = toolCalls.filter(
+          (toolCall) =>
+            typeof toolCall.id !== 'string' ||
+            !rawComputerCallIds.has(toolCall.id)
+        );
+        if (projectedToolCalls.length !== toolCalls.length) {
+          projected ??= [...messages];
+          projected[i] = cloneAIMessageWithToolCalls(
+            message as AIMessage,
+            projectedToolCalls,
+            rawComputerCallIds
+          );
+        }
+      }
+    }
+
+    if (
+      message instanceof ToolMessage &&
+      hasComputerCallOutputMarker(message)
+    ) {
+      const screenshot = getComputerCallOutputScreenshot(message.content);
+      if (screenshot == null) {
+        throw new Error('Invalid computer call output screenshot');
+      }
+      if (pendingComputerCallIds[0] !== message.tool_call_id) {
+        throw new Error(
+          `Invalid computer call output pairing for "${message.tool_call_id}"`
+        );
+      }
+      pendingComputerCallIds.shift();
+      projected ??= [...messages];
+      projected[i] = cloneToolMessageWithContent(message, [screenshot]);
+      continue;
+    }
+    if (
+      !(message instanceof ToolMessage) ||
+      typeof message.content === 'string'
+    ) {
+      continue;
+    }
+    projected ??= [...messages];
+    projected[i] = cloneToolMessageWithContent(
+      message,
+      projectStructuredOpenAIToolContent(
+        message.content,
+        maxChars,
+        cacheControlledTextProjection
+      )
+    );
+  }
+  if (pendingComputerCallIds.length > 0) {
+    throw new Error(
+      `Missing computer call output for "${pendingComputerCallIds[0]}"`
+    );
+  }
+  return projected ?? messages;
+}
+
+/** Projects OpenAI-compatible tool content without changing parsed call parents. */
+export function projectOpenAIToolMessageContent(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  return projectOpenAIToolMessageContentInternal(
+    messages,
+    maxChars,
+    false,
+    'serialize'
+  );
+}
+
+/** Projects an actual OpenAI-compatible Chat attempt and removes cache metadata. */
+export function projectOpenAIChatToolMessageContent(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  return projectOpenAIToolMessageContentInternal(
+    messages,
+    maxChars,
+    false,
+    'text'
+  );
+}
+
+/** Preserves OpenRouter's cache-decorated text blocks for a Chat attempt. */
+export function projectOpenRouterToolMessageContent(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  return projectOpenAIToolMessageContentInternal(
+    messages,
+    maxChars,
+    false,
+    'preserve'
+  );
+}
+
+/** Projects Responses tool content and collapses parsed/raw computer-call mirrors. */
+export function projectOpenAIResponsesToolMessageContent(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  return projectOpenAIToolMessageContentInternal(
+    messages,
+    maxChars,
+    true,
+    'text'
+  );
+}
+
+/** Removes Anthropic/OpenRouter cache metadata before unsupported providers run. */
+export function projectCacheControlledToolOutputsToText(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  let projected: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      !(message instanceof ToolMessage) ||
+      typeof message.content === 'string'
+    ) {
+      continue;
+    }
+    const cacheControlledContent = getBoundedCacheControlledTextToolContent(
+      message.content,
+      maxChars
+    );
+    if (cacheControlledContent == null) {
+      continue;
+    }
+    projected ??= [...messages];
+    projected[i] = cloneToolMessageWithContent(
+      message,
+      cacheControlledContent[0].text
+    );
+  }
+  return projected ?? messages;
+}
+
+/** Unwraps a canonical single text block after provider cache markers are removed. */
+export function projectSingleTextToolOutputsToText(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  let projected: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      !(message instanceof ToolMessage) ||
+      typeof message.content === 'string'
+    ) {
+      continue;
+    }
+    const text = getBoundedSingleTextToolContent(message.content, maxChars);
+    if (text == null) {
+      continue;
+    }
+    projected ??= [...messages];
+    projected[i] = cloneToolMessageWithContent(message, text);
+  }
+  return projected ?? messages;
+}
+
+/** Serializes provider-neutral structured tool outputs without media pairing. */
+export function projectStructuredToolOutputsToText(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
+  let projected: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      !(message instanceof ToolMessage) ||
+      typeof message.content === 'string' ||
+      hasComputerCallOutputMarker(message)
+    ) {
+      continue;
+    }
+    projected ??= [...messages];
+    projected[i] = cloneToolMessageWithContent(
+      message,
+      serializeToolContentBounded(message.content, maxChars)
+    );
+  }
+  return projected ?? messages;
+}
+
+/**
+ * Non-Responses providers cannot consume native computer screenshots. Keep
+ * the tool-call structure intact, but replace screenshot bytes with a bounded
+ * text marker at the actual invocation boundary.
+ */
+export function projectComputerCallOutputsToText(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  let projected: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (
+      !(message instanceof ToolMessage) ||
+      !hasComputerCallOutputMarker(message)
+    ) {
+      continue;
+    }
+    projected ??= [...messages];
+    projected[i] = cloneToolMessageWithContent(
+      message,
+      '[Computer screenshot omitted for this provider]'
+    );
+  }
+  return projected ?? messages;
+}
+
+export function projectAnthropicArtifactContent(
+  messages: BaseMessage[],
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+): BaseMessage[] {
   const lastMessage = messages[messages.length - 1];
-  if (!(lastMessage instanceof ToolMessage)) return;
+  if (!(lastMessage instanceof ToolMessage)) return messages;
 
   // Find the latest AIMessage with tool_calls that this tool message belongs to
   const latestAIParentIndex = findLastIndex(
     messages,
     (msg) =>
-      msg instanceof AIMessageChunk &&
-      (msg.tool_calls?.length ?? 0) > 0 &&
-      (msg.tool_calls?.some((tc) => tc.id === lastMessage.tool_call_id) ??
-        false)
+      ((msg instanceof AIMessage || msg instanceof AIMessageChunk) &&
+        (msg.tool_calls?.length ?? 0) > 0 &&
+        msg.tool_calls?.some((tc) => tc.id === lastMessage.tool_call_id)) ??
+      false
   );
 
-  if (latestAIParentIndex === -1) return;
+  if (latestAIParentIndex === -1) return messages;
 
   // Build tool call ID set and merge artifact content in a single forward pass.
-  const message = messages[latestAIParentIndex] as AIMessageChunk;
+  const message = messages[latestAIParentIndex] as AIMessage | AIMessageChunk;
   const toolCallIdSet = new Set<string>();
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
@@ -495,136 +1030,171 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
     }
   }
 
+  let formattedMessages: BaseMessage[] | undefined;
   for (let j = latestAIParentIndex + 1; j < messages.length; j++) {
     const msg = messages[j];
     if (
       msg instanceof ToolMessage &&
+      !isComputerCallOutputMessage(msg) &&
       toolCallIdSet.has(msg.tool_call_id) &&
       msg.artifact != null &&
-      Array.isArray(msg.artifact?.content)
+      ((typeof msg.artifact?.content === 'string' &&
+        msg.artifact.content.length > 0) ||
+        (Array.isArray(msg.artifact?.content) &&
+          msg.artifact.content.length > 0))
     ) {
-      const base = Array.isArray(msg.content)
+      const artifactContent =
+        typeof msg.artifact.content === 'string'
+          ? [
+            {
+              type: ContentTypes.TEXT,
+              text: msg.artifact.content,
+            },
+          ]
+          : msg.artifact.content;
+      const baseContent = Array.isArray(msg.content)
         ? msg.content
-        : [
-          {
-            type: ContentTypes.TEXT,
-            text: stringifyToolMessageContent(msg.content),
-          },
-        ];
-      msg.content = base.concat(msg.artifact.content);
+        : stringifyToolMessageContent(msg.content);
+      const content = appendBoundedContent(
+        compactToolContent(baseContent, maxChars).content,
+        artifactContent,
+        maxChars
+      );
+      formattedMessages ??= [...messages];
+      formattedMessages[j] = cloneToolMessageWithContent(msg, content, {
+        ...msg.artifact,
+        content: [],
+      });
+    }
+  }
+  return formattedMessages ?? messages;
+}
+
+/**
+ * Mutating compatibility wrapper retained for existing package consumers.
+ * New provider-call paths should use `projectAnthropicArtifactContent`.
+ */
+export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
+  const projected = projectAnthropicArtifactContent(messages);
+  if (projected === messages) {
+    return;
+  }
+  for (let i = 0; i < messages.length; i++) {
+    if (
+      messages[i] instanceof ToolMessage &&
+      projected[i] instanceof ToolMessage &&
+      projected[i] !== messages[i]
+    ) {
+      messages[i].content = projected[i].content;
     }
   }
 }
 
-/** Assistant bridge that lets a `user` image follow a `tool` result on strict providers. */
-const ARTIFACT_BRIDGE_TEXT = 'Here is the generated image:';
-/** Caption on the injected user message that carries the tool image(s). */
-const ARTIFACT_IMAGE_CAPTION = 'Generated image:';
-
-function isImageUrlPart(part: unknown): boolean {
-  return (
-    part != null &&
-    typeof part === 'object' &&
-    'type' in part &&
-    (part as { type?: string }).type === 'image_url'
-  );
-}
-
 /**
- * Presents tool image artifacts to OpenAI-compatible (and Google) providers.
- *
- * These APIs reject image parts inside a `tool` message, and strict ones
- * (Scaleway/Mistral) also reject a `user` message immediately after a `tool`
- * message ("Unexpected role 'user' after role 'tool'"). So the image can go
- * neither in the tool result nor directly after it. To still let a vision model
- * see a tool-generated image, keep the tool result text-only and, after the
- * trailing run of tool messages, insert a short assistant bridge followed by a
- * user message carrying the image(s). This satisfies role-alternation and
- * image-placement rules across OpenAI, Scaleway/Mistral, and Google.
- *
- * When the model is not vision-capable the images are dropped (the tool text
- * remains), matching the downstream image strip for non-vision models.
- *
- * Runs only for the tail tool round (the graph calls it when the last message
- * is a ToolMessage). Returns the message array to send; a new array is returned
- * only when image messages are appended, so the caller must use the return value.
- *
- * @param messages - Messages to send; expected to end with a ToolMessage.
- * @param visionCapable - Whether the target model can see images.
+ * Short assistant turn placed between the tool results and the projected user message.
+ * Strict OpenAI-compatible providers (Mistral, and Scaleway which fronts it) reject a
+ * `user` message that directly follows a `tool` message, so the alternation needs a
+ * bridge; OpenAI and Google accept it either way.
  */
-export function formatArtifactPayload(
+const ARTIFACT_BRIDGE_TEXT = 'Here is the tool output:';
+
+export function projectArtifactPayload(
   messages: BaseMessage[],
-  visionCapable: boolean = true
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS,
+  options?: {
+    /**
+     * Insert an assistant bridge before the projected user message. Required by providers
+     * that enforce role alternation after `tool`; harmless elsewhere. Defaults to false so
+     * existing callers keep the current message shape.
+     */
+    bridgeUserAfterTool?: boolean;
+  }
 ): BaseMessage[] {
-  // Restore artifacts from additional_kwargs (where ToolNode stores them);
-  // coerceMessageLikeToMessage preserves additional_kwargs but not the top-level
-  // artifact property.
-  for (const msg of messages) {
-    if (msg._getType() === 'tool') {
-      const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
-      const stored = toolMsg.additional_kwargs.artifact as
-        | t.MCPArtifact
-        | undefined;
-      if (stored != null) {
-        toolMsg.artifact = stored;
-      }
-    }
-  }
+  const lastMessageY = messages[messages.length - 1];
+  if (!(lastMessageY instanceof ToolMessage)) return messages;
 
-  if (messages.length === 0) {
-    return messages;
-  }
-  const last = messages[messages.length - 1];
-  if (last._getType() !== 'tool') {
-    return messages;
-  }
+  // Find the latest AIMessage with tool_calls that this tool message belongs to
+  const latestAIParentIndex = findLastIndex(
+    messages,
+    (msg) =>
+      ((msg instanceof AIMessage || msg instanceof AIMessageChunk) &&
+        (msg.tool_calls?.length ?? 0) > 0 &&
+        msg.tool_calls?.some((tc) => tc.id === lastMessageY.tool_call_id)) ??
+      false
+  );
 
-  // Walk back over the trailing run of tool messages (the just-executed round),
-  // collecting image parts and forcing every tool result to stay text-only.
-  const images: t.MessageContentComplex[] = [];
-  for (let i = messages.length - 1; i >= 0; i--) {
+  if (latestAIParentIndex === -1) return messages;
+
+  // Single pass: collect relevant tool messages with artifacts and aggregate
+  let aggregatedContent: BaseMessage['content'] | undefined;
+  let formattedMessages: BaseMessage[] | undefined;
+
+  for (let i = latestAIParentIndex + 1; i < messages.length; i++) {
     const msg = messages[i];
-    if (msg._getType() !== 'tool') {
-      break;
+    if (
+      !(msg instanceof ToolMessage) ||
+      isComputerCallOutputMessage(msg) ||
+      !(
+        (typeof msg.artifact?.content === 'string' &&
+          msg.artifact.content.length > 0) ||
+        (Array.isArray(msg.artifact?.content) &&
+          msg.artifact.content.length > 0)
+      )
+    ) {
+      continue;
     }
-    const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
-    if (Array.isArray(toolMsg.content)) {
-      const textOnly = toolMsg.content.filter((p) => !isImageUrlPart(p));
-      toolMsg.content =
-        textOnly.length > 0
-          ? textOnly
-          : stringifyToolMessageContent(toolMsg.content);
-    }
-    const artifact = toolMsg.artifact;
-    if (artifact != null && Array.isArray(artifact.content)) {
-      images.unshift(...artifact.content.filter(isImageUrlPart));
-    }
+    aggregatedContent = appendBoundedContent(
+      aggregatedContent,
+      msg.content,
+      maxChars
+    );
+    formattedMessages ??= [...messages];
+    formattedMessages[i] = cloneToolMessageWithContent(
+      msg,
+      'Tool response is included in the next message as a Human message',
+      {
+        ...msg.artifact,
+        content: [],
+      }
+    );
+    aggregatedContent = appendBoundedContent(
+      aggregatedContent,
+      msg.artifact.content,
+      maxChars
+    );
   }
 
-  if (images.length === 0 || !visionCapable) {
-    return messages;
+  if (aggregatedContent != null) {
+    if (options?.bridgeUserAfterTool === true) {
+      formattedMessages?.push(new AIMessage({ content: ARTIFACT_BRIDGE_TEXT }));
+    }
+    formattedMessages?.push(new HumanMessage({ content: aggregatedContent }));
   }
-
-  return [
-    ...messages,
-    new AIMessage({ content: ARTIFACT_BRIDGE_TEXT }),
-    new HumanMessage({
-      content: toLangChainContent([
-        { type: ContentTypes.TEXT, text: ARTIFACT_IMAGE_CAPTION },
-        ...images,
-      ]),
-    }),
-  ];
+  return formattedMessages ?? messages;
 }
 
 /**
- * Finds the last index in an array that satisfies the predicate.
- * Iterates backwards from the end of the array.
- *
- * @param array - Array to search
- * @param predicate - Function to test each element
- * @returns Index of the last matching element, or -1 if not found
+ * Mutating compatibility wrapper retained for existing package consumers.
+ * New provider-call paths should use `projectArtifactPayload`.
  */
+export function formatArtifactPayload(messages: BaseMessage[]): void {
+  const originalLength = messages.length;
+  const projected = projectArtifactPayload(messages);
+  if (projected === messages) {
+    return;
+  }
+  for (let i = 0; i < originalLength; i++) {
+    if (
+      messages[i] instanceof ToolMessage &&
+      projected[i] instanceof ToolMessage &&
+      projected[i] !== messages[i]
+    ) {
+      messages[i].content = projected[i].content;
+    }
+  }
+  messages.push(...projected.slice(originalLength));
+}
+
 export function findLastIndex<T>(
   array: T[],
   predicate: (value: T) => boolean
