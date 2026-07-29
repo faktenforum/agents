@@ -1648,6 +1648,7 @@ export class AgentContext {
       provider: this.provider,
       tokenCounter,
       maxTokens: this.maxContextTokens,
+      maxToolResultChars: this.maxToolResultChars,
       thinkingEnabled: isThinkingEnabled(this.provider, this.clientOptions),
       indexTokenCountMap,
       contextPruningConfig: this.contextPruningConfig,

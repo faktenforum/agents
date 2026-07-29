@@ -1,4 +1,4 @@
-import axios, { isAxiosError } from 'axios';
+import axios from 'axios';
 import type * as t from './types';
 import { createDefaultLogger, formatErrorForLog } from './utils';
 
@@ -209,6 +209,25 @@ export class CohereReranker extends BaseReranker {
   }
 }
 
+export class InfinityReranker extends BaseReranker {
+  constructor(logger?: t.Logger) {
+    super(logger);
+    // No API key needed for the placeholder implementation
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    topK: number = 5
+  ): Promise<t.Highlight[]> {
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with Infinity (placeholder)`
+    );
+    // This would be replaced with actual Infinity reranker implementation
+    return this.getDefaultRanking(documents, topK);
+  }
+}
+
 export class CustomReranker extends BaseReranker {
   private apiUrl: string | undefined;
   private model: string | undefined;
@@ -309,38 +328,12 @@ export class CustomReranker extends BaseReranker {
         return this.getDefaultRanking(documents, topK);
       }
     } catch (error) {
-      this.logger.error('Error using custom reranker:', error);
-      if (isAxiosError(error) && error.response) {
-        this.logger.error(
-          'Custom reranker response status:',
-          error.response.status
-        );
-        this.logger.error(
-          'Custom reranker response data:',
-          JSON.stringify(error.response.data)
-        );
-      }
+      this.logger.error(
+        'Error using custom reranker',
+        formatErrorForLog(error)
+      );
       return this.getDefaultRanking(documents, topK);
     }
-  }
-}
-
-export class InfinityReranker extends BaseReranker {
-  constructor(logger?: t.Logger) {
-    super(logger);
-    // No API key needed for the placeholder implementation
-  }
-
-  async rerank(
-    query: string,
-    documents: string[],
-    topK: number = 5
-  ): Promise<t.Highlight[]> {
-    this.logger.debug(
-      `Reranking ${documents.length} chunks with Infinity (placeholder)`
-    );
-    // This would be replaced with actual Infinity reranker implementation
-    return this.getDefaultRanking(documents, topK);
   }
 }
 

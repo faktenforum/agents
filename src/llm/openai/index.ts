@@ -29,16 +29,28 @@ import type {
   BaseMessageChunk,
   UsageMetadata,
 } from '@langchain/core/messages';
+import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
+import type { PromptCacheTtl } from '@/messages/cache';
+import {
+  buildAnthropicCacheControl,
+  resolvePromptCacheTtl,
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+} from '@/messages/cache';
 import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import {
+  projectOpenAIResponsesToolMessageContent,
+  projectToolStreamContentForProvider,
+} from '@/messages/core';
 import {
   isReasoningModel,
   _convertMessagesToOpenAIParams,
@@ -106,13 +118,20 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
+  preserveToolCacheControl?: boolean;
+  responsesPromptCache?: boolean;
+  responsesPromptCacheTtl?: PromptCacheTtl;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  /** Whether the model can accept image input; false strips images (default true). */
+  vision?: boolean;
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  /** Whether the model can accept image input; false strips images (default true). */
+  vision?: boolean;
 };
 type ReasoningCallOptions = {
   reasoning?: OpenAIClient.Reasoning;
@@ -172,6 +191,40 @@ type OpenAIManagedRequestParams = {
   };
   safety_identifier?: string;
 };
+
+function stripResponsesToolCacheControl<T>(tools: T): T {
+  if (!Array.isArray(tools)) {
+    return tools;
+  }
+
+  return tools.map((tool) => {
+    if (tool == null || typeof tool !== 'object') {
+      return tool;
+    }
+    const clone = { ...(tool as Record<string, unknown>) };
+    delete clone.cache_control;
+    if (
+      clone.extras != null &&
+      typeof clone.extras === 'object' &&
+      !Array.isArray(clone.extras)
+    ) {
+      clone.extras = { ...(clone.extras as Record<string, unknown>) };
+      delete (clone.extras as Record<string, unknown>).cache_control;
+    }
+    return clone;
+  }) as T;
+}
+
+function projectOpenAIResponsesProviderMessages(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  return projectOpenAIResponsesToolMessageContent(
+    stripAnthropicCacheControl(
+      stripBedrockCacheControl(projectToolStreamContentForProvider(messages))
+    )
+  );
+}
+
 type ResponsesRequest =
   | OpenAIClient.Responses.ResponseCreateParamsStreaming
   | OpenAIClient.Responses.ResponseCreateParamsNonStreaming;
@@ -1120,6 +1173,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
+  private preserveToolCacheControl?: boolean;
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
 
@@ -1129,6 +1183,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
       fields?.convertReasoningDetailsToContent;
+    this.preserveToolCacheControl = fields?.preserveToolCacheControl;
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.safetyIdentifier = fields?.safety_identifier;
   }
@@ -1229,6 +1284,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         includeReasoningContent: this.includeReasoningContent,
         includeReasoningDetails: this.includeReasoningDetails,
         convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        preserveToolCacheControl: this.preserveToolCacheControl,
       }
     );
 
@@ -1397,6 +1453,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         includeReasoningContent: this.includeReasoningContent,
         includeReasoningDetails: this.includeReasoningDetails,
         convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        preserveToolCacheControl: this.preserveToolCacheControl,
       });
 
     const params = {
@@ -1537,21 +1594,52 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   private promptCacheExplicit?: boolean;
+  private responsesPromptCache?: boolean;
+  private responsesPromptCacheTtl?: PromptCacheTtl;
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.responsesPromptCache = fields?.responsesPromptCache;
+    this.responsesPromptCacheTtl = fields?.responsesPromptCacheTtl;
     this.safetyIdentifier = fields?.safety_identifier;
   }
 
   invocationParams(
     options?: this['ParsedCallOptions']
   ): ReturnType<OriginalChatOpenAIResponses['invocationParams']> {
-    const params = applyManagedRequestParams(super.invocationParams(options), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    const cacheOptions = options as
+      | {
+          promptCache?: boolean;
+          promptCacheTtl?: PromptCacheTtl;
+        }
+      | undefined;
+    const promptCache = cacheOptions?.promptCache ?? this.responsesPromptCache;
+    const cacheControl =
+      promptCache === true
+        ? buildAnthropicCacheControl(
+          resolvePromptCacheTtl(
+            cacheOptions?.promptCacheTtl ?? this.responsesPromptCacheTtl
+          )
+        )
+        : undefined;
+    const baseParams = applyManagedRequestParams(
+      super.invocationParams(options),
+      {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      }
+    );
+    const params = {
+      ...baseParams,
+      ...(baseParams.tools != null && {
+        tools: stripResponsesToolCacheControl(baseParams.tools),
+      }),
+      ...(cacheControl != null && {
+        cache_control: cacheControl,
+      }),
+    };
     if (shouldIncludeEncryptedReasoning(this.model, params)) {
       params.include = [
         ...new Set([
@@ -1596,7 +1684,11 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const result = await super._generate(messages, options, runManager);
+    const result = await super._generate(
+      projectOpenAIResponsesProviderMessages(messages),
+      options,
+      runManager
+    );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
     }
@@ -1609,13 +1701,25 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     for await (const chunk of super._streamResponseChunks(
-      messages,
+      projectOpenAIResponsesProviderMessages(messages),
       options,
       runManager
     )) {
       attachCacheWriteUsage(chunk.message);
       yield chunk;
     }
+  }
+
+  async *_streamChatModelEvents(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatModelStreamEvent> {
+    yield* super._streamChatModelEvents(
+      projectOpenAIResponsesProviderMessages(messages),
+      options,
+      runManager
+    );
   }
 
   protected _getReasoningParams(
@@ -1933,20 +2037,20 @@ function withLibreChatOpenAIFields(
 }
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
-  _lc_stream_delay?: number;
-
-  /** When false, image_url parts are stripped before sending (avoids non-multimodal API errors). */
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
   protected visionCapable: boolean;
 
+  _lc_stream_delay?: number;
+
   constructor(
-    fields?: LibreChatOpenAIFields & {
-      vision?: boolean;
-    } & t.OpenAIChatInput['modelKwargs']
+    fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
-    const { vision, ...rest } = fields ?? {};
-    super(withLibreChatOpenAIFields(rest as LibreChatOpenAIFields));
+    super(withLibreChatOpenAIFields(fields));
+    this.visionCapable = fields?.vision ?? true;
     this._lc_stream_delay = fields?._lc_stream_delay;
-    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2032,7 +2136,11 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     return delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager
@@ -2041,21 +2149,20 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 }
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
-  _lc_stream_delay?: number;
-
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
   protected visionCapable: boolean;
 
-  constructor(fields?: LibreChatAzureOpenAIFields & { vision?: boolean }) {
-    const { vision, ...rest } = fields ?? {};
-    super(rest as LibreChatAzureOpenAIFields);
-    this.completions = new LibreChatAzureOpenAICompletions(
-      rest as LibreChatAzureOpenAIFields
-    );
-    this.responses = new LibreChatAzureOpenAIResponses(
-      rest as LibreChatAzureOpenAIFields
-    );
+  _lc_stream_delay?: number;
+
+  constructor(fields?: LibreChatAzureOpenAIFields) {
+    super(fields);
+    this.visionCapable = fields?.vision ?? true;
+    this.completions = new LibreChatAzureOpenAICompletions(fields);
+    this.responses = new LibreChatAzureOpenAIResponses(fields);
     this._lc_stream_delay = fields?._lc_stream_delay;
-    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2165,19 +2272,24 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   }
 }
 export class ChatDeepSeek extends OriginalChatDeepSeek {
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
   protected visionCapable: boolean;
+
   _lc_stream_delay?: number;
 
   constructor(
     fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
-      vision?: boolean;
       _lc_stream_delay?: number;
+      /** Whether the model can accept image input; false strips images (default true). */
+      vision?: boolean;
     }
   ) {
-    const { vision, ...rest } = fields ?? {};
-    super(rest as ConstructorParameters<typeof OriginalChatDeepSeek>[0]);
+    super(fields);
+    this.visionCapable = fields?.vision ?? true;
     this._lc_stream_delay = fields?._lc_stream_delay;
-    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2694,21 +2806,26 @@ export class ChatMoonshot extends ChatOpenAI {
 }
 
 export class ChatXAI extends OriginalChatXAI {
-  _lc_stream_delay?: number;
-
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
   protected visionCapable: boolean;
+
+  _lc_stream_delay?: number;
 
   constructor(
     fields?: Partial<ChatXAIInput> & {
       configuration?: { baseURL?: string };
       clientConfig?: { baseURL?: string };
       _lc_stream_delay?: number;
+      /** Whether the model can accept image input; false strips images (default true). */
       vision?: boolean;
     }
   ) {
     super(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay;
     this.visionCapable = fields?.vision ?? true;
+    this._lc_stream_delay = fields?._lc_stream_delay;
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
     if (customBaseURL != null && customBaseURL) {
