@@ -277,7 +277,7 @@ export class AgentContext {
   /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
   _sourceInputs?: t.AgentInputs;
   /** Subagent configurations for hierarchical delegation. */
-  subagentConfigs?: t.SubagentConfig[];
+  subagentConfigs?: t.SubagentConfigEntry[];
   /** Maximum subagent nesting depth. */
   maxSubagentDepth?: number;
   /** Instructions for this agent */
@@ -1716,6 +1716,11 @@ export class AgentContext {
   /** Marks token data as stale before a new LLM call. */
   markTokensStale(): void {
     this.totalTokensFresh = false;
+  }
+
+  /** Returns a snapshot of the deferred tools discovered in this context. */
+  getDiscoveredTools(): string[] {
+    return Array.from(this.discoveredToolNames);
   }
 
   /**

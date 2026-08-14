@@ -18,6 +18,8 @@ import type * as t from '@/types';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { convertMessageContentToParts } from '@/llm/google/utils/common';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { toLangChainContent } from '@/messages/langchain';
 import { Constants, Providers } from '@/common';
@@ -555,7 +557,7 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     responses.model.defaultOptions = { tools: [] };
     responses.model._useResponsesApi = (options) =>
       Array.isArray((options as { tools?: unknown[] } | undefined)?.tools) &&
-      ((options as { tools: unknown[] }).tools.length ?? 0) > 0;
+      (options as { tools: unknown[] }).tools.length > 0;
 
     await attemptInvoke(
       {
@@ -823,6 +825,190 @@ describe('tryFallbackProviders applies the same lazy annotation transform', () =
     expect(invokeMessages[invokeMessages.length - 1][0].content).toBe(
       '[ref: tool0turn0]\noutput'
     );
+
+    jest.dontMock('@/llm/init');
+    jest.resetModules();
+  });
+
+  it('stops draining a cancellation-ignoring stream once the breaker trips', async () => {
+    const abort = new AbortController();
+    /** Statically imported class: neighboring tests reset the module
+     * registry, and a dynamically imported instance would fail the
+     * statically-linked drain loop's instanceof check. */
+    const trip = new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+      toolName: 'db_query',
+    });
+    let yields = 0;
+    const model: StubModel = {
+      stream: jest.fn(async function* (): AsyncGenerator<AIMessageChunk> {
+        for (let i = 0; i < 5; i++) {
+          yields += 1;
+          yield new AIMessageChunk({ content: `c${i}` });
+        }
+      }),
+    };
+
+    /** The stub ignores the abort signal entirely; only the per-chunk
+     * breaker check in the drain loop can stop it. */
+    await expect(
+      attemptInvoke(
+        {
+          model: model as t.ChatModel,
+          messages: [new HumanMessage('hi')],
+          provider: Providers.ANTHROPIC,
+          onChunk: () => {
+            abort.abort(trip);
+          },
+        },
+        { signal: abort.signal }
+      )
+    ).rejects.toBe(trip);
+    expect(yields).toBeLessThanOrEqual(2);
+  });
+
+  it('rejects before invoking a fallback when the breaker tripped during preparation', async () => {
+    const abort = new AbortController();
+    const { invokeMessages, model } = buildCapturingModel();
+    await jest.isolateModulesAsync(async () => {
+      jest.doMock('@/llm/init', () => ({
+        initializeModel: (): unknown => model,
+      }));
+      const { tryFallbackProviders: freshTry } = (await import(
+        '@/llm/invoke'
+      )) as { tryFallbackProviders: typeof tryFallbackProviders };
+      const { StreamLimitExceededError: FreshStreamLimitError } = (await import(
+        '@/llm/streamLimits'
+      )) as typeof import('@/llm/streamLimits');
+      const trip = new FreshStreamLimitError({
+        kind: 'tool_call_args',
+        limit: 10,
+        observed: 11,
+        toolName: 'db_query',
+      });
+
+      /** The sibling's trip lands while fallback preparation is awaited; the
+       * fallback must not be invoked at all — a provider that ignores the
+       * aborted signal and SUCCEEDS would resolve a run that must reject. */
+      await expect(
+        freshTry({
+          fallbacks: [{ provider: Providers.ANTHROPIC }],
+          messages: [
+            new ToolMessage({
+              name: 'echo',
+              tool_call_id: 'tc1',
+              status: 'success',
+              content: 'output',
+            }),
+          ],
+          primaryError: new Error('primary failed'),
+          config: { signal: abort.signal },
+          prepareProviderMessages: async ({ messages: preparedMessages }) => {
+            abort.abort(trip);
+            return preparedMessages;
+          },
+        })
+      ).rejects.toBe(trip);
+    });
+    expect(invokeMessages).toHaveLength(0);
+
+    jest.dontMock('@/llm/init');
+  });
+
+  it('neutralizes preempted Responses history before an OpenAI Chat fallback', async () => {
+    const reasoning = {
+      id: 'rs_fallback',
+      type: 'reasoning',
+      status: 'completed',
+      summary: [],
+      encrypted_content: 'opaque-fallback-reasoning',
+    };
+    const toolOutput = {
+      id: 'ci_fallback',
+      type: 'code_interpreter_call',
+      status: 'completed',
+      code: 'print("fallback result")',
+      outputs: [{ type: 'logs', logs: 'fallback result' }],
+    };
+    const translatedMessage = new AIMessage({
+      content: [{ type: 'text', text: 'Partial answer.' }],
+      additional_kwargs: {
+        reasoning,
+        tool_outputs: [toolOutput],
+      },
+      response_metadata: { model_provider: 'openai' },
+    });
+    const message = new AIMessage({
+      contentBlocks: [
+        ...translatedMessage.contentBlocks,
+        {
+          type: 'non_standard',
+          value: {
+            id: 'rs_bare_fallback',
+            type: 'reasoning',
+            summary: [],
+          },
+        },
+        {
+          type: 'image',
+          mimeType: 'image/png',
+          data: 'AA==',
+          id: 'ig_fallback',
+          metadata: { status: 'completed' },
+        },
+      ],
+      additional_kwargs: {
+        reasoning,
+        tool_outputs: [toolOutput],
+      },
+      response_metadata: {
+        model_provider: 'openai',
+        output_version: 'v1',
+        preempted: true,
+      },
+    });
+    const { invokeMessages, model } = buildCapturingModel();
+    model._useResponsesApi = () => false;
+    jest.doMock('@/llm/init', () => ({
+      initializeModel: (): unknown => model,
+    }));
+    jest.resetModules();
+    const { tryFallbackProviders: freshTry } = (await import(
+      '@/llm/invoke'
+    )) as { tryFallbackProviders: typeof tryFallbackProviders };
+
+    await freshTry({
+      fallbacks: [
+        {
+          provider: Providers.OPENAI,
+          clientOptions: { model: 'gpt-5.6' },
+        },
+      ],
+      messages: [message],
+      primaryError: new Error('primary failed'),
+    });
+
+    const sent = invokeMessages[invokeMessages.length - 1][0] as AIMessage;
+    expect(sent).not.toBe(message);
+    expect(sent.content).toEqual([
+      { type: 'text', text: 'Partial answer.' },
+      { type: 'text', text: expect.stringContaining('fallback result') },
+    ]);
+    expect(sent.additional_kwargs).toEqual({});
+    expect(JSON.stringify(sent.toJSON())).not.toMatch(/rs_|ci_|ig_/);
+    const chatPayload = _convertMessagesToOpenAIParams([sent], 'gpt-5.6');
+    expect(chatPayload).toEqual([
+      {
+        role: 'assistant',
+        content: sent.content,
+      },
+    ]);
+    expect(JSON.stringify(chatPayload)).not.toMatch(/rs_|ci_|ig_/);
+    expect(JSON.stringify(message.toJSON())).toContain('rs_fallback');
+    expect(JSON.stringify(message.toJSON())).toContain('ci_fallback');
+    expect(JSON.stringify(message.toJSON())).toContain('ig_fallback');
 
     jest.dontMock('@/llm/init');
     jest.resetModules();

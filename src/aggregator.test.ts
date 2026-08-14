@@ -1,15 +1,6 @@
-import { nanoid } from 'nanoid';
-import { MessageContentText } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { GraphEvents, StepTypes, ContentTypes } from '@/common';
 import { createContentAggregator } from './stream';
-import { SplitStreamHandler } from './splitStream';
-import { createMockStream } from './mockStream';
-
-// Mock sleep to speed up tests
-jest.mock('@/utils', () => ({
-  sleep: (): Promise<void> => Promise.resolve(),
-}));
 
 const createRunStep = (id: string): t.RunStep => ({
   id,
@@ -21,156 +12,6 @@ const createRunStep = (id: string): t.RunStep => ({
     message_creation: { message_id: id },
   },
   usage: null,
-});
-
-describe('Stream Generation and Handling', () => {
-  let mockHandlers: {
-    [GraphEvents.ON_RUN_STEP]: jest.Mock;
-    [GraphEvents.ON_MESSAGE_DELTA]: jest.Mock;
-  };
-
-  beforeEach(() => {
-    mockHandlers = {
-      [GraphEvents.ON_RUN_STEP]: jest.fn(),
-      [GraphEvents.ON_MESSAGE_DELTA]: jest.fn(),
-    };
-  });
-
-  it('should properly stream tokens including spaces', async () => {
-    const stream = createMockStream({
-      text: 'Hello world!',
-      streamRate: 0,
-    })();
-
-    const tokens: string[] = [];
-    for await (const chunk of stream) {
-      const content = chunk.choices?.[0]?.delta.content ?? '';
-      if (content) tokens.push(content);
-    }
-
-    expect(tokens).toEqual(['Hello', ' ', 'world!']);
-  });
-
-  it('should handle code blocks without splitting them', async () => {
-    const runId = nanoid();
-    const handler = new SplitStreamHandler({
-      runId,
-      blockThreshold: 10,
-      handlers: mockHandlers,
-    });
-
-    const codeText = `Code:
-\`\`\`
-const x = 1;
-const y = 2;
-const z = 2;
-const a = 2;
-const b = 2;
-const c = 2;
-const d = 2;
-const e = 2;
-const f = 2;
-const g = 2;
-const h = 2;
-\`\`\`
-End code.`;
-
-    const stream = createMockStream({
-      text: codeText,
-      streamRate: 0,
-    })();
-
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
-
-    // Verify that only one message block was created for the code section
-    const runSteps = mockHandlers[GraphEvents.ON_RUN_STEP].mock.calls;
-    expect(runSteps.length).toBe(2); // Should only create one message block
-  });
-
-  it('should split content when exceeding threshold', async () => {
-    const runId = nanoid();
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: mockHandlers,
-      // Set a very low threshold for testing
-      blockThreshold: 10,
-    });
-
-    // Make the text longer and ensure it has clear breaking points
-    const longText =
-      'This is the first sentence. And here is another sentence. And yet another one here. Finally one more.';
-
-    const stream = createMockStream({
-      text: longText,
-      streamRate: 0,
-    })();
-
-    // For debugging
-    // let totalLength = 0;
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-      // For debugging
-      // const content = chunk.choices?.[0]?.delta.content;
-      // if (content) {
-      //   totalLength += content.length;
-      //   console.log(`Current length: ${totalLength}, Content: "${content}"`);
-      // }
-    }
-
-    // Verify multiple message blocks were created
-    const runSteps = mockHandlers[GraphEvents.ON_RUN_STEP].mock.calls;
-    // console.log('Number of run steps:', runSteps.length);
-    expect(runSteps.length).toEqual(handler.currentIndex + 1);
-  });
-
-  it('should handle reasoning text separately', async () => {
-    const runId = nanoid();
-    new SplitStreamHandler({
-      runId,
-      handlers: mockHandlers,
-    });
-
-    const stream = createMockStream({
-      text: 'Main content',
-      reasoningText: 'Reasoning text',
-      streamRate: 0,
-    })();
-
-    const reasoningTokens: string[] = [];
-    const contentTokens: string[] = [];
-
-    for await (const chunk of stream) {
-      const reasoning = chunk.choices?.[0]?.delta.reasoning_content ?? '';
-      const content = chunk.choices?.[0]?.delta.content ?? '';
-
-      if (reasoning) reasoningTokens.push(reasoning);
-      if (content) contentTokens.push(content);
-    }
-
-    expect(reasoningTokens.length).toBeGreaterThan(0);
-    expect(contentTokens.length).toBeGreaterThan(0);
-  });
-
-  it('should preserve empty strings and whitespace', async () => {
-    const stream = createMockStream({
-      text: 'Hello  world', // Note double space
-      streamRate: 0,
-    })();
-
-    const tokens: string[] = [];
-    for await (const chunk of stream) {
-      const content = chunk.choices?.[0]?.delta.content ?? '';
-      if (!content) {
-        return;
-      }
-      tokens.push(content);
-    }
-
-    expect(tokens).toContain(' ');
-    expect(tokens.join('')).toBe('Hello  world');
-  });
 });
 
 describe('ContentAggregator empty deltas', () => {
@@ -892,9 +733,7 @@ describe('ContentAggregator physical content indices', () => {
         id: 'step_late_ids',
         delta: {
           type: StepTypes.TOOL_CALLS,
-          tool_calls: [
-            { index: 2, name: 'first', args: '{"value":"first"}' },
-          ],
+          tool_calls: [{ index: 2, name: 'first', args: '{"value":"first"}' }],
         },
       } as t.RunStepDeltaEvent,
     });
@@ -1155,540 +994,221 @@ describe('ContentAggregator provider-specific parts', () => {
   });
 });
 
-describe('ContentAggregator with SplitStreamHandler', () => {
-  it('should aggregate content from multiple message blocks', async () => {
-    const runId = nanoid();
+describe('ContentAggregator multi-entry deltas', () => {
+  it('concatenates every text entry of a message delta in order', () => {
     const { contentParts, aggregateContent } = createContentAggregator();
 
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_RUN_STEP]: aggregateContent,
-        [GraphEvents.ON_MESSAGE_DELTA]: aggregateContent,
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_multi_text'),
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_multi_text',
+        delta: {
+          content: [
+            { type: ContentTypes.TEXT, text: 'Hello ' },
+            { type: ContentTypes.TEXT, text: 'streaming ' },
+            { type: ContentTypes.TEXT, text: 'world' },
+          ],
+        },
       },
-      blockThreshold: 5,
     });
 
-    const text = 'First sentence. Second sentence. Third sentence.';
-    const stream = createMockStream({ text, streamRate: 0 })();
-
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
-
-    expect(contentParts.length).toBeGreaterThan(0);
-    contentParts.forEach((part) => {
-      expect(part?.type).toBe(ContentTypes.TEXT);
-      if (part?.type === ContentTypes.TEXT) {
-        expect(typeof part.text).toBe('string');
-        expect(part.text.length).toBeGreaterThan(0);
-      }
-    });
-
-    const fullText = contentParts
-      .filter((part) => part?.type === ContentTypes.TEXT)
-      .map((part) => (part?.type === ContentTypes.TEXT ? part.text : ''))
-      .join('');
-    expect(fullText).toBe(text);
-  });
-
-  it('should maintain content order across splits', async () => {
-    const runId = nanoid();
-    const { contentParts, aggregateContent } = createContentAggregator();
-
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_RUN_STEP]: aggregateContent,
-        [GraphEvents.ON_MESSAGE_DELTA]: aggregateContent,
-      },
-      blockThreshold: 15,
-    });
-
-    const text = 'First part. Second part. Third part.';
-    const stream = createMockStream({ text, streamRate: 0 })();
-
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
-
-    const texts = contentParts
-      .filter((part) => part?.type === ContentTypes.TEXT)
-      .map((part) => (part?.type === ContentTypes.TEXT ? part.text : ''));
-
-    expect(texts[0]).toContain('First');
-    expect(texts[texts.length - 1]).toContain('Third');
-  });
-
-  it('should handle code blocks as single content parts', async () => {
-    const runId = nanoid();
-    const { contentParts, aggregateContent } = createContentAggregator();
-
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_RUN_STEP]: aggregateContent,
-        [GraphEvents.ON_MESSAGE_DELTA]: aggregateContent,
-      },
-      blockThreshold: 10,
-    });
-
-    const text = `Before code.
-\`\`\`python
-def test():
-    return True
-\`\`\`
-After code.`;
-
-    const stream = createMockStream({ text, streamRate: 0 })();
-
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
-
-    const codeBlockPart = contentParts.find(
-      (part) =>
-        part?.type === ContentTypes.TEXT &&
-        part.text.includes('```python') === true
-    );
-
-    expect(codeBlockPart).toBeDefined();
-    if (codeBlockPart?.type === ContentTypes.TEXT) {
-      expect(codeBlockPart.text).toContain('def test()');
-      expect(codeBlockPart.text).toContain('return True');
-    }
-  });
-
-  it('should properly map steps to their content', async () => {
-    const runId = nanoid();
-    const { contentParts, aggregateContent, stepMap } =
-      createContentAggregator();
-
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_RUN_STEP]: aggregateContent,
-        [GraphEvents.ON_MESSAGE_DELTA]: aggregateContent,
-      },
-      blockThreshold: 5,
-    });
-
-    const text = 'Hi. Ok. Yes.';
-    const stream = createMockStream({ text, streamRate: 0 })();
-
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
-
-    Array.from(stepMap.entries()).forEach(([_stepId, step]) => {
-      expect(step?.type).toBe(StepTypes.MESSAGE_CREATION);
-      const currentIndex = step?.index ?? -1;
-      const stepContent = contentParts[currentIndex];
-      if (!stepContent && currentIndex > 0) {
-        const prevStepContent = contentParts[currentIndex - 1];
-        expect(
-          (prevStepContent as MessageContentText | undefined)?.text
-        ).toEqual(text);
-      } else if (stepContent?.type === ContentTypes.TEXT) {
-        expect(stepContent.text.length).toBeGreaterThan(0);
-      }
-    });
-
-    contentParts.forEach((part, index) => {
-      const hasMatchingStep = Array.from(stepMap.values()).some(
-        (step) => step?.index === index
-      );
-      expect(hasMatchingStep).toBe(true);
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hello streaming world',
     });
   });
 
-  it('should aggregate content across multiple splits while preserving order', async () => {
-    const runId = nanoid();
+  it('concatenates every think entry of a reasoning delta in order', () => {
     const { contentParts, aggregateContent } = createContentAggregator();
 
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_RUN_STEP]: aggregateContent,
-        [GraphEvents.ON_MESSAGE_DELTA]: aggregateContent,
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_multi_think'),
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data: {
+        id: 'step_multi_think',
+        delta: {
+          content: [
+            { type: ContentTypes.THINK, think: 'First reasoning block. ' },
+            { type: ContentTypes.THINK, think: 'Second reasoning block.' },
+          ],
+        },
       },
-      blockThreshold: 10,
     });
 
-    const text = 'A. B. C. D. E. F.';
-    const stream = createMockStream({ text, streamRate: 0 })();
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.THINK,
+      think: 'First reasoning block. Second reasoning block.',
+    });
+  });
 
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
+  it('accumulates across multi-entry and single-entry deltas alike', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
 
-    const letters = ['A', 'B', 'C', 'D', 'E', 'F'];
-    let letterIndex = 0;
-
-    contentParts.forEach((part) => {
-      if (part?.type === ContentTypes.TEXT) {
-        while (
-          letterIndex < letters.length &&
-          part.text.includes(letters[letterIndex]) === true
-        ) {
-          letterIndex++;
-        }
-      }
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_mixed_cadence'),
     });
 
-    expect(letterIndex).toBe(letters.length);
+    aggregateContent({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data: {
+        id: 'step_mixed_cadence',
+        delta: {
+          content: [
+            { type: ContentTypes.THINK, think: 'One. ' },
+            { type: ContentTypes.THINK, think: 'Two. ' },
+          ],
+        },
+      },
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_REASONING_DELTA,
+      data: {
+        id: 'step_mixed_cadence',
+        delta: { content: [{ type: ContentTypes.THINK, think: 'Three.' }] },
+      },
+    });
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.THINK,
+      think: 'One. Two. Three.',
+    });
   });
 });
 
-describe('SplitStreamHandler with Reasoning Tokens', () => {
-  it('should apply same splitting rules to both content types', async () => {
-    const runId = nanoid();
-    const mockHandlers: t.SplitStreamHandlers = {
-      [GraphEvents.ON_RUN_STEP]: jest.fn(),
-      [GraphEvents.ON_MESSAGE_DELTA]: jest.fn(),
-      [GraphEvents.ON_REASONING_DELTA]: jest.fn(),
-    };
-
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: mockHandlers,
-      blockThreshold: 3,
-    });
-
-    const stream = createMockStream({
-      text: 'First text. Second text. Third text.',
-      reasoningText: 'First thought. Second thought. Third thought.',
-      streamRate: 0,
-    })();
-
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
-
-    const runSteps = (mockHandlers[GraphEvents.ON_RUN_STEP] as jest.Mock).mock
-      .calls;
-    const reasoningDeltas = (
-      mockHandlers[GraphEvents.ON_REASONING_DELTA] as jest.Mock
-    ).mock.calls;
-    const messageDeltas = (
-      mockHandlers[GraphEvents.ON_MESSAGE_DELTA] as jest.Mock
-    ).mock.calls;
-
-    // Both content types should create multiple blocks
-    expect(runSteps.length).toBeGreaterThan(1);
-    expect(reasoningDeltas.length).toBeGreaterThan(0);
-    expect(messageDeltas.length).toBeGreaterThan(0);
-
-    // Verify splitting behavior for both types
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const getStepTypes = (calls: any[]): string[] =>
-      calls
-        .map(([{ data }]) =>
-          data.stepDetails?.type === StepTypes.MESSAGE_CREATION
-            ? data.stepDetails.message_creation.message_id
-            : null
-        )
-        .filter(Boolean);
-
-    const messageSteps = getStepTypes(runSteps);
-    expect(new Set(messageSteps).size).toBeGreaterThan(1);
+describe('ContentAggregator citation deltas', () => {
+  const citation = (url: string, cited_text: string) => ({
+    type: 'web_search_result_location',
+    url,
+    title: 'Example',
+    cited_text,
+    encrypted_index: 'enc',
   });
 
-  it('should properly map steps to their reasoning content', async () => {
-    const runId = nanoid();
-    const { contentParts, aggregateContent, stepMap } =
-      createContentAggregator();
-
-    const handler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_RUN_STEP]: aggregateContent,
-        [GraphEvents.ON_MESSAGE_DELTA]: aggregateContent,
-        [GraphEvents.ON_REASONING_DELTA]: aggregateContent,
-      },
-      blockThreshold: 5,
-    });
-
-    const text = 'Main content.';
-    const reasoningText = 'First thought. Second thought. Third thought.';
-    const stream = createMockStream({
-      text,
-      reasoningText,
-      streamRate: 0,
-    })();
-
-    for await (const chunk of stream) {
-      handler.handle(chunk);
-    }
-
-    Array.from(stepMap.entries()).forEach(([_stepId, step]) => {
-      expect(step?.type).toBe(StepTypes.MESSAGE_CREATION);
-      const currentIndex = step?.index ?? -1;
-      const stepContent = contentParts[currentIndex];
-
-      if (stepContent?.type === ContentTypes.THINK) {
-        // Verify reasoning content structure
-        expect(stepContent).toHaveProperty('think');
-        expect(typeof stepContent.think).toBe('string');
-        expect(stepContent.think.length).toBeGreaterThan(0);
-      }
-    });
-
-    // Verify at least one reasoning content part exists
-    const reasoningParts = contentParts.filter(
-      (part) => part?.type === ContentTypes.THINK
-    );
-    expect(reasoningParts.length).toBeGreaterThan(0);
-
-    // Verify the content order (reasoning should come before main content)
-    const contentTypes = contentParts
-      .filter((part) => part !== undefined)
-      .map((part) => part.type);
-
-    expect(contentTypes).toContain(ContentTypes.THINK);
-    expect(contentTypes).toContain(ContentTypes.TEXT);
-
-    // Verify the complete reasoning content is preserved
-    const fullReasoningText = reasoningParts
-      .map((part) => (part?.type === ContentTypes.THINK ? part.think : ''))
-      .join('');
-    expect(fullReasoningText).toBe(reasoningText);
-  });
-});
-
-describe('SplitStreamHandler', () => {
-  it('should handle think blocks correctly', async () => {
-    const runId = nanoid();
-    const messageDeltaEvents: t.MessageDeltaEvent[] = [];
-    const reasoningDeltaEvents: t.ReasoningDeltaEvent[] = [];
-
-    const streamHandler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_MESSAGE_DELTA]: ({ data }): void => {
-          messageDeltaEvents.push(data);
-        },
-        [GraphEvents.ON_REASONING_DELTA]: ({ data }): void => {
-          reasoningDeltaEvents.push(data);
-        },
-      },
-    });
-
-    const content =
-      'Here\'s some regular text. <think>Now I\'m thinking deeply about something important. This should all be reasoning.</think> Back to regular text.';
-
-    const stream = createMockStream({
-      text: content,
-      streamRate: 5,
-    })();
-
-    for await (const chunk of stream) {
-      streamHandler.handle(chunk);
-    }
-
-    // Check that content before <think> was handled as regular text
-    expect(
-      messageDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-          )?.text.includes('Here\'s') === true
-      )
-    ).toBe(true);
-
-    // Check that <think> tag was handled as reasoning
-    expect(
-      reasoningDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
-          )?.think.includes('<think>') === true
-      )
-    ).toBe(true);
-
-    // Check that content inside <think> tags was handled as reasoning
-    expect(
-      reasoningDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
-          )?.think.includes('thinking') === true
-      )
-    ).toBe(true);
-
-    // Check that </think> tag was handled as reasoning
-    expect(
-      reasoningDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
-          )?.think.includes('</think>') === true
-      )
-    ).toBe(true);
-
-    // Check that content after </think> was handled as regular text
-    expect(
-      messageDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-          )?.text.includes('Back') === true
-      )
-    ).toBe(true);
+  /**
+   * Anthropic emits a search turn's citations as their own `citations_delta`,
+   * which `_makeMessageChunkFromAnthropicEvent` normalizes into a `text` part
+   * carrying `citations` and **no** `text` key.
+   */
+  const citationDelta = (id: string, ...citations: unknown[]) => ({
+    event: GraphEvents.ON_MESSAGE_DELTA,
+    data: {
+      id,
+      delta: { content: [{ type: ContentTypes.TEXT, citations }] },
+    } as t.MessageDeltaEvent,
   });
 
-  it('should ignore think tags inside code blocks', async () => {
-    const runId = nanoid();
-    const messageDeltaEvents: t.MessageDeltaEvent[] = [];
-    const reasoningDeltaEvents: t.ReasoningDeltaEvent[] = [];
-
-    const streamHandler = new SplitStreamHandler({
-      runId,
-      handlers: {
-        [GraphEvents.ON_MESSAGE_DELTA]: ({ data }): void => {
-          messageDeltaEvents.push(data);
-        },
-        [GraphEvents.ON_REASONING_DELTA]: ({ data }): void => {
-          reasoningDeltaEvents.push(data);
-        },
-      },
-    });
-
-    const content =
-      'Regular text. ```<think>This should stay as code</think>``` More text.';
-
-    const stream = createMockStream({
-      text: content,
-      streamRate: 5,
-    })();
-
-    for await (const chunk of stream) {
-      streamHandler.handle(chunk);
-    }
-
-    // Check that think tags inside code blocks were treated as regular text
-    expect(
-      messageDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-          )?.text.includes('Regular') === true
-      )
-    ).toBe(true);
-
-    // Verify no reasoning events were generated
-    expect(reasoningDeltaEvents.length).toBe(0);
+  const textDelta = (id: string, text: string) => ({
+    event: GraphEvents.ON_MESSAGE_DELTA,
+    data: {
+      id,
+      delta: { content: [{ type: ContentTypes.TEXT, text }] },
+    } as t.MessageDeltaEvent,
   });
 
-  it('should properly split content with think tags while maintaining context', async () => {
-    const runId = nanoid();
-    const messageDeltaEvents: t.MessageDeltaEvent[] = [];
-    const reasoningDeltaEvents: t.ReasoningDeltaEvent[] = [];
-    const runStepEvents: t.RunStep[] = [];
+  it('keeps citations that arrive without accompanying text', () => {
     const { contentParts, aggregateContent } = createContentAggregator();
-
-    const streamHandler = new SplitStreamHandler({
-      runId,
-      blockThreshold: 20, // Small threshold to force splits
-      handlers: {
-        [GraphEvents.ON_MESSAGE_DELTA]: (event): void => {
-          messageDeltaEvents.push(event.data);
-          aggregateContent(event);
-        },
-        [GraphEvents.ON_REASONING_DELTA]: (event): void => {
-          reasoningDeltaEvents.push(event.data);
-          aggregateContent(event);
-        },
-        [GraphEvents.ON_RUN_STEP]: (event): void => {
-          runStepEvents.push(event.data);
-          aggregateContent(event);
-        },
-      },
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_citations'),
     });
 
-    const content =
-      'Here\'s some regular text. <think>Now I\'m thinking deeply about something important. This is a long thought that should be split into multiple parts. We want to ensure the splitting works correctly.</think> Back to regular text after thinking.';
-
-    const stream = createMockStream({
-      text: content,
-      streamRate: 5,
-    })();
-
-    for await (const chunk of stream) {
-      streamHandler.handle(chunk);
-    }
-
-    // Verify that multiple message blocks were created
-    expect(runStepEvents.length).toBeGreaterThan(2);
-
-    // Check that content before <think> was handled as regular text
-    expect(
-      messageDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-          )?.text.includes('regular') === true
-      )
-    ).toBe(true);
-
-    // Verify that reasoning content was split into multiple parts
-    const reasoningParts = reasoningDeltaEvents
-      .map(
-        (event) =>
-          (event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined)
-            ?.think
-      )
-      .filter(Boolean);
-    expect(reasoningParts.length).toBeGreaterThan(1);
-
-    // Verify that the complete reasoning content is preserved when joined
-    const fullReasoningContent = reasoningParts.join('');
-    expect(fullReasoningContent).toContain('thinking');
-    expect(fullReasoningContent).toContain('should');
-    expect(fullReasoningContent).toContain('be');
-    expect(fullReasoningContent).toContain('split');
-
-    // Check that each reasoning part maintains proper think context
-    let seenThinkOpen = false;
-    let seenThinkClose = false;
-    reasoningParts.forEach((part) => {
-      if (part == null) return;
-      if (part.includes('<think>')) {
-        seenThinkOpen = true;
-      }
-      if (part.includes('</think>')) {
-        seenThinkClose = true;
-      }
-      // Middle parts should be handled as reasoning even without explicit think tags
-      if (!part.includes('<think>') && !part.includes('</think>')) {
-        expect(
-          reasoningDeltaEvents.some(
-            (event) =>
-              (event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined)
-                ?.think === part
-          )
-        ).toBe(true);
-      }
-    });
-    expect(seenThinkOpen).toBe(true);
-    expect(seenThinkClose).toBe(true);
-
-    // Check that content after </think> was handled as regular text
-    expect(
-      messageDeltaEvents.some(
-        (event) =>
-          (
-            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-          )?.text.includes('Back') === true
-      )
-    ).toBe(true);
-
-    const thinkingBlocks = contentParts.filter(
-      (part) => part?.type === ContentTypes.THINK
+    aggregateContent(textDelta('step_citations', 'Answer.'));
+    aggregateContent(
+      citationDelta('step_citations', citation('https://a.example', 'quoted a'))
     );
-    expect(thinkingBlocks.length).toBeGreaterThan(0);
-    expect(
-      (thinkingBlocks[0] as t.ReasoningContentText).think.startsWith('<think>')
-    ).toBeTruthy();
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Answer.',
+      citations: [citation('https://a.example', 'quoted a')],
+    });
+  });
+
+  it('accumulates citations across successive deltas', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_multi'),
+    });
+
+    aggregateContent(textDelta('step_multi', 'Part one. '));
+    aggregateContent(
+      citationDelta('step_multi', citation('https://a.example', 'quoted a'))
+    );
+    aggregateContent(textDelta('step_multi', 'Part two.'));
+    aggregateContent(
+      citationDelta('step_multi', citation('https://b.example', 'quoted b'))
+    );
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Part one. Part two.',
+      citations: [
+        citation('https://a.example', 'quoted a'),
+        citation('https://b.example', 'quoted b'),
+      ],
+    });
+  });
+
+  it('leaves parts without citations untouched', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_plain'),
+    });
+
+    aggregateContent(textDelta('step_plain', 'Hello '));
+    aggregateContent(textDelta('step_plain', 'world.'));
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hello world.',
+    });
+    expect(contentParts[0]).not.toHaveProperty('citations');
+  });
+
+  it('preserves tool_call_ids when a citations-only delta follows', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_tool_ids'),
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_tool_ids',
+        delta: {
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              text: 'Answer.',
+              tool_call_ids: ['call_1'],
+            },
+          ],
+        },
+      } as t.MessageDeltaEvent,
+    });
+    aggregateContent(
+      citationDelta('step_tool_ids', citation('https://a.example', 'quoted a'))
+    );
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Answer.',
+      tool_call_ids: ['call_1'],
+      citations: [citation('https://a.example', 'quoted a')],
+    });
   });
 });

@@ -79,6 +79,120 @@ describe('convertToConverseMessages — Anthropic tool replay', () => {
   });
 });
 
+/**
+ * Bedrock Converse requires `toolUse.input` to be a JSON object. History can
+ * carry non-object values: pre-3.x context-pressure truncation persisted
+ * `null` onto both a block's inline input and its `tool_calls` args (see the
+ * Anthropic-replay fix in PR #369), and Anthropic-shaped inline blocks keep
+ * the raw streamed JSON string. These must coerce — never ship as-is, never
+ * throw the whole request away.
+ */
+describe('convertToConverseMessages — non-object toolUse input coercion', () => {
+  const toolUseBlocks = (result: ConverseResult): ConverseBlock[] =>
+    assistantContent(result).filter((b) => b.toolUse != null);
+
+  it('coerces null args to {} when materializing from tool_calls', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('What is 9 * 9?'),
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'tool_use',
+            id: 'call_null',
+            name: 'calculator',
+            input: null,
+          },
+        ]),
+        tool_calls: [
+          {
+            id: 'call_null',
+            name: 'calculator',
+            args: null as never,
+          },
+        ],
+      }),
+    ];
+
+    const [block] = toolUseBlocks(convertToConverseMessages(messages));
+    expect(block.toolUse?.input).toEqual({});
+  });
+
+  it('parses a complete raw-string input on an unmirrored inline block instead of throwing', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Search'),
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'tool_use',
+            id: 'call_str',
+            name: 'search',
+            input: '{"query": "test"}',
+          },
+        ]),
+        tool_calls: [],
+      }),
+    ];
+
+    expect(() => convertToConverseMessages(messages)).not.toThrow();
+    const [block] = toolUseBlocks(convertToConverseMessages(messages));
+    expect(block.toolUse?.input).toEqual({ query: 'test' });
+  });
+
+  it('degrades non-object inline inputs (partial string, number-string, null) to {}', () => {
+    for (const input of ['{"query": "tru', '123', null]) {
+      const messages: BaseMessage[] = [
+        new HumanMessage('Search'),
+        new AIMessage({
+          content: toLangChainContent([
+            { type: 'tool_use', id: 'call_bad', name: 'search', input },
+          ]),
+          tool_calls: [],
+        }),
+      ];
+
+      const [block] = toolUseBlocks(convertToConverseMessages(messages));
+      expect(block.toolUse?.input).toEqual({});
+    }
+  });
+
+  it('still rejects a tool_use block missing its id or name', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Search'),
+      new AIMessage({
+        content: toLangChainContent([
+          { type: 'tool_use', name: 'search', input: { query: 'x' } },
+        ]),
+        tool_calls: [],
+      }),
+    ];
+
+    expect(() => convertToConverseMessages(messages)).toThrow(
+      'Invalid Anthropic tool_use content block'
+    );
+  });
+
+  it('coerces null args on the v1 tool_call and tool_calls fallback paths', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Run both'),
+      new AIMessage({
+        content: toLangChainContent([
+          { type: 'tool_call', id: 'v1_block', name: 'search', args: null },
+        ]),
+        tool_calls: [
+          { id: 'v1_fallback', name: 'lookup', args: null as never },
+        ],
+        response_metadata: { output_version: 'v1' },
+      }),
+    ];
+
+    const blocks = toolUseBlocks(convertToConverseMessages(messages));
+    expect(blocks).toHaveLength(2);
+    for (const block of blocks) {
+      expect(block.toolUse?.input).toEqual({});
+    }
+  });
+});
+
 describe('convertToConverseMessages — native Bedrock reasoning serialization', () => {
   it('drops a signature-only reasoning block, keeping text and tool calls', () => {
     const messages: BaseMessage[] = [
@@ -448,5 +562,89 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
       'native reasoning',
     ]);
     expect(content.some((b) => b.text === 'answer')).toBe(true);
+  });
+});
+
+/**
+ * Converse rejects consecutive same-role messages categorically, and both
+ * `ToolMessage` and `HumanMessage` convert to `role: 'user'` — so a hook
+ * injection landing a text turn directly after tool results (`PostToolBatch`
+ * / `PreemptBoundary` drains) must merge into one user message here, with
+ * block order preserved so the toolUse/toolResult pairing stays intact.
+ */
+describe('convertToConverseMessages — user-role run merging', () => {
+  it('merges a tool result followed by an injected text turn into one user message', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('run the search'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call_1', name: 'search', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'search output',
+        tool_call_id: 'call_1',
+        name: 'search',
+      }),
+      new HumanMessage({
+        content: 'Actually, focus on the second result.',
+        additional_kwargs: { source: 'steer' },
+      }),
+    ];
+
+    const { converseMessages } = convertToConverseMessages(messages);
+
+    expect(converseMessages.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
+    const merged = converseMessages[2];
+    const blockKinds = (merged.content ?? []).map((block) =>
+      'toolResult' in block ? 'toolResult' : 'text'
+    );
+    expect(blockKinds).toEqual(['toolResult', 'text']);
+    expect((merged.content ?? []).find((block) => 'text' in block)?.text).toBe(
+      'Actually, focus on the second result.'
+    );
+  });
+
+  it('still merges adjacent tool-result-only turns', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'call_1', name: 'a', args: {}, type: 'tool_call' },
+          { id: 'call_2', name: 'b', args: {}, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({ content: 'one', tool_call_id: 'call_1', name: 'a' }),
+      new ToolMessage({ content: 'two', tool_call_id: 'call_2', name: 'b' }),
+    ];
+
+    const { converseMessages } = convertToConverseMessages(messages);
+
+    expect(converseMessages.map((m) => m.role)).toEqual(['assistant', 'user']);
+    const toolResultIds = (converseMessages[1].content ?? [])
+      .map((block) =>
+        'toolResult' in block ? block.toolResult?.toolUseId : undefined
+      )
+      .filter(Boolean);
+    expect(toolResultIds).toEqual(['call_1', 'call_2']);
+  });
+
+  it('does not merge across an assistant turn', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('first'),
+      new AIMessage('answer'),
+      new HumanMessage('second'),
+    ];
+    const { converseMessages } = convertToConverseMessages(messages);
+    expect(converseMessages.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
   });
 });

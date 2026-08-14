@@ -5,9 +5,13 @@ import type {
   AgentSessionUsage,
 } from './types';
 import type * as t from '@/types';
+import {
+  createContentAggregator,
+  dispatchesChatModelStream,
+  SDK_STREAM_DISPATCH,
+} from '@/stream';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { toJsonValue } from './messageSerialization';
-import { createContentAggregator } from '@/stream';
 import { createTimestamp } from './ids';
 import { GraphEvents } from '@/common';
 
@@ -107,18 +111,34 @@ export function createRunHandlers(params: {
 
   emitEvent(createEvent('run.started'));
 
-  const handlers: Record<string, t.EventHandler> = {
-    [GraphEvents.CHAT_MODEL_STREAM]: {
-      handle: async (event, data, metadata, graph): Promise<void> => {
-        await callUserHandler({
-          userHandlers: params.userHandlers,
-          event,
-          data,
-          metadata,
-          graph,
-        });
-      },
+  /**
+   * Forwards to the host's own handler, so it inherits that handler's
+   * capability. Branding matters because this wrapper is installed on EVERY
+   * session run and merged last: without it, a host that registered
+   * `new ChatModelStreamHandler()` would silently lose the sealing opt-out
+   * that registration is supposed to buy.
+   */
+  const streamWrapper: t.EventHandler = {
+    handle: async (event, data, metadata, graph): Promise<void> => {
+      await callUserHandler({
+        userHandlers: params.userHandlers,
+        event,
+        data,
+        metadata,
+        graph,
+      });
     },
+  };
+  if (
+    dispatchesChatModelStream(
+      params.userHandlers?.[GraphEvents.CHAT_MODEL_STREAM]
+    )
+  ) {
+    Object.defineProperty(streamWrapper, SDK_STREAM_DISPATCH, { value: true });
+  }
+
+  const handlers: Record<string, t.EventHandler> = {
+    [GraphEvents.CHAT_MODEL_STREAM]: streamWrapper,
     [GraphEvents.CHAT_MODEL_END]: {
       handle: async (event, data, metadata, graph): Promise<void> => {
         await modelEndHandler.handle(
@@ -196,6 +216,18 @@ export function createRunHandlers(params: {
         if (isToolCompletion(completed.result)) {
           emitEvent(createEvent('tool.completed', completed));
         }
+        await callUserHandler({
+          userHandlers: params.userHandlers,
+          event,
+          data,
+          metadata,
+          graph,
+        });
+      },
+    },
+    [GraphEvents.ON_RUN_STEP_CLOSED]: {
+      handle: async (event, data, metadata, graph): Promise<void> => {
+        emitEvent(createEvent('step.finished', data as t.RunStepClosedEvent));
         await callUserHandler({
           userHandlers: params.userHandlers,
           event,

@@ -1,5 +1,31 @@
 // src/hooks/HookRegistry.ts
-import type { HookEvent, HookMatcher } from './types';
+import type {
+  HookEvent,
+  HookMatcher,
+  ToolApprovalReplayKey,
+  ToolApprovalReplaySnapshot,
+  AggregatedHookResult,
+} from './types';
+
+function serializeApprovalKey(key: ToolApprovalReplayKey): string {
+  return JSON.stringify([key.executionScope, key.agentId, key.toolUseId]);
+}
+
+function deserializeApprovalKey(value: string): ToolApprovalReplayKey | null {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 3 ||
+    parsed.some((part) => typeof part !== 'string')
+  ) {
+    return null;
+  }
+  return {
+    executionScope: parsed[0],
+    agentId: parsed[1],
+    toolUseId: parsed[2],
+  };
+}
 
 /**
  * Internal matcher storage type.
@@ -71,6 +97,11 @@ export class HookRegistry {
    * O(1) insertion in hot paths, no spread-on-write.
    */
   private readonly haltSignals: Map<string, HookHaltSignal> = new Map();
+  /** One-shot hook contributions retained until approval is consumed. */
+  private readonly pendingToolApprovals = new Map<
+    string,
+    Map<string, AggregatedHookResult>
+  >();
 
   /**
    * Register a matcher for the lifetime of this registry (= one Run).
@@ -160,6 +191,125 @@ export class HookRegistry {
    */
   clearSession(sessionId: string): void {
     this.sessions.delete(sessionId);
+    this.pendingToolApprovals.delete(sessionId);
+  }
+
+  /** Copies session-scoped policy into a rebuilt or branched Run. */
+  copySession(sourceSessionId: string, targetSessionId: string): void {
+    if (sourceSessionId === targetSessionId) {
+      return;
+    }
+    const source = this.sessions.get(sourceSessionId);
+    if (source != null) {
+      const target = this.ensureSessionBucket(targetSessionId);
+      for (const event of Object.keys(source) as HookEvent[]) {
+        const targetList = ensureList(target, event);
+        for (const matcher of readList(source, event)) {
+          if (!targetList.includes(matcher)) {
+            targetList.push(matcher);
+          }
+        }
+      }
+    }
+    const pending = this.pendingToolApprovals.get(sourceSessionId);
+    if (pending == null) {
+      return;
+    }
+    let targetPending = this.pendingToolApprovals.get(targetSessionId);
+    if (targetPending == null) {
+      targetPending = new Map();
+      this.pendingToolApprovals.set(targetSessionId, targetPending);
+    }
+    for (const [toolUseId, result] of pending) {
+      if (!targetPending.has(toolUseId)) {
+        targetPending.set(toolUseId, result);
+      }
+    }
+  }
+
+  getPendingToolApproval(
+    sessionId: string,
+    key: ToolApprovalReplayKey
+  ): AggregatedHookResult | undefined {
+    return this.pendingToolApprovals
+      .get(sessionId)
+      ?.get(serializeApprovalKey(key));
+  }
+
+  setPendingToolApproval(
+    sessionId: string,
+    key: ToolApprovalReplayKey,
+    result: AggregatedHookResult
+  ): void {
+    let pending = this.pendingToolApprovals.get(sessionId);
+    if (pending == null) {
+      pending = new Map();
+      this.pendingToolApprovals.set(sessionId, pending);
+    }
+    pending.set(serializeApprovalKey(key), result);
+  }
+
+  clearPendingToolApproval(
+    sessionId: string,
+    key: ToolApprovalReplayKey
+  ): void {
+    const pending = this.pendingToolApprovals.get(sessionId);
+    if (pending == null) {
+      return;
+    }
+    pending.delete(serializeApprovalKey(key));
+    if (pending.size === 0) {
+      this.pendingToolApprovals.delete(sessionId);
+    }
+  }
+
+  snapshotPendingToolApprovals(
+    sessionId: string,
+    executionScope: string
+  ): ToolApprovalReplaySnapshot[] {
+    const pending = this.pendingToolApprovals.get(sessionId);
+    if (pending == null) {
+      return [];
+    }
+    const snapshots: ToolApprovalReplaySnapshot[] = [];
+    for (const [serializedKey, result] of pending) {
+      const key = deserializeApprovalKey(serializedKey);
+      if (key == null || key.executionScope !== executionScope) {
+        continue;
+      }
+      snapshots.push({ key, result });
+    }
+    return snapshots;
+  }
+
+  restorePendingToolApprovals(
+    sessionId: string,
+    targetExecutionScope: string,
+    snapshots: ReadonlyArray<ToolApprovalReplaySnapshot>
+  ): void {
+    const restored = new Map<string, AggregatedHookResult>();
+    for (const [serializedKey, result] of this.pendingToolApprovals.get(
+      sessionId
+    ) ?? []) {
+      const key = deserializeApprovalKey(serializedKey);
+      if (key?.executionScope !== targetExecutionScope) {
+        restored.set(serializedKey, result);
+      }
+    }
+    for (const snapshot of snapshots) {
+      restored.set(
+        serializeApprovalKey({
+          ...snapshot.key,
+          executionScope: targetExecutionScope,
+        }),
+        snapshot.result
+      );
+    }
+    if (restored.size === 0) {
+      this.pendingToolApprovals.delete(sessionId);
+      return;
+    }
+    this.pendingToolApprovals.set(sessionId, restored);
   }
 
   /**
@@ -247,6 +397,34 @@ export class HookRegistry {
     return readList(bucket, event).length > 0;
   }
 
+  /**
+   * True when at least one matcher for `event` would actually DISPATCH on a
+   * query-less call — a wildcard pattern with a non-empty `hooks` array.
+   *
+   * `hasHookFor` answers "is one registered", which is not the same question:
+   * a matcher carrying a pattern is inert for events that supply no
+   * `matchQuery`, so a caller using registration as a proxy for "something
+   * will run" can act on a hook that never fires. Mirrors the two skips in
+   * `executeHooks` (pattern mismatch, empty `hooks`).
+   *
+   * Non-allocating on purpose — `StandardGraph.canClaimPreemptSeal` reads it
+   * once per streamed chunk, where `getMatchers`' defensive `slice()` would
+   * allocate on every delta.
+   */
+  hasDispatchableHookFor(event: HookEvent, sessionId?: string): boolean {
+    if (hasDispatchableInList(readList(this.global, event))) {
+      return true;
+    }
+    if (sessionId === undefined) {
+      return false;
+    }
+    const bucket = this.sessions.get(sessionId);
+    if (bucket === undefined) {
+      return false;
+    }
+    return hasDispatchableInList(readList(bucket, event));
+  }
+
   private ensureSessionBucket(sessionId: string): MatcherBucket {
     const existing = this.sessions.get(sessionId);
     if (existing !== undefined) {
@@ -276,6 +454,18 @@ function readList(
   event: HookEvent
 ): HookMatcher<HookEvent>[] {
   return bucket[event] ?? [];
+}
+
+function hasDispatchableInList(list: HookMatcher<HookEvent>[]): boolean {
+  for (const matcher of list) {
+    if (
+      (matcher.pattern === undefined || matcher.pattern === '') &&
+      matcher.hooks.length > 0
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function hasResultAlteringInBucket(bucket: MatcherBucket): boolean {

@@ -8,8 +8,9 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
-import type OpenAITypes from 'openai';
+import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
+import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
@@ -50,20 +51,30 @@ start, stream and end are associated with slightly different data payload.
 Please see the documentation for EventData for more details. */
 export type EventName = string;
 
+export type RunStepStatus =
+  | 'in_progress'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
 export type RunStep = {
-  // id: string;
-  // object: 'thread.run.step'; // Updated from 'run.step' # missing
-  // created_at: number;
-  // run_id: string;
-  // assistant_id: string;
-  // thread_id: string;
   type: StepTypes;
-  // status: 'in_progress' | 'completed' | 'failed' | 'cancelled'; // Add other possible status values if needed
-  // cancelled_at: number | null;
-  // completed_at: number | null;
-  // expires_at: number;
-  // failed_at: number | null;
-  // last_error: string | null;
+  /** Epoch ms when the step was dispatched. */
+  created_at?: number;
+  /**
+   * Lifecycle status; terminal values are stamped when the step closes.
+   * Invariant (enforced by `closeRunStep`, not the type, to stay wire-compatible
+   * with the OpenAI Assistants shape): a terminal status sets exactly one
+   * matching `*_at` field; first close wins and `cancelled`/`failed` are
+   * immutable once stamped.
+   */
+  status?: RunStepStatus;
+  /** Epoch ms when the step closed with status `completed`. */
+  completed_at?: number;
+  /** Epoch ms when the step closed with status `cancelled` (abort/halt). */
+  cancelled_at?: number;
+  /** Epoch ms when the step closed with status `failed`. */
+  failed_at?: number;
   id: string; // #new
   runId?: string; // #new
   agentId?: string; // #new - tracks which agent this step belongs to
@@ -107,6 +118,44 @@ export interface RunStepDeltaEvent {
   delta: ToolCallDelta;
 }
 
+/**
+ * Terminal signal for a run step, emitted exactly once per step when it
+ * finishes (`completed`), is aborted/halted (`cancelled`), or the run errors
+ * (`failed`). The `id` is top-level so callback echoes dedupe like other
+ * step-scoped events.
+ */
+export interface RunStepClosedEvent {
+  id: string;
+  index: number;
+  type: StepTypes;
+  status: Exclude<RunStepStatus, 'in_progress'>;
+  /** Epoch ms when the step was dispatched, when known. */
+  created_at?: number;
+  /** Epoch ms when the step reached its terminal status. */
+  closed_at: number;
+  runId?: string;
+  agentId?: string;
+  groupId?: number;
+  stepIndex?: number;
+}
+
+export type RecordStepCompletionOptions = {
+  /** The completing tool call, when the step tracks pending completions. */
+  toolCallId?: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * Producer-stamped completion time (epoch ms). Carried through so a slow
+   * host completion handler cannot inflate the recorded step duration.
+   */
+  at?: number;
+};
+
+export type RunStepCloseOptions = {
+  /** Epoch ms for the terminal stamp; defaults to `Date.now()` at close time. */
+  at?: number;
+  metadata?: Record<string, unknown>;
+};
+
 export type StepDetails = MessageCreationDetails | ToolCallsDetails;
 
 export type SummaryCompleted = {
@@ -120,6 +169,10 @@ export type MessageCreationDetails = {
   type: StepTypes.MESSAGE_CREATION;
   message_creation: {
     message_id: string;
+    /** Content lane announced before its first delta. */
+    content_type?: ContentTypes.TEXT | ContentTypes.THINK;
+    /** Provider-authored assistant text phase, when available. */
+    phase?: AssistantTextPhase;
   };
 };
 
@@ -143,6 +196,19 @@ export type ProcessedToolCall = {
   id: string;
   output: string;
   progress: number;
+  /**
+   * Settled label for the call, resolved from the tool-supplied
+   * `outcome`/`outcome_patch` result fields against the model-authored
+   * `intent` arg. Present ONLY when the tool authored one.
+   *
+   * When absent, display the `intent` arg unchanged — do NOT rewrite its
+   * tense. A gerund→past-tense rewrite can only be a closed list of English
+   * verbs, so it never fires for the non-English labels this feature expects
+   * and fires for some sibling calls but not others within one group.
+   * Completion belongs to UI state (the shimmer stopping, the icon settling),
+   * which is language-neutral and always consistent.
+   */
+  outcome?: string;
 };
 
 export type ProcessedContent = {
@@ -162,6 +228,8 @@ export type ToolCompleteEvent = ToolCallCompleted & {
   /** The content index of the tool call */
   index: number;
   type: 'tool_call';
+  /** Epoch ms when this tool call's completion was dispatched. */
+  completed_at?: number;
 };
 
 export type ToolCallsDetails = {
@@ -268,6 +336,8 @@ export type MessageDeltaUpdate = {
   type: ContentTypes.TEXT;
   text: string;
   tool_call_ids?: string[];
+  /** Provider-supplied source citations, accumulated across deltas. */
+  citations?: Anthropic.TextCitation[];
 };
 export type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
 
@@ -289,10 +359,30 @@ export type SummaryBoundary = {
   contentIndex: number;
 };
 
+/**
+ * Semantic extent of a summary: the first source message compaction retained
+ * verbatim, meaning everything before it is covered. Distinct from `boundary`,
+ * which records where the block was emitted — a retained recency tail sits
+ * *before* the block's own position, so position alone cannot say what the
+ * summary replaced.
+ *
+ * Anchored to the retained side rather than the covered side so that a source
+ * message expanding into several messages (a steer splits an assistant entry
+ * into pre-steer, steer, and post-steer entries sharing one ID) stays whole:
+ * such a message is the retained anchor and survives intact.
+ */
+export type SummaryCoverage = {
+  retainedFromMessageId: string;
+};
+
 export type SummaryContentBlock = {
   type: ContentTypes.SUMMARY;
   content?: MessageContentComplex[];
+  /** Injection budget: provider output-token space when usage was reported, plus
+   *  the wrapper added at injection time. Not comparable with per-message counts
+   *  such as `indexTokenCountMap`, which are in the consumer's own tokenizer. */
   tokenCount?: number;
+  coverage?: SummaryCoverage;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
   model?: string;
@@ -337,6 +427,11 @@ export type ToolCallPart = {
   id?: string;
   /** If provided, the output of the tool call */
   output?: ToolResultContent['content'];
+  /**
+   * Tool-authored settled label for the call (see `ProcessedToolCall.outcome`),
+   * preserved through aggregation so it survives persistence/reload.
+   */
+  outcome?: string;
   /** Auth URL */
   auth?: string;
   /** Expiration time */
@@ -378,6 +473,10 @@ export type MessageContentComplex = (
       type?: never;
     })
 ) & {
+  /** Open Responses-compatible semantic phase for assistant text. */
+  phase?: AssistantTextPhase;
+  /** LangChain standard-content form of provider-specific block fields. */
+  extras?: { phase?: AssistantTextPhase } & Record<string, unknown>;
   tool_call_ids?: string[];
   // Optional agentId for parallel execution attribution
   agentId?: string;
@@ -392,46 +491,6 @@ export interface TMessage {
 }
 
 export type TPayload = Array<Partial<TMessage>>;
-
-export type CustomChunkDelta =
-  | null
-  | undefined
-  | (Partial<OpenAITypes.Chat.Completions.ChatCompletionChunk.Choice.Delta> & {
-      reasoning?: string | null;
-      reasoning_content?: string | null;
-    });
-export type CustomChunkChoice = Partial<
-  Omit<OpenAITypes.Chat.Completions.ChatCompletionChunk.Choice, 'delta'> & {
-    delta?: CustomChunkDelta;
-  }
->;
-export type CustomChunk = Partial<OpenAITypes.ChatCompletionChunk> & {
-  choices?: Partial<Array<CustomChunkChoice>>;
-};
-
-export type SplitStreamHandlers = Partial<{
-  [GraphEvents.ON_RUN_STEP]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: RunStep;
-  }) => void;
-  [GraphEvents.ON_MESSAGE_DELTA]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: MessageDeltaEvent;
-  }) => void;
-  [GraphEvents.ON_REASONING_DELTA]: ({
-    event,
-    data,
-  }: {
-    event: GraphEvents;
-    data: ReasoningDeltaEvent;
-  }) => void;
-}>;
 
 export type SummarizeDeltaData = {
   id: string;

@@ -25,6 +25,7 @@ import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import { deserializeMessage } from './messageSerialization';
 import { createSummarizeNode } from '@/summarization/node';
+import { resolveStreamLimits } from '@/llm/streamLimits';
 import { JsonlSessionStore } from './JsonlSessionStore';
 import { AgentContext } from '@/agents/AgentContext';
 import { ContentTypes, GraphEvents } from '@/common';
@@ -610,23 +611,85 @@ function createManualCompactGraph(params: {
   runId: string;
   customHandlers?: Record<string, t.EventHandler>;
   hooks?: HookRegistry;
+  /** Session run-level stream limits, so manual compaction honors them. */
+  streamLimits?: t.StreamLimits;
 }): {
   graph: Parameters<typeof createSummarizeNode>[0]['graph'];
   completedSummary?: t.SummaryContentBlock;
+  closeOpenSteps: (
+    status: Exclude<t.RunStepStatus, 'in_progress'>
+  ) => Promise<void>;
 } {
   const contentData: t.RunStep[] = [];
   const contentIndexMap = new Map<string, number>();
+  /** Stamps the terminal state and publishes the single terminal event. */
+  const closeStep = async (
+    runStep: t.RunStep,
+    status: Exclude<t.RunStepStatus, 'in_progress'>,
+    at: number
+  ): Promise<void> => {
+    if (runStep.status !== 'in_progress') {
+      return;
+    }
+    runStep.status = status;
+    if (status === 'completed') {
+      runStep.completed_at = at;
+    } else if (status === 'cancelled') {
+      runStep.cancelled_at = at;
+    } else {
+      runStep.failed_at = at;
+    }
+    const closedEvent: t.RunStepClosedEvent = {
+      id: runStep.id,
+      index: runStep.index,
+      type: runStep.type,
+      status,
+      closed_at: at,
+    };
+    if (runStep.created_at != null) {
+      closedEvent.created_at = runStep.created_at;
+    }
+    if (runStep.runId != null) {
+      closedEvent.runId = runStep.runId;
+    }
+    await params.customHandlers?.[GraphEvents.ON_RUN_STEP_CLOSED]?.handle(
+      GraphEvents.ON_RUN_STEP_CLOSED,
+      closedEvent
+    );
+  };
   const result: {
     graph: Parameters<typeof createSummarizeNode>[0]['graph'];
     completedSummary?: t.SummaryContentBlock;
+    closeOpenSteps: (
+      status: Exclude<t.RunStepStatus, 'in_progress'>
+    ) => Promise<void>;
   } = {
+    /**
+     * Terminal sweep for compaction, which runs outside `Run.processStream`
+     * and so has no stream-level equivalent: a summarization model that
+     * rejects, aborts, or trips a stream limit after the step was published
+     * would otherwise strand observers with a permanently open step.
+     */
+    closeOpenSteps: async (status): Promise<void> => {
+      const closedAt = Date.now();
+      for (const runStep of contentData) {
+        try {
+          await closeStep(runStep, status, closedAt);
+        } catch (_e) {
+          /** Delivery failure for one step must not halt the sweep */
+        }
+      }
+    },
     graph: {
       contentData,
       contentIndexMap,
       runId: params.runId,
       isMultiAgent: false,
       hookRegistry: params.hooks,
+      streamLimits: resolveStreamLimits(params.streamLimits),
       dispatchRunStep: async (runStep): Promise<void> => {
+        runStep.created_at ??= Date.now();
+        runStep.status ??= 'in_progress';
         contentData.push(runStep);
         contentIndexMap.set(runStep.id, runStep.index);
         await params.customHandlers?.[GraphEvents.ON_RUN_STEP]?.handle(
@@ -634,12 +697,25 @@ function createManualCompactGraph(params: {
           runStep
         );
       },
+      closeRunStep: async (stepId, status): Promise<void> => {
+        const stepIndex = contentIndexMap.get(stepId);
+        const runStep =
+          stepIndex === undefined ? undefined : contentData[stepIndex];
+        if (runStep == null) {
+          return;
+        }
+        await closeStep(runStep, status, Date.now());
+      },
       dispatchRunStepCompleted: async (stepId, completed): Promise<void> => {
-        const runStep = contentData.find((step) => step.id === stepId);
+        const completedAt = Date.now();
+        const stepIndex = contentIndexMap.get(stepId);
+        const runStep =
+          stepIndex === undefined ? undefined : contentData[stepIndex];
         const resultWithStep = {
           ...completed,
           id: stepId,
           index: runStep?.index ?? 0,
+          completed_at: completedAt,
         };
         if (completed.type === 'summary') {
           result.completedSummary = completed.summary;
@@ -649,6 +725,10 @@ function createManualCompactGraph(params: {
         ]?.handle(GraphEvents.ON_RUN_STEP_COMPLETED, {
           result: resultWithStep,
         } as unknown as Parameters<t.EventHandler['handle']>[1]);
+        if (runStep == null) {
+          return;
+        }
+        await closeStep(runStep, 'completed', completedAt);
       },
     },
   };
@@ -930,6 +1010,30 @@ export class AgentSession {
     });
   }
 
+  private async recordChildCheckpointThreads(params: {
+    source: 'run' | 'resume';
+    runId: string;
+    run: Run<t.IState>;
+  }): Promise<void> {
+    if (!this.checkpointing.enabled || this.store == null) {
+      return;
+    }
+    const recordedThreadIds = new Set(
+      this.store.getCheckpoints().map((checkpoint) => checkpoint.data.threadId)
+    );
+    for (const threadId of params.run.getChildCheckpointThreadIds()) {
+      if (recordedThreadIds.has(threadId)) {
+        continue;
+      }
+      recordedThreadIds.add(threadId);
+      await this.store.appendCheckpoint({
+        source: params.source,
+        runId: params.runId,
+        threadId,
+      });
+    }
+  }
+
   private getCheckpointThreadIds(): string[] {
     const threadIds = new Set<string>([this.threadId]);
     for (const checkpoint of this.store?.getCheckpoints() ?? []) {
@@ -1002,6 +1106,7 @@ export class AgentSession {
     const sessionState = createSessionRunState(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
+    let run: Run<t.IState> | undefined;
     try {
       const runConfig: t.RunConfig = {
         ...this.runConfig,
@@ -1020,7 +1125,7 @@ export class AgentSession {
           ...handlerResult.handlers,
         },
       };
-      const run = await Run.create<t.IState>(runConfig);
+      run = await Run.create<t.IState>(runConfig);
       let messages = inputMessages;
       if (!useCheckpointState && sessionState.messages.length > 0) {
         messages = sessionState.messages;
@@ -1066,6 +1171,11 @@ export class AgentSession {
         checkpointId: interrupt?.checkpointId,
         checkpointNs: interrupt?.checkpointNs,
       });
+      await this.recordChildCheckpointThreads({
+        source: 'run',
+        runId,
+        run,
+      });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
       );
@@ -1095,6 +1205,13 @@ export class AgentSession {
         threadId,
         config: callerConfig,
       });
+      if (run != null) {
+        await this.recordChildCheckpointThreads({
+          source: 'run',
+          runId,
+          run,
+        });
+      }
       throw error;
     }
   }
@@ -1251,6 +1368,7 @@ export class AgentSession {
       runId: compactRunId,
       customHandlers: this.runConfig.customHandlers,
       hooks: this.runConfig.hooks,
+      streamLimits: this.runConfig.streamLimits,
     });
     const summarizeNode = createSummarizeNode({
       agentContext,
@@ -1260,19 +1378,35 @@ export class AgentSession {
         graph.graph.contentData.length,
       ],
     });
-    const summarizedState = await summarizeNode(
-      {
-        messages: sessionState.messages,
-        summarizationRequest: {
-          remainingContextTokens: agentContext.maxContextTokens ?? 0,
-          agentId: agentContext.agentId,
+    let summarizedState;
+    try {
+      summarizedState = await summarizeNode(
+        {
+          messages: sessionState.messages,
+          summarizationRequest: {
+            remainingContextTokens: agentContext.maxContextTokens ?? 0,
+            agentId: agentContext.agentId,
+          },
         },
-      },
-      {
-        configurable: { thread_id: this.threadId },
-        metadata: { run_id: compactRunId },
-      }
-    );
+        {
+          configurable: { thread_id: this.threadId },
+          metadata: { run_id: compactRunId },
+        }
+      );
+    } catch (error) {
+      /**
+       * `failed`, not `cancelled`: manual compaction is invoked without a
+       * caller abort signal, so there is no cancellation source to
+       * corroborate against. An error that merely carries the `AbortError`
+       * name is an unexpected failure here, and it propagates to the caller
+       * either way.
+       */
+      await graph.closeOpenSteps('failed').catch(() => {
+        /** the sweep must never mask the summarization failure */
+      });
+      throw error;
+    }
+    await graph.closeOpenSteps('completed');
     const completedSummaryText = getSummaryText(graph.completedSummary);
     const contextSummaryText = agentContext.getSummaryText();
     let summaryText = completedSummaryText;
@@ -1343,8 +1477,9 @@ export class AgentSession {
     const sessionState = createSessionRunState(
       isSessionThread ? (this.store?.getPath() ?? []) : []
     );
+    let run: Run<t.IState> | undefined;
     try {
-      const run = await Run.create<t.IState>({
+      run = await Run.create<t.IState>({
         ...this.runConfig,
         runId,
         graphConfig: applyCheckpointingToGraphConfig(
@@ -1395,6 +1530,11 @@ export class AgentSession {
         checkpointId: interrupt?.checkpointId,
         checkpointNs: interrupt?.checkpointNs,
       });
+      await this.recordChildCheckpointThreads({
+        source: 'resume',
+        runId,
+        run,
+      });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
       );
@@ -1420,6 +1560,13 @@ export class AgentSession {
         threadId,
         config: callerConfig,
       });
+      if (run != null) {
+        await this.recordChildCheckpointThreads({
+          source: 'resume',
+          runId,
+          run,
+        });
+      }
       throw error;
     }
   }

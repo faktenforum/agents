@@ -4,8 +4,9 @@
 // `src/index.ts` and consumed by `Run.processStream` (RunStart,
 // UserPromptSubmit, Stop, StopFailure), `ToolNode.dispatchToolEvents`
 // (PreToolUse, PostToolUse, PostToolUseFailure, PermissionDenied),
-// `createSummarizeNode` (PreCompact, PostCompact), and
-// `SubagentExecutor.execute` (SubagentStart, SubagentStop).
+// `createSummarizeNode` (PreCompact, PostCompact),
+// `SubagentExecutor.execute` (SubagentStart, SubagentStop), and
+// `StandardGraph.createCallModel` (PreemptBoundary).
 export { HookRegistry } from './HookRegistry';
 export type { HookHaltSignal } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
@@ -16,6 +17,17 @@ export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
  * be consumed by an SDK version that would silently drop it.
  */
 export const HOOK_INJECTED_MESSAGES_CAPABLE = true;
+/**
+ * Feature probe for hosts: this SDK dispatches `PreemptBoundary`, so a
+ * cooperative mid-generation seal can drain into the run.
+ *
+ * Deliberately separate from {@link HOOK_INJECTED_MESSAGES_CAPABLE} — an SDK
+ * version can support `injectedMessages` at the tool boundary and know
+ * nothing about preemption. A host that probed the wrong flag would arm an
+ * interrupt control whose seal request is silently ignored, which reads to
+ * the user as a dead button rather than as an unsupported feature.
+ */
+export const HOOK_PREEMPT_BOUNDARY_CAPABLE = true;
 export {
   matchesQuery,
   hasNestedQuantifier,
@@ -30,7 +42,7 @@ export type {
   WorkspacePolicyConfig,
   PathExtractor,
 } from './createWorkspacePolicyHook';
-export { HOOK_EVENTS } from './types';
+export { HOOK_EVENTS, TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from './types';
 export type {
   HookEvent,
   HookInput,
@@ -44,6 +56,8 @@ export type {
   BaseHookOutput,
   ToolDecision,
   StopDecision,
+  ToolApprovalReplayKey,
+  ToolApprovalReplaySnapshot,
   AggregatedHookResult,
   RunStartHookInput,
   UserPromptSubmitHookInput,
@@ -52,6 +66,7 @@ export type {
   PostToolUseFailureHookInput,
   PostToolBatchHookInput,
   PostToolBatchEntry,
+  PreemptBoundaryHookInput,
   PermissionDeniedHookInput,
   SubagentStartHookInput,
   SubagentStopHookInput,
@@ -65,6 +80,7 @@ export type {
   PostToolUseHookOutput,
   PostToolUseFailureHookOutput,
   PostToolBatchHookOutput,
+  PreemptBoundaryHookOutput,
   PermissionDeniedHookOutput,
   SubagentStartHookOutput,
   SubagentStopHookOutput,

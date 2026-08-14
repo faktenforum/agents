@@ -16,7 +16,10 @@ import {
 import {
   getEndpoint,
   OpenAIClient,
+  wrapOpenAIClientError,
   getHeadersWithUserAgent,
+  convertMessagesToResponsesInput,
+  convertResponsesDeltaToChatGenerationChunk,
   ChatOpenAI as OriginalChatOpenAI,
   ChatOpenAIResponses as OriginalChatOpenAIResponses,
   ChatOpenAICompletions as OriginalChatOpenAICompletions,
@@ -34,9 +37,16 @@ import type { BindToolsInput } from '@langchain/core/language_models/chat_models
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
+import type { SmoothItem, SmoothPiece } from '@/llm/stream/smoother';
+import type { ResponsesReplayPosition } from '@/messages/core';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import type { PromptCacheTtl } from '@/messages/cache';
+import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  projectOpenAIResponsesToolMessageContent,
+  projectToolStreamContentForProvider,
+} from '@/messages/core';
 import {
   buildAnthropicCacheControl,
   resolvePromptCacheTtl,
@@ -48,22 +58,22 @@ import {
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
-  projectOpenAIResponsesToolMessageContent,
-  projectToolStreamContentForProvider,
-} from '@/messages/core';
-import {
   isReasoningModel,
   _convertMessagesToOpenAIParams,
   stripImagesFromMessages,
 } from './utils';
+import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
+import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
+import {
+  hasReasoningKwargs,
+  hasToolCallChunks,
+  getReasoningKwargsText,
+} from '@/llm/stream/chunkAdapters';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
 import { withRateLimitRetry } from '@/utils/rateLimit';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
-
-const STREAM_CHUNK_MIN_SIZE = 4;
-const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
 
 export function isHeaders(headers: unknown): headers is Headers {
   return (
@@ -232,6 +242,10 @@ type ResponsesRequest =
 type ResponsesResult =
   | AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>
   | OpenAIClient.Responses.Response;
+type ResponsesStreamChunkOptions = {
+  promptIndex?: number;
+  signal?: AbortSignal;
+};
 type CacheableChatPart = {
   type: 'text' | 'image_url' | 'input_audio' | 'file' | 'refusal';
   prompt_cache_breakpoint?: { mode: 'explicit' };
@@ -244,7 +258,15 @@ type CacheableResponsePart = (
 ) & {
   prompt_cache_breakpoint?: { mode: 'explicit' };
 };
-type ResponsesUsageWithCacheWrite = OpenAIClient.Responses.ResponseUsage & {
+// `Omit` before re-adding `input_tokens_details` as optional matters: the SDK's own
+// `ResponseUsage` declares it required (true for OpenAI itself), so a plain intersection
+// would keep it required in the merged type despite the `?:` here — masking, at the type
+// level, that OpenAI-*compatible* servers (e.g. mlx_vlm.server) may omit it entirely.
+// Mirrors `CompletionUsageWithCacheWrite`'s handling of the analogous Completions API field.
+type ResponsesUsageWithCacheWrite = Omit<
+  OpenAIClient.Responses.ResponseUsage,
+  'input_tokens_details'
+> & {
   input_tokens_details?: OpenAIClient.Responses.ResponseUsage['input_tokens_details'] & {
     cache_write_tokens?: number;
   };
@@ -394,6 +416,10 @@ function isResponseMessage(
   return item.type === 'message';
 }
 
+function isResponseInputRole(role: string): boolean {
+  return role === 'system' || role === 'developer' || role === 'user';
+}
+
 /** Only `input_text`/`input_image`/`input_file` accept a Responses breakpoint;
  *  `output_text`/`refusal` (replayed assistant blocks) are rejected with a 400. */
 function isCacheableResponsePart(part: unknown): part is CacheableResponsePart {
@@ -467,11 +493,7 @@ export function addResponseCacheBreakpoints(
         /** Only input roles take a Responses breakpoint. Assistant/tool turns
          *  carry output content (string or output_text) that the API rejects
          *  under an input marker, so they're never eligible. */
-        if (
-          item.role !== 'system' &&
-          item.role !== 'developer' &&
-          item.role !== 'user'
-        ) {
+        if (!isResponseInputRole(item.role)) {
           return false;
         }
         const content = item.content as
@@ -508,13 +530,13 @@ export function shouldIncludeEncryptedReasoning(
   );
 }
 
-function getCacheWriteTokens(message: BaseMessage): number | undefined {
+export function getCacheWriteTokens(message: BaseMessage): number | undefined {
   const responseMetadata = message.response_metadata as {
     usage?: ResponsesUsageWithCacheWrite;
     metadata?: Record<string, string>;
   };
   const reported =
-    responseMetadata.usage?.input_tokens_details.cache_write_tokens;
+    responseMetadata.usage?.input_tokens_details?.cache_write_tokens;
   if (reported != null) {
     return reported;
   }
@@ -526,7 +548,7 @@ function getCacheWriteTokens(message: BaseMessage): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function attachCacheWriteUsage(message: BaseMessage): void {
+export function attachCacheWriteUsage(message: BaseMessage): void {
   const cacheWriteTokens = getCacheWriteTokens(message);
   if (
     cacheWriteTokens == null ||
@@ -553,11 +575,11 @@ function attachCacheWriteUsage(message: BaseMessage): void {
   };
 }
 
-function attachCacheWriteMetadata(
+export function attachCacheWriteMetadata(
   response: OpenAIClient.Responses.Response
 ): OpenAIClient.Responses.Response {
   const usage = response.usage as ResponsesUsageWithCacheWrite | undefined;
-  const cacheWriteTokens = usage?.input_tokens_details.cache_write_tokens;
+  const cacheWriteTokens = usage?.input_tokens_details?.cache_write_tokens;
   if (cacheWriteTokens == null) {
     return response;
   }
@@ -574,6 +596,278 @@ function isResponsesStream(
   result: ResponsesResult
 ): result is AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent> {
   return Symbol.asyncIterator in result;
+}
+
+const RESPONSES_REPLAY_OUTPUT_ITEM_TYPES = new Set([
+  'local_shell_call_output',
+  'shell_call_output',
+  'apply_patch_call_output',
+  'program_output',
+]);
+
+function isResponsesReplayOutputItem(item: unknown): boolean {
+  return (
+    typeof item === 'object' &&
+    item != null &&
+    'type' in item &&
+    typeof item.type === 'string' &&
+    RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(item.type)
+  );
+}
+
+/**
+ * LangChain's Responses converter places the authoritative terminal output in
+ * response_metadata.output. Its chunk merge has no way to delete provisional
+ * tool_outputs or replay-position sidecars, so remove those preemption-only
+ * captures once that terminal output arrives. An interrupted stream has no
+ * terminal chunk and keeps the captures for replay.
+ */
+class ResponsesReplayAIMessageChunk extends AIMessageChunk {
+  override get lc_id(): string[] {
+    return [...this.lc_namespace, AIMessageChunk.lc_name()];
+  }
+
+  override concat(chunk: AIMessageChunk): this {
+    const combined = super.concat(chunk);
+    if (!Array.isArray(chunk.response_metadata.output)) {
+      return combined;
+    }
+    delete combined.additional_kwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
+    const toolOutputs = combined.additional_kwargs.tool_outputs;
+    if (!Array.isArray(toolOutputs)) {
+      return combined;
+    }
+    const retainedToolOutputs = toolOutputs.filter(
+      (item) => !isResponsesReplayOutputItem(item)
+    );
+    if (retainedToolOutputs.length === toolOutputs.length) {
+      return combined;
+    }
+    if (retainedToolOutputs.length > 0) {
+      combined.additional_kwargs.tool_outputs = retainedToolOutputs;
+    } else {
+      delete combined.additional_kwargs.tool_outputs;
+    }
+    return combined;
+  }
+}
+
+function makeResponsesReplayAggregationSafe(
+  chunk: ChatGenerationChunk
+): ChatGenerationChunk {
+  if (!AIMessageChunk.isInstance(chunk.message)) {
+    return chunk;
+  }
+  const message = chunk.message;
+  chunk.message = new ResponsesReplayAIMessageChunk({
+    id: message.id,
+    name: message.name,
+    content: message.content,
+    additional_kwargs: message.additional_kwargs,
+    response_metadata: message.response_metadata,
+    tool_calls: message.tool_calls,
+    invalid_tool_calls: message.invalid_tool_calls,
+    tool_call_chunks: message.tool_call_chunks,
+    usage_metadata: message.usage_metadata,
+  });
+  return chunk;
+}
+
+function remapResponsesTextBlockIndex(
+  chunk: ChatGenerationChunk,
+  event: OpenAIClient.Responses.ResponseStreamEvent,
+  textBlockIndices: Map<string, number>
+): void {
+  const position = iife(() => {
+    if (
+      event.type === 'response.output_text.delta' ||
+      event.type === 'response.output_text.annotation.added'
+    ) {
+      return {
+        contentIndex: event.content_index,
+        outputIndex: event.output_index,
+      };
+    }
+    if (
+      event.type === 'response.output_item.added' &&
+      event.item.type === 'message'
+    ) {
+      return { contentIndex: 0, outputIndex: event.output_index };
+    }
+    return undefined;
+  });
+  if (position == null || !Array.isArray(chunk.message.content)) {
+    return;
+  }
+  const key = `${position.outputIndex}:${position.contentIndex}`;
+  let blockIndex = textBlockIndices.get(key);
+  if (blockIndex == null) {
+    blockIndex = textBlockIndices.size;
+    textBlockIndices.set(key, blockIndex);
+  }
+  const content = chunk.message.content.map((block) =>
+    typeof block === 'object' && block.type === 'text'
+      ? { ...block, index: blockIndex }
+      : block
+  );
+  chunk.message.content = content;
+  chunk.message.lc_kwargs.content = content;
+}
+
+function convertDroppedResponsesReplayOutput(
+  event: OpenAIClient.Responses.ResponseStreamEvent
+): ChatGenerationChunk | null {
+  if (event.type !== 'response.output_item.done') {
+    return null;
+  }
+  if (event.item.type === 'reasoning') {
+    // Added/summary events already stream id, type, and summary. Only merge
+    // terminal fields here so chunk concatenation does not duplicate summary.
+    return new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({
+        content: [],
+        additional_kwargs: {
+          reasoning: {
+            status: event.item.status,
+            ...(typeof event.item.encrypted_content === 'string'
+              ? { encrypted_content: event.item.encrypted_content }
+              : {}),
+          },
+        },
+        response_metadata: { model_provider: 'openai' },
+      }),
+    });
+  }
+  if (!RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(event.item.type)) {
+    return null;
+  }
+  return new ChatGenerationChunk({
+    text: '',
+    message: new AIMessageChunk({
+      content: [],
+      additional_kwargs: { tool_outputs: [event.item] },
+      response_metadata: { model_provider: 'openai' },
+    }),
+  });
+}
+
+function attachResponsesReplayPosition(
+  chunk: ChatGenerationChunk,
+  event: OpenAIClient.Responses.ResponseStreamEvent,
+  seenPositions: Set<string>
+): void {
+  let position: ResponsesReplayPosition | undefined;
+  if (event.type === 'response.output_text.delta' && event.delta.length > 0) {
+    position = {
+      contentIndex: event.content_index,
+      itemId: event.item_id,
+      kind: 'text',
+      outputIndex: event.output_index,
+    };
+  } else if (
+    event.type === 'response.output_item.added' &&
+    event.item.type === 'message' &&
+    typeof event.item.id === 'string' &&
+    event.item.id.length > 0
+  ) {
+    position = {
+      itemId: event.item.id,
+      kind: 'message',
+      outputIndex: event.output_index,
+    };
+  } else if (
+    event.type === 'response.output_item.added' &&
+    event.item.type === 'reasoning' &&
+    typeof event.item.id === 'string' &&
+    event.item.id.length > 0
+  ) {
+    position = {
+      itemId: event.item.id,
+      kind: 'reasoning',
+      outputIndex: event.output_index,
+    };
+  } else if (
+    event.type === 'response.output_item.done' &&
+    (RESPONSES_REPLAY_OUTPUT_ITEM_TYPES.has(event.item.type) ||
+      Array.isArray(chunk.message.additional_kwargs.tool_outputs))
+  ) {
+    let itemId: string | undefined;
+    if (typeof event.item.id === 'string' && event.item.id.length > 0) {
+      itemId = event.item.id;
+    } else if (
+      'call_id' in event.item &&
+      typeof event.item.call_id === 'string' &&
+      event.item.call_id.length > 0
+    ) {
+      itemId = event.item.call_id;
+    }
+    if (itemId != null) {
+      position = {
+        itemId,
+        kind: 'output',
+        outputIndex: event.output_index,
+      };
+    }
+  }
+  if (position == null) {
+    return;
+  }
+  const positionKey = `${position.kind}:${position.itemId}:${position.outputIndex}:${position.contentIndex ?? ''}`;
+  if (seenPositions.has(positionKey)) {
+    return;
+  }
+  seenPositions.add(positionKey);
+  const existing = chunk.message.additional_kwargs[
+    OPENAI_RESPONSES_REPLAY_POSITIONS_KEY
+  ] as unknown;
+  const additionalKwargs = {
+    ...chunk.message.additional_kwargs,
+    [OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]: [
+      ...(Array.isArray(existing) ? existing : []),
+      position,
+    ],
+  };
+  chunk.message.additional_kwargs = additionalKwargs;
+  chunk.message.lc_kwargs.additional_kwargs = additionalKwargs;
+}
+
+async function* convertLibreChatResponsesStream(
+  stream: AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>,
+  options: ResponsesStreamChunkOptions,
+  runManager?: CallbackManagerForLLMRun
+): AsyncGenerator<ChatGenerationChunk> {
+  const seenReplayPositions = new Set<string>();
+  const responsesTextBlockIndices = new Map<string, number>();
+  try {
+    for await (const event of stream) {
+      options.signal?.throwIfAborted();
+      const convertedChunk =
+        convertResponsesDeltaToChatGenerationChunk(event) ??
+        convertDroppedResponsesReplayOutput(event);
+      if (convertedChunk == null) {
+        continue;
+      }
+      const chunk = makeResponsesReplayAggregationSafe(convertedChunk);
+      remapResponsesTextBlockIndex(chunk, event, responsesTextBlockIndices);
+      attachResponsesReplayPosition(chunk, event, seenReplayPositions);
+      attachCacheWriteUsage(chunk.message);
+      await runManager?.handleLLMNewToken(
+        chunk.text || '',
+        {
+          prompt: options.promptIndex ?? 0,
+          completion: 0,
+        },
+        undefined,
+        undefined,
+        undefined,
+        { chunk }
+      );
+      yield chunk;
+    }
+  } catch (e) {
+    throw wrapOpenAIClientError(e);
+  }
 }
 
 function createUsageMetadata(
@@ -833,77 +1127,87 @@ function getCustomOpenAIClientOptions(
   return requestOptions;
 }
 
-function findStreamChunkBoundary(text: string, minSize: number): number {
-  if (minSize >= text.length) {
-    return text.length;
-  }
-
-  for (let position = minSize; position < text.length; position++) {
-    if (STREAM_BOUNDARIES.has(text[position])) {
-      return position + 1;
-    }
-  }
-
-  return text.length;
-}
-
-function splitStreamToken(text: string): string[] {
-  const chunks: string[] = [];
-  let currentIndex = 0;
-
-  while (currentIndex < text.length) {
-    const remainingText = text.slice(currentIndex);
-    const chunkSize = findStreamChunkBoundary(
-      remainingText,
-      STREAM_CHUNK_MIN_SIZE
-    );
-    chunks.push(text.slice(currentIndex, currentIndex + chunkSize));
-    currentIndex += chunkSize;
-  }
-
-  return chunks;
-}
-
-function splitTextGenerationChunk(
+/**
+ * Classifies a generation chunk for the smoothing engine:
+ * - splittable: plain visible text (string content equal to `chunk.text`, no
+ *   logprobs / finish_reason) — sliced adaptively at the pacing cadence.
+ *   ANY logprobs value blocks splitting here (this family only attaches
+ *   logprobs on request; the DeepSeek suite pins chunks with them staying
+ *   intact) — deliberately stricter than `stream/chunkAdapters.ts`, where
+ *   google-common's always-present empty logprobs must not block.
+ * - atomic: text- or reasoning-bearing chunks whose metadata cannot survive
+ *   slicing — paced as one piece, never split (legacy parity: these were
+ *   emitted whole but still paced).
+ * - passthrough: tool-call deltas, usage-only, finish_reason and other
+ *   metadata chunks — strict FIFO, zero delay.
+ */
+export function toSmoothItem(
   chunk: ChatGenerationChunk
-): ChatGenerationChunk[] {
+): SmoothItem<ChatGenerationChunk> {
   const { message } = chunk;
-  if (
-    !chunk.text ||
-    !(message instanceof AIMessageChunk) ||
-    typeof message.content !== 'string' ||
-    message.content !== chunk.text ||
-    chunk.generationInfo?.logprobs != null ||
-    chunk.generationInfo?.finish_reason != null
-  ) {
-    return [chunk];
+  const isMessageChunk = message instanceof AIMessageChunk;
+  /** Chunks pairing visible text with a reasoning delta (reasoning_content,
+   * reasoning summary, or OpenRouter reasoning_details) or with tool-call
+   * deltas must pace whole: split pieces would each clone the same kwargs /
+   * tool_call_chunks and downstream accumulation duplicates them per piece. */
+  const splittable =
+    Boolean(chunk.text) &&
+    isMessageChunk &&
+    typeof message.content === 'string' &&
+    message.content === chunk.text &&
+    chunk.generationInfo?.logprobs == null &&
+    chunk.generationInfo?.finish_reason == null &&
+    !hasReasoningKwargs(message) &&
+    !hasToolCallChunks(message);
+
+  if (splittable) {
+    return {
+      text: chunk.text,
+      smooth: true,
+      emit: (piece) => cloneGenerationChunkPiece(chunk, piece),
+    };
   }
 
-  const tokenChunks = splitStreamToken(chunk.text);
-  if (tokenChunks.length <= 1) {
-    return [chunk];
+  const pacedText =
+    chunk.text || (isMessageChunk ? getReasoningKwargsText(message) : '');
+  if (pacedText !== '') {
+    return {
+      text: pacedText,
+      smooth: true,
+      atomic: true,
+      emit: () => chunk,
+    };
   }
 
-  let emittedUsage = false;
-  return tokenChunks.map((token) => {
-    const usageMetadata =
-      emittedUsage && message.usage_metadata != null
-        ? undefined
-        : message.usage_metadata;
-    if (message.usage_metadata != null && !emittedUsage) {
-      emittedUsage = true;
-    }
+  return { text: '', smooth: false, emit: () => chunk };
+}
 
-    return new ChatGenerationChunk({
-      text: token,
-      generationInfo: chunk.generationInfo,
-      message: new AIMessageChunk(
-        Object.assign({}, message, {
-          content: token,
-          usage_metadata: usageMetadata,
-        })
-      ),
-    });
+/**
+ * Usage metadata, additional kwargs and response metadata survive only on
+ * the first piece: the aggregator's dict merge concatenates string fields
+ * and sums usage, so replication across pieces corrupts them. Unlike the
+ * generic adapter, `generationInfo` stays on every piece — per-piece token
+ * indices ride in it and `dropRepeatedScalarMetadata` owns repetition there.
+ */
+function cloneGenerationChunkPiece(
+  chunk: ChatGenerationChunk,
+  piece: SmoothPiece
+): ChatGenerationChunk {
+  if (piece.isFirst && piece.isLast) {
+    return chunk;
+  }
+  const message = chunk.message as AIMessageChunk;
+  return new ChatGenerationChunk({
+    text: piece.text,
+    generationInfo: chunk.generationInfo,
+    message: new AIMessageChunk(
+      Object.assign({}, message, {
+        content: piece.text,
+        usage_metadata: piece.isFirst ? message.usage_metadata : undefined,
+        additional_kwargs: piece.isFirst ? message.additional_kwargs : {},
+        response_metadata: piece.isFirst ? message.response_metadata : {},
+      })
+    ),
   });
 }
 
@@ -934,66 +1238,45 @@ function getStreamChunkTokenIndices(
   return undefined;
 }
 
+/**
+ * Adaptive smoothing adapter for the OpenAI chat-model family, layered over
+ * the shared `smoothStream` engine. Keeps the historical signature so every
+ * `_streamResponseChunks` call site is unchanged.
+ *
+ * `seenScalarMetadata`: when provided, de-duplicates repeated scalar metadata
+ * just before emitting, so token callbacks and the yielded chunk observe the
+ * same cleaned data. Omitted by callers that wrap this stream and finalize
+ * downstream (e.g. `ChatOpenRouter`, which needs the raw `finish_reason` as
+ * its flush signal and de-duplicates after its own processing).
+ */
 async function* delayStreamChunks(
   chunks: AsyncGenerator<ChatGenerationChunk>,
   delay?: number,
   signal?: AbortSignal,
   runManager?: CallbackManagerForLLMRun,
-  // When provided, de-duplicate repeated scalar metadata just before emitting,
-  // so token callbacks and the yielded chunk observe the same cleaned data.
-  // Omitted by callers that wrap this stream and finalize downstream (e.g.
-  // `ChatOpenRouter`, which needs the raw `finish_reason` as its flush signal
-  // and de-duplicates after its own processing).
   seenScalarMetadata?: SeenScalarMetadata
 ): AsyncGenerator<ChatGenerationChunk> {
-  let lastYieldedAt: number | undefined;
-  for await (const chunk of chunks) {
-    const outputChunks =
-      delay != null && delay > 0 ? splitTextGenerationChunk(chunk) : [chunk];
-    for (const outputChunk of outputChunks) {
-      signal?.throwIfAborted();
-      if (delay != null && delay > 0 && lastYieldedAt != null) {
-        const timeSinceLastYield = Date.now() - lastYieldedAt;
-        const timeToWait = Math.max(0, delay - timeSinceLastYield);
-        if (timeToWait > 0) {
-          await sleepWithAbort(timeToWait, signal);
-        }
-      }
-      signal?.throwIfAborted();
-      lastYieldedAt = Date.now();
-      if (seenScalarMetadata != null) {
-        dropRepeatedScalarMetadata(outputChunk, seenScalarMetadata);
-      }
-      await emitStreamChunkCallback(outputChunk, runManager);
-      signal?.throwIfAborted();
-      yield outputChunk;
+  const source = (async function* (): AsyncGenerator<
+    SmoothItem<ChatGenerationChunk>
+    > {
+    for await (const chunk of chunks) {
+      yield toSmoothItem(chunk);
     }
-  }
-}
+  })();
 
-async function sleepWithAbort(
-  delay: number,
-  signal?: AbortSignal
-): Promise<void> {
-  if (delay <= 0) {
-    return;
-  }
-  signal?.throwIfAborted();
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, delay);
-    const onAbort = (): void => {
-      clearTimeout(timeout);
-      signal?.removeEventListener('abort', onAbort);
-      reject(signal?.reason ?? new Error('AbortError: User aborted request.'));
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (signal?.aborted === true) {
-      onAbort();
-    }
+  const smoothed = smoothStream({
+    source,
+    delayMs: delay != null && delay > 0 ? delay : 0,
+    signal,
   });
+
+  for await (const outputChunk of smoothed) {
+    if (seenScalarMetadata != null) {
+      dropRepeatedScalarMetadata(outputChunk, seenScalarMetadata);
+    }
+    await emitStreamChunkCallback(outputChunk, runManager);
+    yield outputChunk;
+  }
 }
 
 function createAbortHandler(controller: AbortController): () => void {
@@ -1012,6 +1295,65 @@ function createAbortHandler(controller: AbortController): () => void {
  * @param {Object} [fields] Additional fields to add to the OpenAI tool.
  * @returns {ToolDefinition} The inputted tool in OpenAI tool format.
  */
+/**
+ * OpenAI strict function schemas require every property to appear in
+ * `required`. The optional `intent` label (see `tools/intentArg.ts`) is
+ * deliberately NOT required — the same schema is callable from programmatic
+ * tool calling — so a tool auto-marked `strict: true` (the non-streaming
+ * `json_schema` structured-output path) would be rejected as invalid before
+ * execution. That path never streams a live label anyway, so the
+ * marker-identified property is dropped there; every other path keeps it.
+ */
+function stripIntentFromStrictTools<T extends object>(params: T): T {
+  const record = params as { tools?: unknown[] };
+  const tools = record.tools;
+  if (!Array.isArray(tools) || tools.length === 0) {
+    return params;
+  }
+  const nextTools = tools.map((tool) => {
+    const candidate = tool as {
+      strict?: boolean;
+      parameters?: { properties?: Record<string, unknown>; required?: unknown };
+      function?: {
+        strict?: boolean;
+        parameters?: {
+          properties?: Record<string, unknown>;
+          required?: unknown;
+        };
+      };
+    };
+    /** Chat-completions tools nest under `function`; responses-API tools are flat. */
+    const holder = candidate.function ?? candidate;
+    if (holder.strict !== true) {
+      return tool;
+    }
+    const parameters = holder.parameters;
+    const properties = parameters?.properties;
+    if (properties == null || !isIntentLabelProperty(properties[INTENT_ARG])) {
+      return tool;
+    }
+    const required = Array.isArray(parameters?.required)
+      ? (parameters.required as unknown[])
+      : [];
+    if (required.includes(INTENT_ARG)) {
+      return tool;
+    }
+    const { [INTENT_ARG]: _omit, ...restProps } = properties;
+    const nextParams = { ...parameters, properties: restProps };
+    if (candidate.function != null) {
+      return {
+        ...candidate,
+        function: { ...candidate.function, parameters: nextParams },
+      };
+    }
+    return { ...candidate, parameters: nextParams };
+  });
+  if (nextTools.every((tool, index) => tool === tools[index])) {
+    return params;
+  }
+  return { ...params, tools: nextTools } as T;
+}
+
 export function _convertToOpenAITool(
   tool: BindToolsInput,
   fields?: {
@@ -1193,10 +1535,12 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options?: this['ParsedCallOptions'],
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
-    return applyManagedRequestParams(super.invocationParams(options, extra), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    return stripIntentFromStrictTools(
+      applyManagedRequestParams(super.invocationParams(options, extra), {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      })
+    );
   }
 
   protected _getReasoningParams(
@@ -1649,7 +1993,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(
@@ -1701,14 +2045,20 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    for await (const chunk of super._streamResponseChunks(
-      projectOpenAIResponsesProviderMessages(messages),
-      options,
-      runManager
-    )) {
-      attachCacheWriteUsage(chunk.message);
-      yield chunk;
-    }
+    const projectedMessages = projectOpenAIResponsesProviderMessages(messages);
+    const stream = await this.completionWithRetry(
+      {
+        ...this.invocationParams(options),
+        input: convertMessagesToResponsesInput({
+          messages: projectedMessages,
+          zdrEnabled: this.zdrEnabled ?? false,
+          model: this.model,
+        }),
+        stream: true,
+      },
+      options
+    );
+    yield* convertLibreChatResponsesStream(stream, options, runManager);
   }
 
   async *_streamChatModelEvents(
@@ -1750,10 +2100,12 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     options?: this['ParsedCallOptions'],
     extra?: { streaming?: boolean }
   ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
-    return applyManagedRequestParams(super.invocationParams(options, extra), {
-      promptCacheExplicit: this.promptCacheExplicit,
-      safetyIdentifier: this.safetyIdentifier,
-    });
+    return stripIntentFromStrictTools(
+      applyManagedRequestParams(super.invocationParams(options, extra), {
+        promptCacheExplicit: this.promptCacheExplicit,
+        safetyIdentifier: this.safetyIdentifier,
+      })
+    );
   }
 
   protected _getReasoningParams(
@@ -1897,7 +2249,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
         ]),
       ];
     }
-    return params;
+    return stripIntentFromStrictTools(params);
   }
 
   async completionWithRetry(
@@ -1933,7 +2285,11 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const result = await super._generate(messages, options, runManager);
+    const result = await super._generate(
+      projectOpenAIResponsesProviderMessages(messages),
+      options,
+      runManager
+    );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
     }
@@ -1945,14 +2301,32 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    for await (const chunk of super._streamResponseChunks(
-      messages,
+    const projectedMessages = projectOpenAIResponsesProviderMessages(messages);
+    const stream = await this.completionWithRetry(
+      {
+        ...this.invocationParams(options),
+        input: convertMessagesToResponsesInput({
+          messages: projectedMessages,
+          zdrEnabled: this.zdrEnabled ?? false,
+          model: this.model,
+        }),
+        stream: true,
+      },
+      options
+    );
+    yield* convertLibreChatResponsesStream(stream, options, runManager);
+  }
+
+  async *_streamChatModelEvents(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatModelStreamEvent> {
+    yield* super._streamChatModelEvents(
+      projectOpenAIResponsesProviderMessages(messages),
       options,
       runManager
-    )) {
-      attachCacheWriteUsage(chunk.message);
-      yield chunk;
-    }
+    );
   }
 
   protected _getReasoningParams(
@@ -2044,14 +2418,14 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
    */
   protected visionCapable: boolean;
 
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(
     fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
     super(withLibreChatOpenAIFields(fields));
     this.visionCapable = fields?.vision ?? true;
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2156,14 +2530,14 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
    */
   protected visionCapable: boolean;
 
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(withRateLimitRetry(fields));
     this.visionCapable = fields?.vision ?? true;
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2279,7 +2653,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
    */
   protected visionCapable: boolean;
 
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(
     fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
@@ -2290,7 +2664,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   ) {
     super(withRateLimitRetry(fields));
     this.visionCapable = fields?.vision ?? true;
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -2813,7 +3187,7 @@ export class ChatXAI extends OriginalChatXAI {
    */
   protected visionCapable: boolean;
 
-  _lc_stream_delay?: number;
+  _lc_stream_delay: number;
 
   constructor(
     fields?: Partial<ChatXAIInput> & {
@@ -2826,7 +3200,7 @@ export class ChatXAI extends OriginalChatXAI {
   ) {
     super(withRateLimitRetry(fields));
     this.visionCapable = fields?.vision ?? true;
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
     if (customBaseURL != null && customBaseURL) {

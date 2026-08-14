@@ -17,12 +17,53 @@ import { createKeenableScraper } from './keenable-scraper';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
 import { createReranker } from './rerankers';
 import { Constants } from '@/common';
+
+/**
+ * Settled label for a `web_search` call's intent (see `intentArg.ts`).
+ *
+ * Counts the result kinds `formatResultsForLLM` actually renders —
+ * `references` only tracks links embedded in extracted highlights, so it
+ * undercounts ordinary results and can overcount when one highlight embeds
+ * several links.
+ *
+ * A caught provider or processing failure is reported through `data.error`
+ * while the tool still returns NORMALLY, so that case must author its own
+ * label: the `ToolMessage` carries success status, so without an authored
+ * outcome the in-flight intent ("Searching…") would stand as the settled
+ * label and present a failed search as an ordinary one.
+ *
+ * Returns undefined for a genuine zero-result search, leaving the
+ * model-authored intent to stand unchanged as the label.
+ */
+export function resolveSearchOutcome(
+  data: t.SearchResultData,
+  query: string
+): string | undefined {
+  if (data.error != null && data.error !== '') {
+    return `Search failed for "${query}"`;
+  }
+  const count =
+    (data.organic?.length ?? 0) +
+    (data.topStories?.length ?? 0) +
+    (data.news?.length ?? 0) +
+    (data.images?.length ?? 0) +
+    (data.videos?.length ?? 0) +
+    (data.places?.length ?? 0) +
+    (data.peopleAlsoAsk?.length ?? 0) +
+    (data.knowledgeGraph != null ? 1 : 0) +
+    (data.answerBox != null ? 1 : 0);
+  if (count === 0) {
+    return undefined;
+  }
+  return `Found ${count} result${count === 1 ? '' : 's'} for "${query}"`;
+}
 
 /**
  * Executes parallel searches and merges the results,
@@ -335,7 +376,11 @@ function createTool({
         maxOutputChars
       );
       const data: t.SearchResultData = { turn, ...searchResult, references };
-      return [output, { [Constants.WEB_SEARCH]: data }];
+      const outcome = resolveSearchOutcome(data, query);
+      return [
+        output,
+        { [Constants.WEB_SEARCH]: data, ...(outcome != null && { outcome }) },
+      ];
     },
     {
       name: WebSearchToolName,
@@ -407,9 +452,14 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    ragApiUrl,
+    ragApiTokenSupplier,
+    ragApiProfile,
     customRerankerApiUrl,
     customRerankerApiKey,
     customRerankerModel,
+    httpAgent,
+    httpsAgent,
     onSearchResults: _onSearchResults,
     onGetHighlights,
   } = config;
@@ -424,6 +474,7 @@ export const createSearchTool = (
       : tavilySearchOptions;
 
   const schemaProperties: Record<string, unknown> = {
+    intent: { ...INTENT_PROPERTY },
     query: querySchema,
     date: dateSchema,
     images: imagesSchema,
@@ -455,6 +506,8 @@ export const createSearchTool = (
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
+    httpAgent,
+    httpsAgent,
   });
 
   /** Create scraper based on scraperProvider */
@@ -465,6 +518,8 @@ export const createSearchTool = (
       ...serperScraperOptions,
       apiKey: serperApiKey,
       timeout: scraperTimeout ?? serperScraperOptions?.timeout,
+      httpAgent: httpAgent ?? serperScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? serperScraperOptions?.httpsAgent,
       logger,
     });
   } else if (scraperProvider === 'tavily') {
@@ -476,6 +531,8 @@ export const createSearchTool = (
         process.env.TAVILY_API_KEY,
       apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
+      httpAgent: httpAgent ?? tavilyScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? tavilyScraperOptions?.httpsAgent,
       logger,
     });
   } else if (scraperProvider === 'crw') {
@@ -485,6 +542,8 @@ export const createSearchTool = (
       apiUrl: crwScraperOptions?.apiUrl ?? crwApiUrl,
       timeout: scraperTimeout ?? crwScraperOptions?.timeout,
       formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
+      httpAgent: httpAgent ?? crwScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? crwScraperOptions?.httpsAgent,
       logger,
     });
   } else if (scraperProvider === 'keenable') {
@@ -495,6 +554,8 @@ export const createSearchTool = (
       attributionTitle:
         keenableScraperOptions?.attributionTitle ??
         keenableSearchOptions?.attributionTitle,
+      httpAgent: httpAgent ?? keenableScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? keenableScraperOptions?.httpsAgent,
       logger,
     });
   } else {
@@ -505,6 +566,8 @@ export const createSearchTool = (
       version: firecrawlVersion,
       timeout: scraperTimeout ?? firecrawlOptions?.timeout,
       formats: firecrawlOptions?.formats ?? ['markdown', 'rawHtml'],
+      httpAgent: httpAgent ?? firecrawlOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? firecrawlOptions?.httpsAgent,
       logger,
     });
   }
@@ -514,10 +577,15 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    ragApiUrl,
+    ragApiTokenSupplier,
+    ragApiProfile,
     customRerankerApiUrl,
     customRerankerApiKey,
     customRerankerModel,
     rerankerTimeout,
+    httpAgent,
+    httpsAgent,
     logger,
   });
 

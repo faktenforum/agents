@@ -3,6 +3,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { MessageContentComplex, ToolErrorData } from './stream';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
@@ -75,6 +76,28 @@ export type EagerEventToolCallChunkState = {
   argsText: string;
   index?: number;
   lastArgsFragment?: string;
+  /**
+   * Cumulative length of every observed args fragment — the length of the
+   * plain in-order concatenation that LangChain's `AIMessageChunk.concat`
+   * performs to build the final tool call. Every reconciliation branch in
+   * `mergeToolCallArgsText` (and the repeat-fragment dedupe) produces text no
+   * longer than plain concatenation, with equality exactly when every merge
+   * was a pure append — so `argsText.length === rawArgsLength` proves
+   * `argsText` IS the canonical accumulation the final request will carry.
+   * Tracking only the length keeps cumulative/restating streams from
+   * retaining every prefix (quadratic growth) while still letting seal-time
+   * prestart verify the snapshot.
+   */
+  rawArgsLength?: number;
+  /**
+   * The non-empty args fragment carried by a chunk whose explicit adapter
+   * seal covered this call. Some adapters restate the finished call's full
+   * args on the seal chunk (OpenAI Responses `function_call_arguments.done`);
+   * only such a restatement may override the canonical-accumulation check at
+   * seal time. Pure-signal seals (Bedrock `contentBlockStop`, `args: ''`)
+   * never set this.
+   */
+  sealedArgsFragment?: string;
 };
 
 export type ToolNodeOptions = {
@@ -157,6 +180,14 @@ export type ToolNodeOptions = {
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
   eagerEventToolUsageCount?: Map<string, number>;
   /**
+   * Shared per-run circuit breaker for eager prestart. When a prestarted
+   * execution's args turn out to differ from the final request ("changed
+   * after eager execution started"), the ToolNode adds the tool name here
+   * and the stream handler stops prestarting that tool for the remainder of
+   * the run, so the model's retry executes normally instead of looping.
+   */
+  eagerEventToolSuppressions?: Set<string>;
+  /**
    * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
    * PermissionDenied lifecycle hooks. Fires for **every** tool the
    * ToolNode invokes — both event-dispatched tools (via
@@ -229,6 +260,20 @@ export type ToolNodeOptions = {
    * `resolveLocalExecutionTools`.
    */
   fileCheckpointer?: LocalFileCheckpointer;
+  /**
+   * Returns the owning graph's run-scoped breaker signal. Read once per
+   * `run()` invocation and composed into the batch config's `signal`, so
+   * every tool execution in the batch aborts when a stream circuit breaker
+   * trips elsewhere in the run.
+   */
+  getBreakerSignal?: () => AbortSignal | undefined;
+  /**
+   * Returns the owning graph's immutable run scope. Read once per batch,
+   * BEFORE hooks, and threaded to tools that spawn runs (subagents) so a
+   * reset during a hook cannot rebind their children to a newer run's
+   * controller.
+   */
+  getRunScope?: () => RunBreakerScope;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -236,8 +281,16 @@ export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
 export type ToolEndEvent = {
   /** The Step Id of the Tool Call */
   id: string;
-  /** The Completed Tool Call */
-  tool_call: ToolCall;
+  /**
+   * The Completed Tool Call. Carries the tool-authored `outcome` label when
+   * present (see `ProcessedToolCall.outcome`) so `ON_RUN_STEP_COMPLETED`
+   * consumers can read it without an unsafe cast.
+   */
+  tool_call: ToolCall & {
+    output?: string;
+    progress?: number;
+    outcome?: string;
+  };
   /** The content index of the tool call */
   index: number;
   type?: 'tool_call';
@@ -485,6 +538,12 @@ export type ToolExecuteBatchRequest = {
   configurable?: Record<string, unknown>;
   /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
   metadata?: Record<string, unknown>;
+  /**
+   * Aborts when the run is cancelled or its stream circuit breaker trips.
+   * Handlers SHOULD forward this to their tool executions so in-flight work
+   * stops consuming quota once the run is already failing.
+   */
+  signal?: AbortSignal;
   /** Promise resolver - handler calls this with ALL results */
   resolve: (results: ToolExecuteResult[]) => void;
   /** Promise rejector - handler calls this on fatal error */
@@ -521,6 +580,17 @@ export type InjectedMessage = {
   skillName?: string;
 };
 
+/**
+ * In-place edit of a call's model-authored `intent` label: the first
+ * occurrence of `from` in the intent is replaced with `to` (case-sensitive).
+ * Lets a tool settle the label while preserving the model's own phrasing,
+ * e.g. `{ from: 'Searching', to: 'Searched' }`.
+ */
+export type OutcomePatch = {
+  from: string;
+  to: string;
+};
+
 /** Result for a single tool call in event-driven execution */
 export type ToolExecuteResult = {
   /** Matches ToolCallRequest.id */
@@ -533,6 +603,13 @@ export type ToolExecuteResult = {
   status: 'success' | 'error';
   /** Error message if status is 'error' */
   errorMessage?: string;
+  /**
+   * Settled human-readable label for this call, replacing the model-authored
+   * `intent` arg in the UI. Full replacement; wins over `outcome_patch`.
+   */
+  outcome?: string;
+  /** In-place edit of the model-authored `intent` label (see {@link OutcomePatch}). */
+  outcome_patch?: OutcomePatch;
   /**
    * Messages to inject into graph state after the ToolMessage for this call.
    * Placed after tool results to respect provider message ordering (tool_call -> tool_result adjacency).
