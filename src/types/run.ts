@@ -28,7 +28,13 @@ export type BaseGraphConfig = {
 };
 export type LegacyGraphConfig = BaseGraphConfig & {
   type?: 'standard';
-} & Omit<g.StandardGraphInput, 'provider' | 'clientOptions' | 'agents'> &
+} & Omit<
+    g.StandardGraphInput,
+    /** `streamLimits` is excluded because legacy graphs receive limits only
+     * via the top-level `RunConfig.streamLimits`; accepting the field here
+     * would type-check but be silently ignored by `createLegacyGraph`. */
+    'provider' | 'clientOptions' | 'agents' | 'streamLimits'
+  > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
 /* Supervised graph (opt-in) */
@@ -115,6 +121,100 @@ export type StandardGraphConfig = Omit<
   'edges' | 'type'
 > & { type?: 'standard'; signal?: AbortSignal };
 
+/**
+ * Cooperative mid-generation preemption. Lets a host seal the live model
+ * stream at the next provider-safe token boundary — the run is never
+ * aborted, the partial assistant turn is kept, and the graph self-loops
+ * into a fresh model call once the `PreemptBoundary` hook has injected
+ * whatever the host queued.
+ *
+ * Preconditions the host MUST satisfy:
+ *   - `shouldPreempt` is polled once per streamed chunk on the top-level
+ *     graph. It must be synchronous, allocation-free and O(1) — never I/O.
+ *     It must also be LEVEL-TRIGGERED (non-consuming): the SDK never clears
+ *     the host's request, and a true result is only honored once the
+ *     accumulated chunk is provider-safe, so the predicate may be polled
+ *     many times before a seal. A one-shot read that clears its own pending
+ *     flag would silently lose the request on an unsafe chunk (leading
+ *     whitespace/reasoning, an in-flight tool call) — keep returning true
+ *     until the `PreemptBoundary` drain hands over the queued injection,
+ *     then disarm there.
+ *   - Sealing is only honored on the SDK's own dispatch loop. A run whose
+ *     registered `CHAT_MODEL_STREAM` handler IS the SDK dispatcher — or wraps
+ *     it, which `composeEventHandlers` and `createRunHandlers` both do —
+ *     consumes chunks through a decoupled `streamEvents` reader that can lag
+ *     the accumulated chunk, so those runs never seal.
+ *
+ *     Detection is by capability, not identity: the dispatcher carries
+ *     `SDK_STREAM_DISPATCH` and the SDK's wrappers propagate it. A handler
+ *     that merely OBSERVES the raw chunk echo — LibreChat's no-op
+ *     `OpenAIChatModelStreamHandler`, say — is unbranded and does NOT disable
+ *     sealing, because it assigns no content-part indices and so cannot be
+ *     inverted. A host that renders from the raw feed and wants the opt-out
+ *     should brand its handler with `SDK_STREAM_DISPATCH`.
+ *   - `RunConfig.tokenCounter` should be set. A sealed turn ends before most
+ *     providers send their usage chunk, so the synthetic `CHAT_MODEL_END`
+ *     falls back to the counter to report `output_tokens`. Without one that
+ *     fallback silently no-ops and the sealed turn's usage is lost — verified
+ *     live: OpenAI, Azure OpenAI and DeepSeek report no usage for the sealed
+ *     segment without a counter, while Anthropic streams usage incrementally
+ *     and reports it either way.
+ */
+export interface StreamPreemption {
+  /**
+   * Polled once per streamed chunk. Synchronous, allocation-free, O(1), and
+   * level-triggered — keep returning true until the `PreemptBoundary` drain
+   * consumes the request; a self-clearing read loses it on an unsafe chunk.
+   */
+  shouldPreempt: () => boolean;
+  /**
+   * Max cooperative seals per run. Each seal costs one extra superstep, so
+   * this also bounds the recursion-limit headroom the run reserves.
+   */
+  maxSeals?: number;
+}
+
+/** Seals honored and boundaries that had nothing to inject, per run. */
+export type PreemptStats = {
+  seals: number;
+  emptyBoundaries: number;
+};
+
+/**
+ * Circuit breakers for pathological model streams. A malformed generation
+ * can stream a single tool call's arguments for many minutes while they
+ * never become executable (observed live: one 149,923-char SQL argument
+ * streamed for 26 minutes before the 64k output-token ceiling ended the
+ * run). When a limit trips, the run aborts with a `StreamLimitExceededError`
+ * and the in-flight provider request is torn down mid-stream.
+ */
+export interface StreamLimits {
+  /**
+   * Max cumulative UTF-8 bytes a single streamed tool call's arguments may
+   * reach before the run is aborted. Defaults to
+   * `DEFAULT_MAX_TOOL_CALL_ARG_BYTES` (64 KiB); `0` disables the guard.
+   */
+  maxToolCallArgBytes?: number;
+  /**
+   * Per-tool overrides for `maxToolCallArgBytes`, keyed by the model-facing
+   * tool name. A matching entry replaces the global cap for that tool's
+   * calls (`0` disables the guard for that tool only). Tools that
+   * legitimately stream whole documents as arguments (e.g. file creation)
+   * can run with a higher cap without loosening every other tool's guard.
+   * Calls whose tool name has not yet arrived on the stream use the global
+   * cap; providers send the name in the first chunk, so this only matters
+   * for malformed streams.
+   */
+  maxToolCallArgBytesByTool?: Record<string, number>;
+  /**
+   * Max streamed chunk events a single model generation (turn) may emit
+   * before the run is aborted. Defense in depth against looping or
+   * duplicated provider streams that a byte limit cannot see (e.g. endless
+   * empty chunks). Disabled by default; `0` also disables.
+   */
+  maxDeltaEventsPerTurn?: number;
+}
+
 export type RunConfig = {
   runId: string;
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
@@ -146,6 +246,21 @@ export type RunConfig = {
    * block to prevent leaks.
    */
   hooks?: HookRegistry;
+  /**
+   * Opt-in cooperative preemption for this run. Requires a `hooks` registry
+   * with a `PreemptBoundary` matcher — the seal only stops the stream, the
+   * hook is what supplies the messages to resume with. Omit to keep the
+   * pre-preemption behavior, where a mid-run injection can only land at a
+   * tool boundary.
+   */
+  preemption?: StreamPreemption;
+  /**
+   * Circuit breakers for pathological model streams (runaway tool-call
+   * argument generation, looping delta streams). Omit for defaults: the
+   * tool-call argument byte cap is ON by default, the per-turn event cap is
+   * opt-in. See {@link StreamLimits}.
+   */
+  streamLimits?: StreamLimits;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;

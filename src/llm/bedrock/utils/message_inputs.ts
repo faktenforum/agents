@@ -684,6 +684,33 @@ function convertSystemMessageToConverseMessage(
 /**
  * Convert an AI message to a Bedrock message.
  */
+/**
+ * Bedrock Converse requires `toolUse.input` to be a JSON object document.
+ * History can carry non-object values: streaming leaves the raw partial-JSON
+ * string on Anthropic-shaped inline blocks, and context-pressure truncation
+ * (pre-3.x `createBoundedTruncationValue`) could persist `null` onto BOTH a
+ * block's inline input and its `tool_calls` args. A string is parsed when it
+ * forms a complete JSON object; every other shape degrades to `{}` — the call
+ * already executed, so the replayed input is informational. Twin of
+ * `coerceAnthropicToolUseInput` in the Anthropic fork; duplicated so each
+ * fork stays self-contained against its upstream.
+ */
+function coerceBedrockToolUseInput(input: unknown): Record<string, unknown> {
+  let candidate: unknown = input;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return {};
+    }
+  }
+  return typeof candidate === 'object' &&
+    candidate !== null &&
+    !Array.isArray(candidate)
+    ? (candidate as Record<string, unknown>)
+    : {};
+}
+
 function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   // Check for v1 format from other providers (PR #9766 fix)
   const responseMetadata = msg.response_metadata as
@@ -731,9 +758,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
         }
         if (
           typeof toolUse.id !== 'string' ||
-          typeof toolUse.name !== 'string' ||
-          toolUse.input == null ||
-          typeof toolUse.input !== 'object'
+          typeof toolUse.name !== 'string'
         ) {
           throw new Error('Invalid Anthropic tool_use content block');
         }
@@ -741,7 +766,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           toolUse: {
             toolUseId: toolUse.id,
             name: toolUse.name,
-            input: toolUse.input as Record<string, unknown>,
+            input: coerceBedrockToolUseInput(toolUse.input),
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
@@ -804,7 +829,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
         toolUse: {
           toolUseId: toolCall.id,
           name: toolCall.name,
-          input: toolCall.args as Record<string, unknown>,
+          input: coerceBedrockToolUseInput(toolCall.args),
         },
       }));
     assistantMsg.content = [
@@ -862,7 +887,7 @@ function convertFromV1ToChatBedrockConverseMessage(
           toolUse: {
             toolUseId: toolCall.id,
             name: toolCall.name,
-            input: toolCall.args as Record<string, unknown>,
+            input: coerceBedrockToolUseInput(toolCall.args),
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning') {
@@ -914,7 +939,7 @@ function convertFromV1ToChatBedrockConverseMessage(
           toolUse: {
             toolUseId: tc.id,
             name: tc.name,
-            input: tc.args as Record<string, unknown>,
+            input: coerceBedrockToolUseInput(tc.args),
           },
         } as BedrockContentBlock);
       }
@@ -1063,7 +1088,19 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
       }
     });
 
-  // Combine consecutive user tool result messages into a single message
+  /**
+   * Combine ALL consecutive user messages into one, not just tool-result
+   * pairs. The Converse API documents strict role alternation; enforcement
+   * varies by model family (Claude on Converse currently tolerates adjacent
+   * user messages — verified live, 2026-07-28 — but the docs promise nothing
+   * for the others), so the converter never emits the shape. The case that
+   * matters: a `PostToolBatch`/`PreemptBoundary` hook injection lands a text
+   * turn directly after tool results, and `ToolMessage` and `HumanMessage`
+   * both convert to `role: 'user'` above. Block order is preserved
+   * (toolResult blocks, then text) — verified live that Converse accepts the
+   * mixed user message and answers both halves — and the toolUse/toolResult
+   * pairing stays intact.
+   */
   const combinedConverseMessages = converseMessages.reduce<BedrockMessage[]>(
     (acc, curr) => {
       if (acc.length === 0) {
@@ -1071,16 +1108,7 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
         return acc;
       }
       const lastMessage = acc[acc.length - 1];
-      const lastHasToolResult =
-        lastMessage.content?.some((c) => 'toolResult' in c) === true;
-      const currHasToolResult =
-        curr.content?.some((c) => 'toolResult' in c) === true;
-      if (
-        lastMessage.role === 'user' &&
-        lastHasToolResult &&
-        curr.role === 'user' &&
-        currHasToolResult
-      ) {
+      if (lastMessage.role === 'user' && curr.role === 'user') {
         lastMessage.content = lastMessage.content?.concat(curr.content ?? []);
       } else {
         acc.push(curr);

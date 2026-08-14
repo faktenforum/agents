@@ -1,10 +1,11 @@
 import type { JsonSchemaType, LCTool } from '@/types/tools';
 import type { SubagentConfig } from '@/types';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 export const SubagentToolName = Constants.SUBAGENT;
 
-export const SubagentToolDescription = `Delegate a task to a specialized subagent that runs in an isolated context window. The subagent executes independently and returns only its final text result — all intermediate tool calls, reasoning, and context stay isolated.
+export const SubagentToolDescription = `Delegate a task to a specialized subagent or bounded agent team that runs in an isolated context window. The delegated execution returns only its designated final text result — all intermediate tool calls, reasoning, and context stay isolated.
 
 WHEN TO USE:
 - The task is self-contained and can be described in a single prompt.
@@ -12,9 +13,9 @@ WHEN TO USE:
 - A specialized subagent is available for the task domain.
 
 WHAT HAPPENS:
-- A fresh agent is created with the task description as its only input.
-- The subagent runs to completion using its own tools and context.
-- Only the final text response is returned to you.
+- A fresh agent or configured agent graph is created with the task description as its only input.
+- The delegated agent or team runs to completion using isolated tools and context.
+- Only the single agent's final response or the graph's designated result-agent response is returned to you.
 
 CONSTRAINTS:
 - subagent_type must match one of the available types listed below.
@@ -29,6 +30,7 @@ const SUBAGENT_TYPE_PROP_DESCRIPTION =
 export const SubagentToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     description: {
       type: 'string',
       description: DESCRIPTION_PROP_DESCRIPTION,
@@ -67,6 +69,7 @@ export function buildSubagentToolParams(configs: SubagentConfig[]): {
     schema: {
       type: 'object',
       properties: {
+        intent: { ...INTENT_PROPERTY },
         description: {
           type: 'string',
           description: DESCRIPTION_PROP_DESCRIPTION,

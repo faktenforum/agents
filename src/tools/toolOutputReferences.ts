@@ -30,6 +30,29 @@ import {
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
 } from '@/utils/truncation';
 import { isComputerCallOutputMessage } from '@/utils/toolContent';
+import { INTENT_ARG } from '@/tools/intentArg';
+
+/** Parses a stringified JSON object arg; undefined for anything else. */
+function parseStringifiedArgsObject(
+  value: string
+): Record<string, unknown> | undefined {
+  if (!value.trim().startsWith('{')) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (
+      parsed != null &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed)
+    ) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
 
 /**
  * Non-global matcher for a single `{{tool<i>turn<n>}}` placeholder.
@@ -72,6 +95,12 @@ export type ToolOutputReferenceRegistryOptions = {
   maxActiveRuns?: number;
 };
 
+export interface ToolOutputReferenceState {
+  entries: Array<{ key: string; value: string }>;
+  turnCounter: number;
+  warnedNonStringTools: string[];
+}
+
 /**
  * Result of resolving placeholders in tool args.
  */
@@ -89,8 +118,19 @@ export type ResolveResult<T> = {
  * point in time, ignoring any subsequent registrations.
  */
 export interface ToolOutputResolveView {
-  resolve<T>(args: T): ResolveResult<T>;
+  resolve<T>(args: T, options?: ResolveOptions): ResolveResult<T>;
 }
+
+/**
+ * Per-call resolution options. `substituteIntentKey` opts the top-level
+ * `intent` key back INTO placeholder substitution: the exemption protects
+ * the injected display label, but a tool whose own schema declares a
+ * business parameter named `intent` (the injectors skip such tools) still
+ * needs references piped into it like any other argument.
+ */
+export type ResolveOptions = {
+  substituteIntentKey?: boolean;
+};
 
 /**
  * Pre-resolved arg map keyed by `toolCallId`. Used by the mixed
@@ -333,12 +373,16 @@ export class ToolOutputReferenceRegistry {
    * the serialized args, the original input is returned without
    * walking the tree.
    */
-  resolve<T>(runId: string | undefined, args: T): ResolveResult<T> {
+  resolve<T>(
+    runId: string | undefined,
+    args: T,
+    options?: ResolveOptions
+  ): ResolveResult<T> {
     if (!hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
     const bucket = this.runStates.get(this.keyFor(runId));
-    return this.resolveAgainst(bucket?.entries ?? EMPTY_ENTRIES, args);
+    return this.resolveAgainst(bucket?.entries ?? EMPTY_ENTRIES, args, options);
   }
 
   /**
@@ -358,27 +402,81 @@ export class ToolOutputReferenceRegistry {
       ? new Map(bucket.entries)
       : EMPTY_ENTRIES;
     return {
-      resolve: <T>(args: T): ResolveResult<T> =>
-        this.resolveAgainst(entries, args),
+      resolve: <T>(args: T, options?: ResolveOptions): ResolveResult<T> =>
+        this.resolveAgainst(entries, args, options),
     };
+  }
+
+  /** Captures the checkpoint-safe state needed to resume one run bucket. */
+  snapshotState(runId: string | undefined): ToolOutputReferenceState {
+    const bucket = this.runStates.get(this.keyFor(runId));
+    return {
+      entries: [...(bucket?.entries ?? EMPTY_ENTRIES)].map(([key, value]) => ({
+        key,
+        value,
+      })),
+      turnCounter: bucket?.turnCounter ?? 0,
+      warnedNonStringTools: [...(bucket?.warnedNonStringTools ?? [])],
+    };
+  }
+
+  /** Restores a checkpointed run bucket under the current resume scope. */
+  restoreState(
+    runId: string | undefined,
+    state: ToolOutputReferenceState
+  ): void {
+    this.releaseRun(runId);
+    const bucket = this.getOrCreate(runId);
+    for (const { key, value } of state.entries) {
+      this.set(runId, key, value);
+    }
+    bucket.turnCounter = state.turnCounter;
+    for (const toolName of state.warnedNonStringTools) {
+      bucket.warnedNonStringTools.add(toolName);
+    }
   }
 
   private resolveAgainst<T>(
     entries: ReadonlyMap<string, string>,
-    args: T
+    args: T,
+    options?: ResolveOptions
   ): ResolveResult<T> {
     if (!hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
+    const exemptIntentKey = options?.substituteIntentKey !== true;
     const unresolved = new Set<string>();
-    const resolved = this.transform(entries, args, unresolved) as T;
+    /**
+     * Providers may deliver the args OBJECT as a JSON string. A plain
+     * string-root transform would expand placeholders inside the `intent`
+     * label too, bypassing the top-level exclusion below — parse, transform
+     * key-aware, and re-serialize so the label stays verbatim while every
+     * other field still substitutes. Only taken when an `intent` key is
+     * actually present; other strings keep the fast raw-string path.
+     */
+    if (exemptIntentKey && typeof args === 'string') {
+      const parsedRoot = parseStringifiedArgsObject(args);
+      if (parsedRoot != null && INTENT_ARG in parsedRoot) {
+        const resolved = JSON.stringify(
+          this.transform(entries, parsedRoot, unresolved, true)
+        ) as T;
+        return { resolved, unresolved: Array.from(unresolved) };
+      }
+    }
+    const resolved = this.transform(
+      entries,
+      args,
+      unresolved,
+      exemptIntentKey
+    ) as T;
     return { resolved, unresolved: Array.from(unresolved) };
   }
 
   private transform(
     entries: ReadonlyMap<string, string>,
     value: unknown,
-    unresolved: Set<string>
+    unresolved: Set<string>,
+    exemptRootIntent = false
   ): unknown {
     if (typeof value === 'string') {
       return this.replaceInString(entries, value, unresolved);
@@ -390,7 +488,16 @@ export class ToolOutputReferenceRegistry {
       const source = value as Record<string, unknown>;
       const next: Record<string, unknown> = {};
       for (const [key, item] of Object.entries(source)) {
-        next[key] = this.transform(entries, item, unresolved);
+        /**
+         * The top-level `intent` arg is a display label, never a data
+         * channel: expanding a `{{tool<i>turn<n>}}` placeholder there would
+         * dump a stored output (up to the registry cap) into a single-line
+         * UI label and persist it with the message. Left verbatim instead.
+         */
+        next[key] =
+          exemptRootIntent && key === INTENT_ARG
+            ? item
+            : this.transform(entries, item, unresolved);
       }
       return next;
     }

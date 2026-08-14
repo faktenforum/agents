@@ -21,9 +21,10 @@ function getBM25Function(): BM25Fn {
 
 const BM25 = getBM25Function();
 import fetch, { RequestInit } from 'node-fetch';
-import { HttpsProxyAgent } from 'https-proxy-agent';
+import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { getCodeBaseURL } from './CodeExecutor';
 import { Constants } from '@/common';
 
@@ -51,6 +52,7 @@ const MCP_SERVER_DESCRIPTION =
 export const ToolSearchToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     query: {
       type: 'string',
       maxLength: MAX_PATTERN_LENGTH,
@@ -117,6 +119,7 @@ function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
   return {
     type: 'object',
     properties: {
+      intent: { ...INTENT_PROPERTY },
       query: {
         type: 'string',
         maxLength: MAX_PATTERN_LENGTH,
@@ -1099,8 +1102,9 @@ ${mcpNote}${toolsListSection}
           body: JSON.stringify(postData),
         };
 
-        if (process.env.PROXY != null && process.env.PROXY !== '') {
-          fetchOptions.agent = new HttpsProxyAgent(process.env.PROXY);
+        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
+        if (proxyAgent) {
+          fetchOptions.agent = proxyAgent;
         }
 
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);

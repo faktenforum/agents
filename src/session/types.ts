@@ -52,6 +52,7 @@ export interface SerializedSessionMessage {
   name?: string;
   toolCallId?: string;
   toolCalls?: JsonValue;
+  invalidToolCalls?: JsonValue;
   usageMetadata?: JsonObject;
 }
 
@@ -224,6 +225,7 @@ export interface AgentSessionStreamEvent {
     | 'tool.started'
     | 'tool.delta'
     | 'tool.completed'
+    | 'step.finished'
     | 'usage.updated'
     | 'run.completed'
     | 'run.failed'

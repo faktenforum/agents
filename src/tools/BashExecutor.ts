@@ -1,6 +1,5 @@
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
-import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
@@ -16,6 +15,8 @@ import {
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
+import { resolveFetchProxyAgent } from '@/utils/proxy';
+import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
@@ -26,6 +27,7 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 export const BashExecutionToolSchema = {
   type: 'object',
   properties: {
+    intent: { ...INTENT_PROPERTY },
     command: {
       type: 'string',
       description: `The bash command or script to execute.
@@ -187,16 +189,20 @@ function createBashExecutionTool(
       /* Drop any model-supplied `runtime_session_hint` from the raw args: the
        * hint must only come from ToolNode's injected `_runtime_session_hint`
        * (below), never from the tool call itself. */
+      /* `intent` is a UI display label — never part of the wire body. */
       const {
         command,
+        intent: _ignoredIntent,
         runtime_session_hint: _ignoredModelHint,
         ...rest
       } = rawInput as {
         command: string;
+        intent?: unknown;
         runtime_session_hint?: unknown;
         args?: string[];
       };
       void _ignoredModelHint;
+      void _ignoredIntent;
       const { session_id, _injected_files, _runtime_session_hint } =
         (config.toolCall ?? {}) as {
           session_id?: string;
@@ -247,8 +253,9 @@ function createBashExecutionTool(
           body: JSON.stringify(postData),
         };
 
-        if (process.env.PROXY != null && process.env.PROXY !== '') {
-          fetchOptions.agent = new HttpsProxyAgent(process.env.PROXY);
+        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
+        if (proxyAgent) {
+          fetchOptions.agent = proxyAgent;
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {

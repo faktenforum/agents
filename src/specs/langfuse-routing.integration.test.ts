@@ -256,7 +256,9 @@ function expectChildSpanParentName({
   const children = starts.filter((record) => record.name === childName);
   expect(children).not.toHaveLength(0);
   for (const child of children) {
-    const parent = starts.find((record) => record.spanId === child.parentSpanId);
+    const parent = starts.find(
+      (record) => record.spanId === child.parentSpanId
+    );
     expect(parent?.name.startsWith(parentNamePrefix)).toBe(true);
   }
 }
@@ -312,6 +314,50 @@ function createAgent(tenantId: string): t.AgentInputs {
           instructions: 'Answer delegated tasks briefly.',
           maxContextTokens: 8000,
         },
+      },
+    ],
+  };
+}
+
+function createGraphSubagentParent(tenantId: string): t.AgentInputs {
+  const makeMember = (agentId: string): t.AgentInputs => ({
+    agentId,
+    name: `${agentId} ${tenantId}`,
+    provider: Providers.OPENAI,
+    clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+    instructions: `Complete the ${agentId} stage.`,
+    maxContextTokens: 8000,
+  });
+  return {
+    ...makeMember('parent'),
+    maxSubagentDepth: 1,
+    subagentConfigs: [
+      {
+        kind: 'graph',
+        type: 'research-team',
+        name: 'Research Team',
+        description: 'Runs a bounded research chain.',
+        agents: [
+          makeMember('entry'),
+          makeMember('worker'),
+          makeMember('result'),
+        ],
+        edges: [
+          {
+            from: 'entry',
+            to: 'worker',
+            edgeType: 'direct',
+            prompt: 'Proceed to worker.',
+          },
+          {
+            from: 'worker',
+            to: 'result',
+            edgeType: 'direct',
+            prompt: 'Proceed to result.',
+          },
+        ],
+        entryAgentId: 'entry',
+        resultAgentId: 'result',
       },
     ],
   };
@@ -378,6 +424,49 @@ async function runTenantFlow(tenantId: string): Promise<void> {
       },
     },
   });
+}
+
+async function runGraphSubagentTenantFlow(tenantId: string): Promise<void> {
+  const runId = `routing-graph-${tenantId}`;
+  const run = await Run.create<t.IState>({
+    runId,
+    graphConfig: {
+      type: 'standard',
+      agents: [createGraphSubagentParent(tenantId)],
+    },
+    langfuse: tenantLangfuse(tenantId),
+    returnContent: true,
+    skipCleanup: true,
+  });
+  run.Graph?.overrideTestModel(
+    [
+      `Delegating graph work for ${tenantId}.`,
+      `Graph work complete for ${tenantId}.`,
+    ],
+    1,
+    [
+      {
+        id: `call_graph_subagent_${tenantId}`,
+        name: Constants.SUBAGENT,
+        args: {
+          description: `Run the research chain for ${tenantId}.`,
+          subagent_type: 'research-team',
+        },
+        type: 'tool_call',
+      },
+    ]
+  );
+
+  await run.processStream(
+    { messages: [new HumanMessage(`Run graph work for ${tenantId}`)] },
+    {
+      ...callerConfig,
+      configurable: {
+        thread_id: `graph-thread-${tenantId}`,
+        user_id: `graph-user-${tenantId}`,
+      },
+    }
+  );
 }
 
 const compactingTokenCounter: t.TokenCounter = (message) => {
@@ -452,7 +541,7 @@ describe('Langfuse per-run routing integration', () => {
       .spyOn(providers, 'getChatModelClass')
       .mockImplementation(((provider: Providers) => {
         if (provider === Providers.OPENAI) {
-          return class extends FakeListChatModel {
+          return class RoutingProviderFakeChatModel extends FakeListChatModel {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             constructor(_options: any) {
               super({ responses: ['provider response'] });
@@ -529,6 +618,38 @@ describe('Langfuse per-run routing integration', () => {
     }
   });
 
+  it('keeps graph-subagent member spans in the owning tenant trace', async () => {
+    await Promise.all([
+      runGraphSubagentTenantFlow('graph-tenant-a'),
+      runGraphSubagentTenantFlow('graph-tenant-b'),
+    ]);
+
+    for (const tenantId of ['graph-tenant-a', 'graph-tenant-b']) {
+      const otherTenantId =
+        tenantId === 'graph-tenant-a' ? 'graph-tenant-b' : 'graph-tenant-a';
+      const starts = startsForTenant(tenantId);
+      const traceId = traceIdFromSeed(`routing-graph-${tenantId}`);
+
+      expectTenantCredentials(starts, tenantId);
+      expectOnlyTraceIds(starts, [traceId]);
+      expectNamedSpansUseTraceId({
+        starts,
+        traceId,
+        names: [
+          `LibreChat Agent: parent ${tenantId}`,
+          'FakeChatModel',
+          'subagent',
+        ],
+      });
+      expect(
+        starts.filter(
+          (record) => record.name === 'RoutingProviderFakeChatModel'
+        )
+      ).toHaveLength(3);
+      expectNoCrossTenantTrace({ tenantId, otherTenantId, traceId });
+    }
+  });
+
   it('routes parallel summarization spans to each run config', async () => {
     await Promise.all([
       runTenantSummarizationFlow('tenant-a'),
@@ -558,6 +679,141 @@ describe('Langfuse per-run routing integration', () => {
         traceId: summaryTraceId,
       });
     }
+  });
+
+  it('detaches root observations from foreign ambient spans', async () => {
+    const tenantId = 'tenant-ambient';
+    const foreignTraceId = 'f0e1d2c3b4a5968778695a4b3c2d1e0f';
+    const foreignSpanId = 'a1b2c3d4e5f60718';
+    initializeLangfuseTracing(tenantLangfuse(tenantId));
+
+    // Simulates a host running agent code inside its own OpenTelemetry span
+    // (HTTP server auto-instrumentation on the global provider): the span is
+    // never exported to Langfuse, so inheriting it would orphan the trace
+    // root, merge concurrent runs in one request into a single trace, and
+    // bypass deterministic trace ids.
+    const foreignSpan = otelTrace.wrapSpanContext({
+      traceId: foreignTraceId,
+      spanId: foreignSpanId,
+      traceFlags: 1,
+    });
+    await otelContext.with(
+      otelTrace.setSpan(otelContext.active(), foreignSpan),
+      () => runTenantFlow(tenantId)
+    );
+
+    const starts = startsForTenant(tenantId);
+    expect(starts).not.toHaveLength(0);
+    expect(
+      starts.filter(
+        (record) =>
+          record.traceId === foreignTraceId ||
+          record.parentSpanId === foreignSpanId
+      )
+    ).toHaveLength(0);
+
+    const agentRoot = starts.find(
+      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
+    );
+    expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${tenantId}`));
+    expect(agentRoot?.parentSpanId).toBeUndefined();
+
+    const titleRoot = starts.find(
+      (record) => record.name === `LibreChat Title: Parent ${tenantId}`
+    );
+    expect(titleRoot?.traceId).toBe(
+      traceIdFromSeed(`title-routing-${tenantId}`)
+    );
+    expect(titleRoot?.parentSpanId).toBeUndefined();
+  });
+
+  it('keeps root observations nested under Langfuse-managed ambient spans', async () => {
+    const tenantId = 'tenant-managed';
+    const langfuse = tenantLangfuse(tenantId);
+    initializeLangfuseTracing(langfuse);
+
+    let hostSpan: MockSpan | undefined;
+    await withLangfuseRuntimeScope({ langfuse }, async () => {
+      hostSpan = createMockSpan('host-group');
+      await otelContext.with(
+        otelTrace.setSpan(otelContext.active(), hostSpan as never),
+        () => runTenantFlow(tenantId)
+      );
+    });
+
+    const hostSpanContext = hostSpan?.spanContext() as {
+      traceId: string;
+      spanId: string;
+    };
+    const agentRoot = startsForTenant(tenantId).find(
+      (record) => record.name === `LibreChat Agent: Parent ${tenantId}`
+    );
+    expect(agentRoot?.traceId).toBe(hostSpanContext.traceId);
+    expect(agentRoot?.parentSpanId).toBe(hostSpanContext.spanId);
+  });
+
+  it('detaches root observations from managed ambient spans of another destination', async () => {
+    const hostTenantId = 'tenant-managed-a';
+    const runTenantId = 'tenant-managed-b';
+    const hostLangfuse = tenantLangfuse(hostTenantId);
+    initializeLangfuseTracing(hostLangfuse);
+    initializeLangfuseTracing(tenantLangfuse(runTenantId));
+
+    let hostSpan: MockSpan | undefined;
+    await withLangfuseRuntimeScope({ langfuse: hostLangfuse }, async () => {
+      hostSpan = createMockSpan('host-group');
+    });
+
+    // A managed span is only a safe parent for runs exporting to the SAME
+    // destination; nesting tenant-B under tenant-A's span would leave B's
+    // trace dangling in B's project with A's trace id.
+    await otelContext.with(
+      otelTrace.setSpan(otelContext.active(), hostSpan as never),
+      () => runTenantFlow(runTenantId)
+    );
+
+    const hostSpanContext = hostSpan?.spanContext() as {
+      traceId: string;
+      spanId: string;
+    };
+    const agentRoot = startsForTenant(runTenantId).find(
+      (record) => record.name === `LibreChat Agent: Parent ${runTenantId}`
+    );
+    expect(agentRoot?.traceId).toBe(traceIdFromSeed(`routing-${runTenantId}`));
+    expect(agentRoot?.traceId).not.toBe(hostSpanContext.traceId);
+    expect(agentRoot?.parentSpanId).toBeUndefined();
+  });
+
+  it('generates a scope stamp for directly-constructed graphs without a run id', async () => {
+    const { StandardGraph } = await import('@/graphs/Graph');
+    const buildGraph = (): { langfuseScopeRunId: string } =>
+      new StandardGraph({
+        agents: [createAgent('stampless')],
+        langfuse: tenantLangfuse('stampless'),
+      }) as unknown as { langfuseScopeRunId: string };
+
+    const graphA = buildGraph();
+    const graphB = buildGraph();
+    expect(graphA.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph:/));
+    expect(graphB.langfuseScopeRunId).toEqual(expect.stringMatching(/^graph:/));
+    expect(graphA.langfuseScopeRunId).not.toBe(graphB.langfuseScopeRunId);
+  });
+
+  it('stamps concurrent executions of the same public run id distinctly', async () => {
+    const { StandardGraph } = await import('@/graphs/Graph');
+    const buildGraph = (): { langfuseScopeRunId: string } =>
+      new StandardGraph({
+        runId: 'duplicate-run',
+        agents: [createAgent('duplicate')],
+        langfuse: tenantLangfuse('duplicate'),
+      }) as unknown as { langfuseScopeRunId: string };
+
+    const first = buildGraph();
+    const second = buildGraph();
+    expect(first.langfuseScopeRunId).toEqual(
+      expect.stringMatching(/^duplicate-run:/)
+    );
+    expect(first.langfuseScopeRunId).not.toBe(second.langfuseScopeRunId);
   });
 
   it('routes spans from captured OTel context after ALS scope exits', () => {
