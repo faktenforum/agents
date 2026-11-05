@@ -1878,7 +1878,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (tool === undefined && this.loadRuntimeTools) {
       const { tools, toolMap } = this.loadRuntimeTools([call]);
       this.toolMap = toolMap ?? new Map(tools.map((rt) => [rt.name, rt]));
-      this.programmaticCache = undefined; // Invalidate cache on toolMap change
       tool = this.toolMap.get(call.name);
     }
 

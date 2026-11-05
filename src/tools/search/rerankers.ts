@@ -577,6 +577,8 @@ export class InfinityReranker extends BaseReranker {
 }
 
 export class CustomReranker extends BaseReranker {
+  readonly provider = 'custom';
+
   private apiUrl: string | undefined;
   private model: string | undefined;
   private timeout: number;
