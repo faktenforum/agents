@@ -1,12 +1,21 @@
 // src/types/tools.ts
+import type {
+  RunnableConfig,
+  RunnableToolLike,
+} from '@langchain/core/runnables';
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type {
+  MessageContentComplex,
+  RunStepResumeState,
+  ToolErrorData,
+} from './stream';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import type { LangfuseConfig, SubagentExecutionContext } from './graph';
+import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
-import type { MessageContentComplex, ToolErrorData } from './stream';
+import type { HandoffRouting } from '@/graphs/handoff';
 import type { HumanInTheLoopConfig } from './hitl';
-import type { LangfuseConfig } from './graph';
 import type { HookRegistry } from '@/hooks';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
@@ -49,6 +58,13 @@ export type EagerEventToolExecutionConfig = {
    * execution with final args.
    */
   excludeToolNames?: string[];
+  /**
+   * Maximum retained early foreground subagent invocations per graph. Defaults
+   * to 4; 0 disables them. Checkpoints, parent tool hooks, background calls and
+   * control-flow graph tools retain normal batch execution. Once a child has
+   * started, a failed/revised model attempt fails instead of automatically retrying.
+   */
+  maxPendingSubagents?: number;
 };
 
 export type EagerEventToolExecutionOutcome =
@@ -60,6 +76,7 @@ export type EagerEventToolExecution = {
   toolName: string;
   args: Record<string, unknown>;
   request: ToolCallRequest;
+  codeSessionBaselineByName?: ReadonlyMap<string, string>;
   promise: Promise<EagerEventToolExecutionOutcome>;
   /**
    * True when the streaming eager path already emitted the user-visible
@@ -101,6 +118,8 @@ export type EagerEventToolCallChunkState = {
 };
 
 export type ToolNodeOptions = {
+  /** @internal Admission shared by tool nodes belonging to one multi-agent graph. */
+  handoffRouting?: Pick<HandoffRouting, 'finalize'>;
   name?: string;
   tags?: string[];
   /** Enables LangChain/LangGraph tracing for this ToolNode. Defaults to false. */
@@ -126,8 +145,12 @@ export type ToolNodeOptions = {
   ) => Promise<boolean | void>;
   /** Tool registry for lazy computation of programmatic tools and tool search */
   toolRegistry?: LCToolRegistry;
+  /** Returns the owning agent's currently discovered deferred tool names. */
+  getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
+  /** Partition within `sessions` used by this agent's code tools. */
+  codeSessionKey?: string;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   eventDrivenMode?: boolean;
   /** Tool definitions for event-driven mode (used for context, not invocation) */
@@ -137,6 +160,13 @@ export type ToolNodeOptions = {
   /** ID of the agent that owns this tool node, surfaced to hooks as `executingAgentId`
    * so a batch can be attributed to a specific agent even where `agentId` is undefined. */
   executingAgentId?: string;
+  /** SDK-owned identity of the child execution, independent of reusable agent IDs. */
+  executionContext?: SubagentExecutionContext;
+  /** Name of the agent that owns this tool node, used for active Langfuse attribution. */
+  executingAgentName?: string;
+  /** Root graph-agent identity retained alongside the currently executing tool owner. */
+  rootAgentId?: string;
+  rootAgentName?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
   /**
@@ -274,6 +304,20 @@ export type ToolNodeOptions = {
    * controller.
    */
   getRunScope?: () => RunBreakerScope;
+  /** Internal graph-owned prepared invocation registry. */
+  preparedSubagents?: PreparedSubagents;
+  /** SDK-owned checkpoint bridge for open run-step lifecycle state. */
+  restoreRunStepResumeState?: (
+    state?: RunStepResumeState,
+    config?: RunnableConfig
+  ) => void;
+  /** SDK-owned checkpoint snapshot for open run-step lifecycle state. */
+  createRunStepResumeState?: () => RunStepResumeState;
+  /** Internal ownership bridge, awaited before ToolNode can execute a batch. */
+  onToolCallsClaimed?: (
+    messageId: string,
+    config: RunnableConfig
+  ) => Promise<void>;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -375,6 +419,19 @@ export type CodeEnvFile =
 export type CodeExecutionToolParams =
   | undefined
   | {
+      /** Trusted Code API endpoint selected by the host for this agent. */
+      baseUrl?: string;
+      /**
+       * Expected Code API execution profile. Sent as a request assertion so
+       * endpoint/configuration drift fails closed instead of silently using
+       * the wrong sandbox backend.
+       */
+      executionProfile?: CodeApiExecutionProfile;
+      /**
+       * Trusted warm-runtime affinity hint selected by the host for this
+       * agent invocation. This overrides the legacy ToolNode-injected hint.
+       */
+      runtimeSessionHint?: string;
       /** Execution session — see `CodeSessionContext.session_id`. */
       session_id?: string;
       user_id?: string;
@@ -382,15 +439,15 @@ export type CodeExecutionToolParams =
       /** Optional host-supplied Code API auth headers. */
       authHeaders?: CodeApiAuthHeaders;
       /**
-       * Advertise best-effort stateful sessions in the tool description
-       * (variables/files may persist between calls, may reset). Prompt text
-       * only, and it must be set here because the description is bound to the
-       * LLM at construction time. Pair it with the run-scoped
-       * `toolExecution.sandbox.statefulSessions` gate, which drives the wire
-       * hint — set both from one flag so the prompt and the backend agree.
+       * Advertise filesystem-tier stateful sessions in the tool description
+       * and allow a trusted runtime affinity hint onto the wire. Resolve this,
+       * `baseUrl`, `executionProfile`, and `runtimeSessionHint` together from
+       * the executing agent so the prompt and backend agree.
        */
       statefulSessions?: boolean;
     };
+
+export type CodeApiExecutionProfile = 'default' | 'stateful';
 
 export type CodeApiAuthHeaderMap = Record<string, string>;
 
@@ -435,6 +492,29 @@ export type FileRef = {
 
 export type FileRefs = FileRef[];
 
+export type ArtifactDeliveryFailure = {
+  code: 'artifact_delivery_failed';
+  status: 'partial' | 'failed';
+  attempted: number;
+  delivered: number;
+  failed: number;
+};
+
+export type ArtifactTruncationReason =
+  | 'max_files'
+  | 'depth'
+  | 'size'
+  | 'path'
+  | 'unreadable';
+
+export type ArtifactTruncation = {
+  code: 'artifact_truncated';
+  reasons: Partial<Record<ArtifactTruncationReason, number>>;
+  /** Up to 20 relative paths omitted from the response. */
+  skipped: string[];
+  skipped_count: number;
+};
+
 export type ExecuteResult = {
   /**
    * Execution session id — the (transient) sandbox run that produced
@@ -445,6 +525,10 @@ export type ExecuteResult = {
   stdout: string;
   stderr: string;
   files?: FileRefs;
+  /** Persisted input paths explicitly removed during this execution. */
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /**
    * Durable runtime session id echoed by a stateful Code API backend
    * (hash of tenant+user+hint). Additive; absent on stateless servers.
@@ -469,6 +553,8 @@ export type JsonSchemaType = {
   properties?: Record<string, JsonSchemaType>;
   required?: string[];
   description?: string;
+  pattern?: string;
+  maxLength?: number;
   additionalProperties?: boolean | JsonSchemaType;
 };
 
@@ -518,6 +604,10 @@ export type ToolCallRequest = {
     session_id: string;
     files?: CodeEnvFile[];
   };
+  /** Request-time execution session used to detect host session refreshes. */
+  codeSessionBaselineId?: string;
+  /** Preserve request-provisioned code inputs after an eager identity mismatch. */
+  retainCodeSessionInputs?: true;
   /**
    * Stable runtime session hint for stateful sandbox sessions. Orthogonal to
    * `codeSessionContext` (which threads the transient exec-session for file
@@ -526,14 +616,34 @@ export type ToolCallRequest = {
   runtimeSessionHint?: string;
 };
 
+/**
+ * Serializable view of the active tools grouped by their effective caller
+ * capabilities. Event-driven hosts use this snapshot to preserve the SDK's
+ * live deferred-tool discovery state without reimplementing its policy.
+ */
+export type CallerCapabilityProjectionSnapshot = {
+  version: 1;
+  directToolNames: string[];
+  codeExecutionToolNames: string[];
+  directOnlyToolNames: string[];
+  codeExecutionOnlyToolNames: string[];
+};
+
 /** Batch request containing ALL tool calls for a graph step */
 export type ToolExecuteBatchRequest = {
+  /** SDK-owned child lineage. Unset for tools in the root graph. */
+  executionContext?: SubagentExecutionContext;
   /** All tool calls from the AIMessage */
   toolCalls: ToolCallRequest[];
   /** User ID for context */
   userId?: string;
   /** Agent ID for context */
   agentId?: string;
+  /**
+   * SDK-owned snapshot of the active caller capability projection. Optional
+   * so older event handlers remain compatible with newer SDKs.
+   */
+  callerCapabilityProjection?: CallerCapabilityProjectionSnapshot;
   /** Runtime configurable from RunnableConfig (includes user, userMCPAuthMap, etc.) */
   configurable?: Record<string, unknown>;
   /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
@@ -595,6 +705,8 @@ export type OutcomePatch = {
 export type ToolExecuteResult = {
   /** Matches ToolCallRequest.id */
   toolCallId: string;
+  /** SDK-stamped result receipt time; never host-supplied or inferred from handler cleanup. */
+  received_at?: number;
   /** Tool output content */
   content: string | unknown[];
   /** Optional artifact (for content_and_artifact format) */
@@ -771,47 +883,35 @@ export type LocalWorkspaceConfig = {
 };
 
 /**
- * Engine-agnostic execution seam. Default uses Node's
- * `child_process.spawn` and `fs/promises`. A future engine (e.g.
- * stateful remote sandbox) supplies its own `spawn` and `fs` and
- * inherits every tool factory unchanged.
+ * One execution world shared by filesystem and subprocess operations.
+ * Backend identity is stable so capability probes remain warm when tool
+ * bundles are rebuilt for later agent bindings.
+ */
+export interface ExecutionWorld {
+  /** Launches a process inside this world's filesystem namespace. */
+  readonly spawn: LocalSpawn;
+  /** Reads and writes the same namespace observed by `spawn`. */
+  readonly fs: Readonly<import('@/tools/local/workspaceFS').WorkspaceFS>;
+  /** Whether the world already enforces a sandbox boundary. */
+  readonly sandboxed: boolean;
+}
+
+/**
+ * Backward-compatible partial execution-world override. Omitted fields use
+ * the Node host world; remote backends should provide the complete trio.
  *
- * **Important — pair `spawn` and `fs` together.** Most file-touching
- * surfaces in the local engine route through `getWorkspaceFS(config)`
- * so a host can transparently swap in a remote/in-memory FS. A small
- * set of helpers — currently the `execute_code` non-bash temp-file
- * write (Codex P2 [48]) — still uses host `fs/promises` directly to
- * stage source on disk before invoking the spawn. If you override
- * `spawn` to point at a remote runtime (SSH, container, etc.) you
- * MUST also override `fs` with the corresponding remote
- * implementation; otherwise temp source files written to the host
- * `/tmp` won't be visible to the remote interpreter and `py`/`js`/
- * `ts`/etc. executions will fail. (Bash-style executions go through
- * `executeLocalBash` which doesn't stage temp files, so they're
- * unaffected.)
+ * Non-bash `execute_code` still stages source through the host temporary
+ * directory. Remote runtimes should use their dedicated execution engine for
+ * that tool until temporary lifecycle operations join this seam.
  *
- * Threat-model note: the regex-based command validators
- * (`dangerousCommandPatterns`, `quotedDestructivePatterns`, etc.) and
- * the workspace policy hook are documented as best-effort tripwires.
- * The hard security boundary is `local.sandbox.enabled: true` (which
- * wraps execution in `@anthropic-ai/sandbox-runtime`); for adversarial-
- * model threat models, do NOT rely on the regex layer alone.
+ * Command validators and workspace policies are best-effort tripwires. For an
+ * adversarial-model threat model, use a backend sandbox boundary rather than
+ * relying on validation alone.
  */
 export type LocalExecConfig = {
-  /** Pluggable spawn (for SSH, container, remote workers, etc.). */
-  spawn?: LocalSpawn;
-  /**
-   * Pluggable filesystem (for remote-workspace engines). Pair with
-   * `spawn` — see the type-level note above on why both should be
-   * overridden together for non-host engines.
-   */
-  fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
-  /**
-   * Set by custom execution backends that already provide their own
-   * sandbox boundary. Suppresses the local host-sandbox warning while
-   * preserving the warning for plain host `child_process` execution.
-   */
-  sandboxed?: boolean;
+  -readonly [Key in keyof ExecutionWorld]?: Key extends 'fs'
+    ? import('@/tools/local/workspaceFS').WorkspaceFS
+    : ExecutionWorld[Key];
 };
 
 export type LocalExecutionConfig = {
@@ -877,6 +977,22 @@ export type LocalExecutionConfig = {
    * code/bash execution tools) when `engine` is `local`. Defaults to true.
    */
   includeCodingTools?: boolean;
+  /**
+   * Allowlist of auto-bound local coding tool names (for example
+   * `['read_file', 'edit_file', 'grep_search', 'bash_tool']`). Omit to bind
+   * the whole suite. Fewer tool schemas means a smaller prompt on every
+   * request.
+   */
+  codingToolNames?: readonly string[];
+  /**
+   * Opt-in cap, in characters, on the results the model reads most:
+   * `read_file` keeps whole lines up to the cap (and its `limit`, when
+   * given) with an `offset` hint to continue, `grep_search` cuts long match lines and stops
+   * at the cap with a count of omitted lines, and `bash_tool` keeps the head
+   * and tail of long stdout and stderr with the status lines intact. Unset
+   * keeps the existing limits.
+   */
+  toolResultMaxChars?: number;
   /**
    * Override the process launcher. When set, replaces
    * `child_process.spawn` for every local tool invocation, allowing
@@ -1106,19 +1222,17 @@ export type CloudflareSandboxExecutionConfig = {
 
 export type SandboxExecutionConfig = {
   /**
-   * Opt into best-effort stateful runtime sessions on the remote Code API
-   * (its warm per-session MicroVM backend). This gate is run-scoped: it only
-   * controls the wire behavior (ToolNode injecting the session hint on
-   * execute_code/bash calls). The transport is otherwise unchanged.
+   * Legacy run-scoped opt-in for warm runtime hint injection. New hosts that
+   * need mixed execution profiles should resolve `statefulSessions`,
+   * `baseUrl`, `executionProfile`, and `runtimeSessionHint` on each executing
+   * agent's tool factories instead. Direct executors ignore this injected hint
+   * unless their own factory has `statefulSessions: true`.
    *
    * It does NOT change the model-facing tool description. Tool descriptions are
    * bound to the LLM at construction time (`createCodeExecutionTool` /
    * `createBashExecutionTool`), before this run config is applied inside the
    * graph, so they can only be adjusted via the tools' own `statefulSessions`
-   * factory param. Set BOTH from one flag (as LibreChat does): with this on but
-   * the factory param off, the backend runs statefully while the model is still
-   * told the environment is stateless (non-corrupting — the model just won't
-   * exploit persistence).
+   * factory param.
    */
   statefulSessions?: boolean;
   /**
@@ -1144,6 +1258,15 @@ export type ToolExecutionConfig = {
 export type ProgrammaticCache = {
   toolMap: ToolMap;
   toolDefs: LCTool[];
+  /** Actual outer runner name used for caller-policy diagnostics. */
+  programmaticToolName?: string;
+  /**
+   * Known tools that cannot be invoked from programmatic execution. Kept
+   * separate from `toolDefs` so the Programmatic Tool Manifest can be
+   * validated before the execution runtime starts without exposing their
+   * schemas to that runtime.
+   */
+  disallowedToolDefs?: LCTool[];
   /**
    * Hook context plumbed through by ToolNode for the local
    * programmatic-tool path so the in-process bridge can run
@@ -1156,9 +1279,12 @@ export type ProgrammaticCache = {
 
 export type ProgrammaticHookContext = {
   registry: import('@/hooks').HookRegistry | undefined;
+  /** A detached HITL child must never execute an inner tool if its policy hook fails. */
+  failClosedOnHookError?: boolean;
   runId: string;
   threadId?: string;
   agentId?: string;
+  executionContext?: SubagentExecutionContext;
   executingAgentId?: string;
 };
 
@@ -1210,6 +1336,13 @@ export type ToolSearchArtifact = {
     total_searched: number;
     pattern: string;
     error?: string;
+    /** Servers that had tools to search, emitted when a server filter matched
+     * nothing so the caller can see what it could have asked for. */
+    available_mcp_servers?: string[];
+    /** Requested servers that matched no registered server. */
+    unmatched_mcp_servers?: string[];
+    /** Requested servers that exist but had no tools left to search. */
+    idle_mcp_servers?: string[];
   };
 };
 
@@ -1261,6 +1394,10 @@ export type ProgrammaticExecutionResponse = {
   stdout?: string;
   stderr?: string;
   files?: FileRefs;
+  /** Persisted input paths explicitly removed during this execution. */
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
 
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
@@ -1277,16 +1414,33 @@ export type ProgrammaticExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  /** Persisted input paths explicitly removed during this execution. */
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';
 };
 
 /** Parameters for creating a bash execution tool (same API as CodeExecutor, bash-only) */
-export type BashExecutionToolParams = CodeExecutionToolParams;
+export type BashExecutionToolParams =
+  | undefined
+  | (Exclude<CodeExecutionToolParams, undefined> & {
+      /** Trusted attached-workspace identifier selected by the host. */
+      workspaceId?: string;
+      /** Trusted conversation-owned workspace instance selected by the host. */
+      workspaceInstanceId?: string;
+    });
 
 /** Parameters for creating a bash programmatic tool calling tool (same API as PTC, bash-only) */
-export type BashProgrammaticToolCallingParams = ProgrammaticToolCallingParams;
+export type BashProgrammaticToolCallingParams =
+  ProgrammaticToolCallingParams & {
+    /** Trusted attached-workspace identifier selected by the host. */
+    workspaceId?: string;
+    /** Trusted conversation-owned workspace instance selected by the host. */
+    workspaceInstanceId?: string;
+  };
 
 /**
  * Initialization parameters for the PTC tool
@@ -1294,6 +1448,10 @@ export type BashProgrammaticToolCallingParams = ProgrammaticToolCallingParams;
 export type ProgrammaticToolCallingParams = {
   /** Code API base URL (or use CODE_BASEURL env var) */
   baseUrl?: string;
+  /** Expected Code API execution profile (host-controlled). */
+  executionProfile?: CodeApiExecutionProfile;
+  /** Trusted warm-runtime affinity hint for this agent invocation. */
+  runtimeSessionHint?: string;
   /** Safety limit for round-trips (default: 20) */
   maxRoundTrips?: number;
   /** Maximum per-sandbox-run timeout for PTC's legacy `timeout` field. */
@@ -1304,11 +1462,9 @@ export type ProgrammaticToolCallingParams = {
   debug?: boolean;
   /** Optional host-supplied Code API auth headers. */
   authHeaders?: CodeApiAuthHeaders;
-  /* No `statefulSessions` here: PTC is stateless in v1. The initial
-   * /exec/programmatic request still forwards a ToolNode-injected
-   * `_runtime_session_hint` when present, but there is no factory-level opt-in
-   * to advertise (it would be a no-op). Re-add with real behavior when PTC
-   * stateful prompting lands. */
+  /* No `statefulSessions` here: PTC keeps a stateless runtime prompt in v1.
+   * An explicit stateful execution profile may still use a warm filesystem;
+   * runtime/in-memory state never carries across calls. */
 };
 
 // ============================================================================
@@ -1341,6 +1497,10 @@ export type CodeExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  /** Persisted input paths explicitly removed during this execution. */
+  deleted_files?: string[];
+  artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';

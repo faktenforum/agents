@@ -307,11 +307,7 @@ function sealsChunk(
    * must not veto a match on the other, or an OpenAI-style full-argument
    * restatement gets ADDED to the tally instead of replacing it, and an
    * empty seal leaves the tally unreleased. */
-  if (
-    seal.index != null &&
-    chunk.index != null &&
-    seal.index === chunk.index
-  ) {
+  if (seal.index != null && chunk.index != null && seal.index === chunk.index) {
     return true;
   }
   const sealId = seal.id != null && seal.id !== '' ? seal.id : undefined;
@@ -466,7 +462,9 @@ export function enforceStreamedToolCallArgLimit({
       const bytes = Buffer.byteLength(args, 'utf8');
       const sealedName = resolveChunkName(chunk);
       const limit =
-        byTool != null && sealedName != null && Object.hasOwn(byTool, sealedName)
+        byTool != null &&
+        sealedName != null &&
+        Object.hasOwn(byTool, sealedName)
           ? byTool[sealedName]
           : globalLimit;
       if (limit > 0 && bytes > limit) {
@@ -531,11 +529,7 @@ export function enforceStreamedToolCallArgLimit({
      * name-specific limit: comparing only against the global cap would let
      * a call with a lower per-tool override stream past it indefinitely
      * while its chunks stay anonymous. */
-    if (
-      chunk.index == null &&
-      chunkId == null &&
-      toolCallChunks.length === 1
-    ) {
+    if (chunk.index == null && chunkId == null && toolCallChunks.length === 1) {
       const liveTallies = getLiveGenerationTallies();
       if (liveTallies.length > 0) {
         if (liveTallies.length === 1 && applyChunkName(liveTallies[0])) {
@@ -611,9 +605,7 @@ export function enforceStreamedToolCallArgLimit({
          * is still an unambiguous fallback. */
         const liveTallies = getLiveGenerationTallies();
         const soleTally = liveTallies.length === 1 ? liveTallies[0] : undefined;
-        if (
-          soleTally?.keys?.[0]?.startsWith(`${generationPrefix}#`) === true
-        ) {
+        if (soleTally?.keys?.[0]?.startsWith(`${generationPrefix}#`) === true) {
           const anonymousKey = soleTally.keys[0];
           if (anonymousKey !== indexedPositionKey) {
             adoptionCandidates.push(anonymousKey);
@@ -643,10 +635,7 @@ export function enforceStreamedToolCallArgLimit({
          * anonymous (its first key is the position): id-bearing calls also
          * alias their position, and adopting a live parallel call's alias
          * would merge distinct budgets. */
-        if (
-          adoptionKey.includes(':#') &&
-          existing.keys?.[0] !== adoptionKey
-        ) {
+        if (adoptionKey.includes(':#') && existing.keys?.[0] !== adoptionKey) {
           continue;
         }
         tally = existing;
@@ -884,9 +873,7 @@ export function requiresStreamLimitAccounting(
 /** True when any stream-limit guard can fire for this graph. The attempt
  * lease and per-chunk claims are both gated on it — fully disabled guards
  * must allocate no bookkeeping at all, per-attempt included. */
-export function streamLimitAccountingEnabled(
-  graph: StreamLimitState
-): boolean {
+export function streamLimitAccountingEnabled(graph: StreamLimitState): boolean {
   const resolved = graph.streamLimits ?? DEFAULT_RESOLVED_LIMITS;
   return (
     resolved.hasEnforceableToolCallArgLimit ||
@@ -981,7 +968,7 @@ export function linkStreamLimitCanonical(
   canonical: object
 ): void {
   Object.defineProperty(copy, STREAM_LIMIT_CANONICAL, {
-    value: canonical,
+    value: canonicalChunk(canonical),
     enumerable: false,
     configurable: true,
   });
@@ -1095,7 +1082,11 @@ export function enforceStreamLimitsForWireChunk({
    * call streaming oversized arguments is the exact pathology this breaker
    * exists to stop. */
   if (completeCalls != null) {
-    enforceCompleteToolCallArgLimit({ graph, metadata, toolCalls: completeCalls });
+    enforceCompleteToolCallArgLimit({
+      graph,
+      metadata,
+      toolCalls: completeCalls,
+    });
   }
 }
 

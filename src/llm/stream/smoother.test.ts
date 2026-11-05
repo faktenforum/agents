@@ -1,3 +1,4 @@
+import type { SmoothItem, SmoothPiece } from './smoother';
 import {
   smoothStream,
   resolveStreamDelay,
@@ -12,7 +13,7 @@ import {
   SMOOTH_TARGET_LATENCY_MS,
   MAX_STREAM_QUEUE_TEXT_CHARS,
 } from './smoother';
-import type { SmoothItem, SmoothPiece } from './smoother';
+import { ProviderTextAttempt } from '@/protection/providerText';
 
 type Emitted = SmoothPiece & { tag: string; at: number };
 
@@ -40,9 +41,7 @@ async function* arraySource<T>(
   }
 }
 
-async function collect(
-  stream: AsyncGenerator<Emitted>
-): Promise<Emitted[]> {
+async function collect(stream: AsyncGenerator<Emitted>): Promise<Emitted[]> {
   const out: Emitted[] = [];
   for await (const piece of stream) {
     out.push(piece);
@@ -278,7 +277,9 @@ describe('smoothStream', () => {
     expect(pieces.map((p) => p.text).join('')).toBe(expected);
     expect(elapsed).toBeLessThan(2000);
     const tags = pieces.map((p) => p.tag);
-    expect(tags).toEqual([...tags].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1))));
+    expect(tags).toEqual(
+      [...tags].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))
+    );
   });
 
   it('rethrows a producer failure even when the rejection value is nullish', async () => {
@@ -412,7 +413,11 @@ describe('smoothStream', () => {
     const abortUpstream = jest.fn();
     const stream = smoothStream({
       source: arraySource([
-        makeItem('a', 'plenty of text to keep the consumer pacing along ', true),
+        makeItem(
+          'a',
+          'plenty of text to keep the consumer pacing along ',
+          true
+        ),
       ]),
       delayMs: 50,
       signal: controller.signal,
@@ -456,7 +461,9 @@ describe('smoothStream', () => {
     expect(yielded).toContain(1);
     expect(yielded).toContain(2);
     const all = [first.value as Emitted, ...rest];
-    expect(all.map((p) => p.text).join('')).toBe(bigText + bigText + 'tail text ');
+    expect(all.map((p) => p.text).join('')).toBe(
+      bigText + bigText + 'tail text '
+    );
   });
 
   it('closes a parked producer promptly after an early consumer break', async () => {
@@ -486,10 +493,7 @@ describe('smoothStream', () => {
       await stream.return(undefined);
       return true;
     })();
-    const result = await Promise.race([
-      closed,
-      sleep(1000).then(() => false),
-    ]);
+    const result = await Promise.race([closed, sleep(1000).then(() => false)]);
     expect(result).toBe(true);
     expect(abortUpstream).toHaveBeenCalled();
     expect(sourceFinallyRan).toBe(true);
@@ -497,7 +501,8 @@ describe('smoothStream', () => {
 
   it('keeps render lag bounded near the target latency under a fast big-chunk producer', async () => {
     const tick = 5;
-    const chunk = 'lorem ipsum dolor sit amet consectetur adipiscing elit '.repeat(2);
+    const chunk =
+      'lorem ipsum dolor sit amet consectetur adipiscing elit '.repeat(2);
     let producerDoneAt = 0;
     async function* fastSource(): AsyncGenerator<SmoothItem<Emitted>> {
       for (let i = 0; i < 12; i++) {
@@ -516,4 +521,41 @@ describe('smoothStream', () => {
     expect(pieces.map((p) => p.text).join('')).toBe(chunk.repeat(12));
     expect(lag).toBeLessThan(SMOOTH_TARGET_LATENCY_MS * 2.5);
   });
+});
+
+it('keeps protected positive-delay streams fully lazy without read-ahead or splitting', async () => {
+  const attempt = new ProviderTextAttempt({
+    version: 1,
+    timeoutMs: 10000,
+    maxAttemptBytes: 1024,
+    maxBufferedBytes: 1024,
+    classify: () => 'prose',
+    inspect: ({ content }) => ({
+      version: 1,
+      ok: true,
+      value: { content, replacements: 0, categories: [] },
+    }),
+  });
+  const yielded: number[] = [];
+  const source = arraySource(
+    [
+      makeItem('first', 'Some allowed control text.', true),
+      makeItem('second', 'Later control', true),
+    ],
+    (i) => yielded.push(i)
+  );
+  const stream = smoothStream({ source, delayMs: 25, signal: attempt.signal });
+  try {
+    const first = await stream.next();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(yielded).toEqual([0]);
+    expect(first.value).toMatchObject({
+      text: 'Some allowed control text.',
+      isFirst: true,
+      isLast: true,
+    });
+  } finally {
+    await stream.return(undefined);
+    attempt.finish();
+  }
 });

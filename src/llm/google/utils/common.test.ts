@@ -5,19 +5,39 @@ import type {
   EnhancedGenerateContentResponse,
 } from '@google/generative-ai';
 import {
-  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
-  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
-  GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
-} from '@/tools/streamedToolCallSeals';
-import {
   convertResponseContentToChatGenerationChunk,
   convertMessageContentToParts,
   dropUnsupportedModelTurnPrefill,
   rejectsModelTurnPrefill,
+  isGemini3PlusModel,
 } from './common';
+import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
 import { toLangChainContent } from '@/messages/langchain';
 
 describe('convertMessageContentToParts cross-provider tool calls', () => {
+  test.each([
+    ['gemini-3.5-flash', true],
+    ['gemini-4-argon', true],
+    ['models/gemini-4-argon-cyber-permissive', true],
+    ['gemini-2.5-pro', false],
+  ])(
+    'adds a placeholder thought signature to unsigned tool calls on %s: %s',
+    (model, expected) => {
+      const message = new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_weather', name: 'weather', args: {} }],
+      });
+
+      const [part] = convertMessageContentToParts(message, false, [], model);
+
+      expect('thoughtSignature' in part).toBe(expected);
+    }
+  );
+
   test('deduplicates Anthropic tool_use content mirrored in parsed tool_calls', () => {
     const message = new AIMessage({
       content: toLangChainContent([
@@ -120,7 +140,9 @@ describe('rejectsModelTurnPrefill', () => {
     expect(rejectsModelTurnPrefill('gemini-3.6-flash')).toBe(true);
     expect(rejectsModelTurnPrefill('gemini-3.5-flash-lite')).toBe(true);
     expect(rejectsModelTurnPrefill('models/gemini-3.6-flash')).toBe(true);
-    expect(rejectsModelTurnPrefill('models/gemini-3.7-flash-latest')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-3.7-flash-latest')).toBe(
+      true
+    );
     expect(rejectsModelTurnPrefill('google/gemini-3.5-flash-lite-latest')).toBe(
       true
     );
@@ -132,6 +154,45 @@ describe('rejectsModelTurnPrefill', () => {
     expect(rejectsModelTurnPrefill('gemini-3-pro-preview')).toBe(false);
     expect(rejectsModelTurnPrefill(undefined)).toBe(false);
     expect(rejectsModelTurnPrefill('')).toBe(false);
+  });
+
+  test('covers Flash releases newer than the cutoff without an entry', () => {
+    expect(rejectsModelTurnPrefill('gemini-3.8-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('gemini-3.9-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('gemini-3.10-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('gemini-4.0-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-3.8-flash-latest')).toBe(
+      true
+    );
+    expect(rejectsModelTurnPrefill('google/gemini-3.8-flash-lite')).toBe(true);
+  });
+
+  test('covers Gemini 4 Argon and its variants', () => {
+    expect(rejectsModelTurnPrefill('gemini-4-argon')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-4-argon')).toBe(true);
+    expect(rejectsModelTurnPrefill('gemini-4-argon-cyber-permissive')).toBe(
+      true
+    );
+  });
+
+  test('splits the 3.5 generation, where only Flash-Lite rejects prefill', () => {
+    expect(rejectsModelTurnPrefill('gemini-3.5-flash')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3.5-flash-latest')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3.5-flash-lite')).toBe(true);
+  });
+
+  test('reads a major-only Flash id as `.0`', () => {
+    expect(rejectsModelTurnPrefill('gemini-3-flash-preview')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3-flash')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-4-flash')).toBe(true);
+    expect(rejectsModelTurnPrefill('models/gemini-4-flash-preview')).toBe(true);
+  });
+
+  test('does not widen past Flash to other model lines', () => {
+    expect(rejectsModelTurnPrefill('gemini-3.8-pro')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-4.0-pro-preview')).toBe(false);
+    expect(rejectsModelTurnPrefill('gemini-3.7-flashy')).toBe(false);
+    expect(rejectsModelTurnPrefill('not-gemini-3.8-flash')).toBe(false);
   });
 });
 
@@ -192,5 +253,21 @@ describe('dropUnsupportedModelTurnPrefill', () => {
     expect(
       dropUnsupportedModelTurnPrefill(undefined, 'gemini-3.6-flash')
     ).toBeUndefined();
+  });
+});
+
+describe('isGemini3PlusModel', () => {
+  test('matches Gemini 3 and later, with or without a prefix', () => {
+    expect(isGemini3PlusModel('gemini-3-pro-preview')).toBe(true);
+    expect(isGemini3PlusModel('gemini-4-argon')).toBe(true);
+    expect(isGemini3PlusModel('models/gemini-4-argon')).toBe(true);
+    expect(isGemini3PlusModel('google/gemini-10-pro')).toBe(true);
+  });
+
+  test('rejects earlier generations and missing ids', () => {
+    expect(isGemini3PlusModel('gemini-2.5-flash')).toBe(false);
+    expect(isGemini3PlusModel('gemini-pro')).toBe(false);
+    expect(isGemini3PlusModel('gemma-3-27b-it')).toBe(false);
+    expect(isGemini3PlusModel(undefined)).toBe(false);
   });
 });

@@ -7,6 +7,7 @@ import type { Context } from '@opentelemetry/api';
 import type { TPayload } from '@/types';
 import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+  LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY,
   classifyLangfuseToolNodeSpan,
   prepareLangfuseSpanForExport,
   redactLangfuseSpanToolOutputs,
@@ -279,6 +280,116 @@ describe('Langfuse tool output tracing redaction', () => {
     ) as Array<{ role: string; content: string }>;
     expect(redacted[0].content).toBe('show tables');
     expect(redacted[1].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+  });
+
+  it('drops marked decision model prompts under selective redaction, even with mixed public state', () => {
+    const prompt =
+      'librechat-decision-state:' +
+      JSON.stringify({
+        state: [
+          { role: 'private_sql', content: 'private query result' },
+          { role: 'public_tool', content: 'public result' },
+          {
+            type: 'mcp_call',
+            name: 'private_sql',
+            output: 'private server result',
+          },
+          {
+            type: 'text',
+            text: JSON.stringify({
+              serverToolResult: {
+                librechatResponsesReplay: true,
+                toolName: 'private_sql',
+                status: 'success',
+                output: 'private replay result',
+              },
+            }),
+            extras: { librechatServerToolResult: { toolName: 'private_sql' } },
+          },
+        ],
+        questions: { q: { type: 'boolean', instructions: 'Classify' } },
+      });
+    const span = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'generation',
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        { role: 'user', content: prompt },
+      ]),
+    });
+    const config = createConfig({
+      redactedToolNames: new Set(['private_sql']),
+    });
+    redactLangfuseSpanToolOutputs(span, config);
+    const observed = String(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    );
+    expect(observed).not.toContain('private query result');
+    expect(observed).not.toContain('private server result');
+    expect(observed).not.toContain('private replay result');
+    expect(observed).not.toContain('public result');
+    expect(observed).not.toContain('Classify');
+    expect(observed).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+
+    const truncated = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'user',
+          content:
+            'librechat-decision-state:{"state":[{"role":"private_sql","content":"private truncated',
+        },
+      ]),
+    });
+    redactLangfuseSpanToolOutputs(truncated, config);
+    expect(JSON.stringify(truncated.attributes)).not.toContain(
+      'private truncated'
+    );
+
+    const direct = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: prompt,
+    });
+    redactLangfuseSpanToolOutputs(direct, createConfig({ enabled: false }));
+    const directObserved = String(
+      direct.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    );
+    expect(directObserved).not.toContain('private query result');
+    expect(directObserved).not.toContain('public result');
+    expect(directObserved).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+
+    const unredacted = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: prompt,
+    });
+    redactLangfuseSpanToolOutputs(unredacted, createConfig());
+    expect(
+      unredacted.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    ).toBe(prompt);
+  });
+
+  it('does not export free-form decision model state that can quote a redacted tool result', () => {
+    const secret = 'private_sql returned a connection string';
+    const prompt =
+      'librechat-decision-state:' +
+      JSON.stringify({
+        state: secret,
+        questions: {
+          q: { type: 'boolean', instructions: `Does this contain ${secret}?` },
+        },
+      });
+    const span = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'generation',
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        { role: 'system', content: 'public instructions' },
+        { role: 'user', content: prompt },
+      ]),
+    });
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['private_sql']) })
+    );
+    const observed = String(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    );
+    expect(observed).not.toContain(secret);
+    expect(observed).toContain('public instructions');
+    expect(observed).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
   it('redacts captured Responses server-tool outputs wherever they are serialized', () => {
@@ -1037,22 +1148,21 @@ describe('Langfuse tool output tracing redaction', () => {
 
     prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
 
-    for (const key of [
-      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
-      LangfuseOtelSpanAttributes.TRACE_OUTPUT,
-    ]) {
-      const output = span.attributes[key] as string;
-      expect(output).toContain('Partial answer.');
-      expect(output).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
-      expect(output).not.toContain(rootSecret);
-    }
+    const output = span.attributes[
+      LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT
+    ] as string;
+    expect(output).toContain('Partial answer.');
+    expect(output).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(output).not.toContain(rootSecret);
+    expect(span.attributes['langfuse.trace.output']).toBeUndefined();
   });
 
-  it('redacts a root tool output before deriving trace output', () => {
+  it('redacts a root tool output without deriving deprecated trace output', () => {
     const rootSecret = 'private root tool result';
     const span = createSpan('shell', {
       [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
       [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: rootSecret,
+      'langfuse.trace.output': rootSecret,
     });
 
     prepareLangfuseSpanForExport(span, createConfig({ enabled: false }));
@@ -1060,9 +1170,7 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
       LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
     );
-    expect(span.attributes[LangfuseOtelSpanAttributes.TRACE_OUTPUT]).toBe(
-      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
-    );
+    expect(span.attributes['langfuse.trace.output']).toBeUndefined();
     expect(JSON.stringify(span.attributes)).not.toContain(rootSecret);
   });
 
@@ -1497,6 +1605,115 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(JSON.stringify(redacted)).not.toContain('artifact secret row');
   });
 
+  it('promotes trusted artifact fields before redacting a tool observation', () => {
+    const output = new ToolMessage({
+      name: 'run_select_query_mcp_ClickHouse',
+      tool_call_id: 'call_query',
+      content: 'customer row data',
+      artifact: {
+        [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+          query_database_system: 'clickhouse',
+          query_status: 'success',
+          query_returned_rows: 3,
+          query_rows_read: 100,
+          query_bytes_read: 2048,
+        },
+      },
+    });
+    const span = createSpan('run_select_query_mcp_ClickHouse', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify(output),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set(['run_select_query']),
+        redactedToolNameMatchMode: 'partial',
+      })
+    );
+
+    expect(span.attributes).toMatchObject({
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_database_system`]:
+        'clickhouse',
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_status`]:
+        'success',
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_returned_rows`]: 3,
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_rows_read`]: 100,
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_bytes_read`]: 2048,
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]:
+        LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(JSON.stringify(span.attributes)).not.toContain('customer row data');
+  });
+
+  it('preserves callback identity when artifact metadata uses the same keys', () => {
+    const metadataPrefix = LangfuseOtelSpanAttributes.OBSERVATION_METADATA;
+    const span = createSpan('run_select_query', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [`${metadataPrefix}.agentId`]: 'agent-original',
+      [`${metadataPrefix}.messageId`]: 'message-original',
+      [`${metadataPrefix}.parentMessageId`]: 'parent-original',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify(
+        new ToolMessage({
+          tool_call_id: 'query-call',
+          content: 'private row',
+          artifact: {
+            [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+              agentId: 'agent-replacement',
+              messageId: 'message-replacement',
+              parentMessageId: 'parent-replacement',
+              query_status: 'success',
+            },
+          },
+        })
+      ),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['run_select_query']) })
+    );
+
+    expect(span.attributes).toMatchObject({
+      [`${metadataPrefix}.agentId`]: 'agent-original',
+      [`${metadataPrefix}.messageId`]: 'message-original',
+      [`${metadataPrefix}.parentMessageId`]: 'parent-original',
+      [`${metadataPrefix}.query_status`]: 'success',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]:
+        LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(JSON.stringify(span.attributes)).not.toContain('private row');
+  });
+
+  it('does not promote metadata from an unredacted tool', () => {
+    const output = new ToolMessage({
+      name: 'untrusted_tool',
+      tool_call_id: 'call_untrusted',
+      content: 'output',
+      artifact: {
+        [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+          query_status: 'forged',
+        },
+      },
+    });
+    const span = createSpan('untrusted_tool', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify(output),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['run_select_query']) })
+    );
+
+    expect(
+      span.attributes[
+        `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.query_status`
+      ]
+    ).toBeUndefined();
+  });
+
   it('merges run Langfuse defaults with agent redaction overrides', () => {
     const resolved = resolveLangfuseConfig(
       {
@@ -1553,6 +1770,67 @@ describe('Langfuse tool output tracing redaction', () => {
         redactionText: '[redacted]',
       },
     });
+  });
+
+  it('merges run and agent custom headers with the agent winning collisions', () => {
+    const resolved = resolveLangfuseConfig(
+      {
+        enabled: true,
+        publicKey: 'pk-run',
+        secretKey: 'sk-run',
+        additionalHeaders: {
+          'X-Proxy-Token': 'run-token',
+          'X-Shared': 'run',
+        },
+      },
+      {
+        additionalHeaders: {
+          'X-Shared': 'agent',
+          'X-Agent-Only': 'agent',
+        },
+      }
+    );
+
+    expect(resolved).toMatchObject({
+      additionalHeaders: {
+        'X-Proxy-Token': 'run-token',
+        'X-Shared': 'agent',
+        'X-Agent-Only': 'agent',
+      },
+    });
+  });
+
+  it('lets an agent header override a differently cased run header', () => {
+    const resolved = resolveLangfuseConfig(
+      {
+        additionalHeaders: {
+          'X-Proxy-Token': 'run-token',
+          'CF-Access-Client-Id': 'run-client',
+        },
+      },
+      { additionalHeaders: { 'x-proxy-token': 'agent-token' } }
+    );
+
+    /** Both casings surviving would make fetch send a combined
+     *  "run-token, agent-token" value instead of the agent's. */
+    expect(resolved?.additionalHeaders).toEqual({
+      'CF-Access-Client-Id': 'run-client',
+      'x-proxy-token': 'agent-token',
+    });
+  });
+
+  it('leaves custom headers untouched when only one side sets them', () => {
+    expect(
+      resolveLangfuseConfig(
+        { additionalHeaders: { 'X-Proxy-Token': 'run-token' } },
+        { publicKey: 'pk-agent' }
+      )
+    ).toMatchObject({
+      additionalHeaders: { 'X-Proxy-Token': 'run-token' },
+    });
+    expect(
+      resolveLangfuseConfig({ publicKey: 'pk-run' }, { publicKey: 'pk-agent' })
+    ).not.toHaveProperty('additionalHeaders');
   });
 
   it('inherits deterministic trace ids when tenant config only supplies connection settings', () => {

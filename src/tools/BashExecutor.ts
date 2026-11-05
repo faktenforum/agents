@@ -8,21 +8,35 @@ import {
   appendFailedExecutionFileReminder,
   appendTmpScratchReminder,
   appendCodeSessionFileSummary,
+  addCodeApiExecutionProfileHeader,
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
+  buildCodeApiExecutionErrorMessage,
   CodeApiRequestError,
+  buildCodeApiEndpoint,
   getCodeBaseURL,
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
+  selectRuntimeSessionHint,
 } from './CodeExecutor';
+import {
+  appendArtifactDeliveryWarning,
+  normalizeArtifactDeliveryFailure,
+} from '@/tools/ArtifactDelivery';
+import {
+  appendArtifactTruncationWarning,
+  normalizeArtifactTruncation,
+} from '@/tools/ArtifactTruncation';
+import { appendExecutionArtifactFileSummary } from '@/tools/CodeSessionFileSummary';
+import { resolveAttachedWorkspaceInstanceId } from '@/tools/workspaceIdentity';
+import { prepareBashProgrammaticCode } from './BashProgrammaticToolCalling';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
+import { makeRequest } from './ProgrammaticToolCalling';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
 config();
-
-const baseEndpoint = getCodeBaseURL();
-const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 export const BashExecutionToolSchema = {
   type: 'object',
@@ -85,6 +99,17 @@ Usage:
 - NEVER use this tool to execute malicious commands.
 `.trim();
 
+const AttachedWorkspaceBashExecutionToolDescription = `
+Runs bash commands in the selected persistent project through an isolated sandbox process.
+
+Usage:
+- Project file changes persist between calls; shell variables, background processes, and execution-private temporary files do not.
+- Injected files and generated artifacts use \${LIBRECHAT_CODE_DATA_DIR:-/mnt/data}; write durable files to the project root.
+- Generated artifacts are automatically delivered; **DO NOT** provide download links.
+- ${BASH_SHELL_GUIDANCE}
+- NEVER use this tool to execute malicious commands.
+`.trim();
+
 /**
  * Supplemental prompt documenting the tool-output reference feature.
  *
@@ -116,11 +141,14 @@ Referencing previous tool outputs:
 export function buildBashExecutionToolDescription(options?: {
   enableToolOutputReferences?: boolean;
   statefulSessions?: boolean;
+  attachedWorkspace?: boolean;
 }): string {
-  const base =
-    options?.statefulSessions === true
-      ? StatefulBashExecutionToolDescription
-      : BashExecutionToolDescription;
+  let base = BashExecutionToolDescription;
+  if (options?.attachedWorkspace === true) {
+    base = AttachedWorkspaceBashExecutionToolDescription;
+  } else if (options?.statefulSessions === true) {
+    base = StatefulBashExecutionToolDescription;
+  }
   if (options?.enableToolOutputReferences === true) {
     return `${base}\n\n${BashToolOutputReferencesGuide}`;
   }
@@ -131,19 +159,39 @@ const STATELESS_BASH_PARAM_NOTE =
   'The environment is stateless; variables and state don\'t persist between executions.';
 const STATEFUL_BASH_PARAM_NOTE =
   'Files written to /mnt/data persist between calls on the same warm machine. Each call runs in a fresh sandbox: shell variables, cwd, /tmp, and background processes do NOT survive the call. Only /mnt/data is durable.';
+const ATTACHED_BASH_PARAM_NOTE =
+  'Commands start in the selected persistent project. Project file changes persist, but shell variables, background processes, and execution-private temporary files do not.';
+const ATTACHED_BASH_ARTIFACT_PATH_GUIDANCE =
+  'Injected files and generated artifacts use `${LIBRECHAT_CODE_DATA_DIR:-/mnt/data}` for this execution only. Write anything needed later into the selected project.';
+const ATTACHED_BASH_TMP_REMINDER =
+  'Note: /tmp files are same-call scratch only and were not persisted; write files needed later into the selected project.';
 
 export function buildBashExecutionToolSchema(opts?: {
   statefulSessions?: boolean;
+  attachedWorkspace?: boolean;
 }): typeof BashExecutionToolSchema {
-  const note =
-    opts?.statefulSessions === true
-      ? STATEFUL_BASH_PARAM_NOTE
-      : STATELESS_BASH_PARAM_NOTE;
-  const commandDescription =
+  let note = STATELESS_BASH_PARAM_NOTE;
+  if (opts?.attachedWorkspace === true) {
+    note = ATTACHED_BASH_PARAM_NOTE;
+  } else if (opts?.statefulSessions === true) {
+    note = STATEFUL_BASH_PARAM_NOTE;
+  }
+  let commandDescription =
     BashExecutionToolSchema.properties.command.description.replace(
       STATELESS_BASH_PARAM_NOTE,
       note
     );
+  if (opts?.attachedWorkspace === true) {
+    commandDescription = commandDescription
+      .replace(
+        '- Prior /mnt/data files are available and can be modified in place.\n',
+        ''
+      )
+      .replace(
+        CODE_ARTIFACT_PATH_GUIDANCE,
+        ATTACHED_BASH_ARTIFACT_PATH_GUIDANCE
+      );
+  }
   return {
     ...BashExecutionToolSchema,
     properties: {
@@ -157,6 +205,18 @@ export function buildBashExecutionToolSchema(opts?: {
 }
 
 export const BashExecutionToolName = Constants.BASH_TOOL;
+
+function quoteBashArgument(value: string): string {
+  return `'${value.replace(/'/g, '\'"\'"\'')}'`;
+}
+
+function commandWithArguments(
+  command: string,
+  args: string[] | undefined
+): string {
+  if (args == null || args.length === 0) return command;
+  return `bash -c ${quoteBashArgument(command)} -- ${args.map(quoteBashArgument).join(' ')}`;
+}
 
 /**
  * Default bash tool definition using the base description.
@@ -177,32 +237,64 @@ export const BashExecutionToolDefinition = {
 function createBashExecutionTool(
   params: t.BashExecutionToolParams | null = {}
 ): DynamicStructuredTool {
+  const workspaceId = params?.workspaceId?.trim();
+  const hasWorkspace = workspaceId != null && workspaceId !== '';
+  const workspaceInstanceId = resolveAttachedWorkspaceInstanceId(
+    params?.workspaceInstanceId,
+    hasWorkspace
+  );
+  if (
+    hasWorkspace &&
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workspaceId)
+  ) {
+    throw new Error('Invalid attached workspace identifier');
+  }
+  const execEndpoint = buildCodeApiEndpoint(
+    params?.baseUrl ?? getCodeBaseURL(),
+    hasWorkspace ? 'exec/programmatic' : 'exec'
+  );
+
   return tool(
     async (rawInput, config) => {
-      /* `statefulSessions` is prompt-only — keep it out of the wire body. */
+      /* `statefulSessions` drives the prompt and gates runtime affinity hints;
+       * keep the flag itself out of the wire body. */
       const {
         authHeaders,
-        statefulSessions: _statefulSessions,
+        baseUrl: _baseUrl,
+        executionProfile,
+        runtimeSessionHint,
+        statefulSessions,
+        workspaceId: _workspaceId,
+        workspaceInstanceId: _workspaceInstanceId,
         ...executionParams
       } = params ?? {};
-      void _statefulSessions;
+      void _baseUrl;
+      void _workspaceId;
+      void _workspaceInstanceId;
       /* Drop any model-supplied `runtime_session_hint` from the raw args: the
        * hint must only come from ToolNode's injected `_runtime_session_hint`
        * (below), never from the tool call itself. */
       /* `intent` is a UI display label — never part of the wire body. */
       const {
-        command,
+        command: rawCommand,
         intent: _ignoredIntent,
         runtime_session_hint: _ignoredModelHint,
+        workspace_instance_id: _ignoredModelWorkspaceInstanceId,
+        args,
         ...rest
       } = rawInput as {
         command: string;
         intent?: unknown;
         runtime_session_hint?: unknown;
+        workspace_instance_id?: unknown;
         args?: string[];
       };
       void _ignoredModelHint;
+      void _ignoredModelWorkspaceInstanceId;
       void _ignoredIntent;
+      const command = hasWorkspace
+        ? commandWithArguments(rawCommand, args)
+        : rawCommand;
       const { session_id, _injected_files, _runtime_session_hint } =
         (config.toolCall ?? {}) as {
           session_id?: string;
@@ -212,16 +304,27 @@ function createBashExecutionTool(
 
       const postData: Record<string, unknown> = {
         lang: 'bash',
-        code: command,
+        code: hasWorkspace ? prepareBashProgrammaticCode(command) : command,
+        ...(hasWorkspace ? { tools: [] } : {}),
+        ...(!hasWorkspace && args != null ? { args } : {}),
         ...rest,
         ...executionParams,
+        ...(workspaceInstanceId != null && workspaceInstanceId !== ''
+          ? { workspace_instance_id: workspaceInstanceId }
+          : {}),
       };
 
+      const effectiveRuntimeSessionHint = selectRuntimeSessionHint(
+        runtimeSessionHint,
+        _runtime_session_hint
+      );
       if (
-        typeof _runtime_session_hint === 'string' &&
-        _runtime_session_hint !== ''
+        statefulSessions === true &&
+        executionProfile !== 'default' &&
+        typeof effectiveRuntimeSessionHint === 'string' &&
+        effectiveRuntimeSessionHint !== ''
       ) {
-        postData.runtime_session_hint = _runtime_session_hint;
+        postData.runtime_session_hint = effectiveRuntimeSessionHint;
       }
 
       /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
@@ -234,50 +337,106 @@ function createBashExecutionTool(
         session_id.length > 0 &&
         !Array.isArray(postData.files)
       ) {
-        // eslint-disable-next-line no-console
-        console.debug(
-          `[BashExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        logCodeApiDiagnostic(
+          'BashExecutor',
+          'debug',
+          'session carried no injected files; exec will run without input files',
+          { files: 'none' }
         );
       }
 
       try {
         const resolvedAuthHeaders =
           await resolveCodeApiAuthHeaders(authHeaders);
-        const fetchOptions: RequestInit = {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': 'LibreChat/1.0',
-            ...resolvedAuthHeaders,
-          },
-          body: JSON.stringify(postData),
-        };
+        let result: Partial<t.ExecuteResult> & t.ProgrammaticExecutionResponse;
+        if (hasWorkspace) {
+          result = await makeRequest(
+            execEndpoint,
+            postData,
+            undefined,
+            {
+              ...resolvedAuthHeaders,
+              'X-LibreChat-Code-Workspace-ID': workspaceId,
+            },
+            executionProfile,
+            config.signal
+          );
+        } else {
+          const fetchOptions: RequestInit = {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'LibreChat/1.0',
+              ...addCodeApiExecutionProfileHeader(
+                resolvedAuthHeaders,
+                executionProfile
+              ),
+            },
+            body: JSON.stringify(postData),
+            signal: config.signal,
+          };
 
-        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
-        if (proxyAgent) {
-          fetchOptions.agent = proxyAgent;
+          const proxyAgent = resolveFetchProxyAgent(execEndpoint);
+          if (proxyAgent != null) {
+            fetchOptions.agent = proxyAgent;
+          }
+          const response = await fetch(execEndpoint, fetchOptions);
+          if (!response.ok) {
+            throw new CodeApiRequestError(
+              await buildCodeApiHttpErrorMessage(
+                'POST',
+                execEndpoint,
+                response,
+                {
+                  profile: executionProfile,
+                }
+              )
+            );
+          }
+          result = (await response.json()) as Partial<t.ExecuteResult> &
+            t.ProgrammaticExecutionResponse;
         }
-        const response = await fetch(EXEC_ENDPOINT, fetchOptions);
-        if (!response.ok) {
+        if (hasWorkspace && result.status !== 'completed') {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+            buildCodeApiExecutionErrorMessage(
+              result as t.ProgrammaticExecutionResponse
+            )
           );
         }
-
-        const result: t.ExecuteResult = await response.json();
         let formattedOutput = '';
-        if (result.stdout) {
+        if (typeof result.stdout === 'string' && result.stdout.length > 0) {
           formattedOutput += `stdout:\n${result.stdout}\n`;
         } else {
           formattedOutput += emptyOutputMessage;
         }
-        if (result.stderr) formattedOutput += `stderr:\n${result.stderr}\n`;
+        if (typeof result.stderr === 'string' && result.stderr.length > 0) {
+          formattedOutput += `stderr:\n${result.stderr}\n`;
+        }
 
         const outputWithReminder = appendTmpScratchReminder(
           formattedOutput,
-          command
+          command,
+          hasWorkspace ? ATTACHED_BASH_TMP_REMINDER : undefined
+        );
+        const artifactDelivery = normalizeArtifactDeliveryFailure(
+          result.artifact_delivery
+        );
+        const outputWithDeliveryWarning = appendArtifactDeliveryWarning(
+          outputWithReminder,
+          artifactDelivery
+        );
+        const artifactTruncation = normalizeArtifactTruncation(
+          result.artifact_truncation
+        );
+        const outputWithWarnings = appendArtifactTruncationWarning(
+          outputWithDeliveryWarning,
+          artifactTruncation
         );
         const hasFiles = result.files != null && result.files.length > 0;
+        const deletionEcho =
+          result.deleted_files != null
+            ? { deleted_files: result.deleted_files }
+            : {};
         const runtimeEcho =
           result.runtime_session_id != null
             ? {
@@ -286,15 +445,34 @@ function createBashExecutionTool(
             }
             : {};
         return [
-          appendCodeSessionFileSummary(outputWithReminder, result.files),
+          hasWorkspace
+            ? appendExecutionArtifactFileSummary(
+              outputWithWarnings,
+              result.files
+            )
+            : appendCodeSessionFileSummary(outputWithWarnings, result.files),
           (hasFiles
             ? {
               session_id: result.session_id,
               files: result.files,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
+                : {}),
+              ...deletionEcho,
               ...runtimeEcho,
             }
             : {
               session_id: result.session_id,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
+                : {}),
+              ...deletionEcho,
               ...runtimeEcho,
             }) satisfies t.CodeExecutionArtifact,
         ];
@@ -303,15 +481,21 @@ function createBashExecutionTool(
           normalizeCodeApiRequestError(error).message,
           command
         );
-        throw new Error(`Execution error:\n\n${messageWithReminder}`);
+        throw new CodeApiRequestError(
+          `Execution error:\n\n${messageWithReminder}`
+        );
       }
     },
     {
       name: BashExecutionToolName,
       description: buildBashExecutionToolDescription({
         statefulSessions: params?.statefulSessions,
+        attachedWorkspace: hasWorkspace,
       }),
-      schema: buildBashExecutionToolSchema(params ?? undefined),
+      schema: buildBashExecutionToolSchema({
+        statefulSessions: params?.statefulSessions,
+        attachedWorkspace: hasWorkspace,
+      }),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );

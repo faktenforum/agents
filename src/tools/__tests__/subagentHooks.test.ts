@@ -23,6 +23,7 @@ import {
   ToolEndHandler,
   ModelEndHandler,
 } from '@/index';
+import { InMemorySubagentTaskStore } from '@/tools/subagent';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import * as providers from '@/llm/providers';
 import { FakeChatModel } from '@/llm/fake';
@@ -816,6 +817,281 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(dispatchAgentIds).toEqual(['hook-parent']);
   });
 
+  it('runs a background child with HITL enabled and denies a tool requiring approval', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return HitlChildFakeChatModel;
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const hooks = new HookRegistry();
+    const attempted: string[] = [];
+    const executed: string[] = [];
+    hooks.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          if (input.toolName === 'calculator') {
+            attempted.push(input.toolName);
+            return { decision: 'ask', reason: 'BYOM requires approval' };
+          }
+          return { decision: 'allow' };
+        },
+      ],
+    });
+    const customHandlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, rawData): void => {
+          const request = rawData as t.ToolExecuteBatchRequest;
+          executed.push(...request.toolCalls.map((call) => call.name));
+          request.resolve(
+            request.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              status: 'success' as const,
+              content: '42',
+            }))
+          );
+        },
+      },
+    };
+    const store = new InMemorySubagentTaskStore();
+    const scopeId = 'owner:background-hitl';
+    const run = await Run.create<t.IState>({
+      runId: `subagent-background-hitl-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgentWithChildTool()],
+        compileOptions: { checkpointer: new MemorySaver() },
+      },
+      subagentTasks: { store, scopeId },
+      humanInTheLoop: { enabled: true },
+      customHandlers,
+      hooks,
+      returnContent: true,
+      skipCleanup: true,
+    });
+    const call = makeSubagentToolCall('call_background_hitl');
+    call.args = { ...call.args, run_in_background: true };
+    run.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [call]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('calculate in the background')] },
+      callerConfig
+    );
+    expect(run.getInterrupt()).toBeUndefined();
+    let tasks = store.list(scopeId);
+    for (
+      let attempt = 0;
+      attempt < 200 && tasks[0]?.status === 'running';
+      attempt++
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      tasks = store.list(scopeId);
+    }
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].status).toBe('completed');
+    expect(attempted).toEqual(['calculator']);
+    expect(executed).not.toContain('calculator');
+    expect(store.claim(scopeId, tasks[0].taskId)).toMatchObject({
+      status: 'completed',
+      result: expect.stringContaining(
+        'Background approval denied for: calculator'
+      ),
+    });
+  });
+
+  it('keeps HITL background children off the parent checkpoint thread', async () => {
+    const checkpointer = new MemorySaver();
+    const parentConfig = {
+      ...callerConfig,
+      configurable: { thread_id: 'background-parent-checkpoint' },
+    };
+    const handlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, rawData): void => {
+          const request = rawData as t.ToolExecuteBatchRequest;
+          request.resolve(
+            request.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              status: 'success' as const,
+              content: '42',
+            }))
+          );
+        },
+      },
+    };
+    const parent = await Run.create<t.IState>({
+      runId: 'seed-private-parent-history',
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgentWithChildTool()],
+        compileOptions: { checkpointer },
+      },
+      humanInTheLoop: { enabled: true },
+      customHandlers: handlers,
+      returnContent: true,
+    });
+    parent.Graph!.overrideTestModel(['Parent response.'], 1);
+    await parent.processStream(
+      { messages: [new HumanMessage('private-parent-history-marker')] },
+      parentConfig
+    );
+    expect(
+      (
+        await checkpointer.getTuple({
+          configurable: { thread_id: parentConfig.configurable.thread_id },
+        })
+      )?.checkpoint
+    ).toBeDefined();
+
+    const observedChildMessages: string[] = [];
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return class extends HitlChildFakeChatModel {
+          _streamResponseChunks(
+            messages: Parameters<FakeChatModel['_streamResponseChunks']>[0],
+            options: Parameters<FakeChatModel['_streamResponseChunks']>[1],
+            runManager?: Parameters<FakeChatModel['_streamResponseChunks']>[2]
+          ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+            observedChildMessages.push(
+              ...messages.map((message) => String(message.content))
+            );
+            return super._streamResponseChunks(messages, options, runManager);
+          }
+        };
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const store = new InMemorySubagentTaskStore();
+    const scopeId = 'background-checkpoint-isolation';
+    const run = await Run.create<t.IState>({
+      runId: 'dispatch-after-private-parent-history',
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgentWithChildTool()],
+        compileOptions: { checkpointer },
+      },
+      subagentTasks: { store, scopeId },
+      humanInTheLoop: { enabled: true },
+      customHandlers: handlers,
+      returnContent: true,
+    });
+    const childCall = makeSubagentToolCall('call_background_isolated');
+    childCall.args = { ...childCall.args, run_in_background: true };
+    run.Graph!.overrideTestModel(['Delegating...', 'Final parent answer.'], 1, [
+      childCall,
+    ]);
+    await run.processStream(
+      { messages: [new HumanMessage('delegate a fresh task')] },
+      parentConfig
+    );
+    let tasks = store.list(scopeId);
+    for (
+      let attempt = 0;
+      attempt < 200 && tasks[0]?.status === 'running';
+      attempt++
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      tasks = store.list(scopeId);
+    }
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].status).toBe('completed');
+    expect(observedChildMessages.length).toBeGreaterThan(0);
+    expect(observedChildMessages.join(' ')).not.toContain(
+      'private-parent-history-marker'
+    );
+    const parentTuple = await checkpointer.getTuple({
+      configurable: { thread_id: parentConfig.configurable.thread_id },
+    });
+    expect(
+      JSON.stringify(parentTuple?.checkpoint.channel_values.messages)
+    ).toContain('Final parent answer.');
+    expect(
+      JSON.stringify(parentTuple?.checkpoint.channel_values.messages)
+    ).not.toContain(CHILD_RESPONSE);
+    const childThreadIds = Object.keys(checkpointer.storage).filter(
+      (threadId) => threadId !== parentConfig.configurable.thread_id
+    );
+    for (const threadId of childThreadIds) {
+      const marker = await checkpointer.getTuple({
+        configurable: { thread_id: threadId },
+      });
+      expect(
+        JSON.stringify(marker?.checkpoint.channel_values.messages)
+      ).not.toContain(CHILD_RESPONSE);
+    }
+  });
+
+  it('fails a background child that raises an unexpected direct-tool interrupt', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) =>
+      provider === Providers.OPENAI
+        ? PrimitiveInterruptFakeChatModel
+        : originalGetChatModelClass(
+          provider
+        )) as typeof providers.getChatModelClass);
+    let confirmAttempts = 0;
+    const confirmTool = tool(
+      async () => {
+        confirmAttempts += 1;
+        return interrupt<string, string>('confirm child');
+      },
+      {
+        name: PRIMITIVE_INTERRUPT_TOOL_NAME,
+        description: 'Requests human confirmation.',
+        schema: z.object({}),
+      }
+    );
+    const store = new InMemorySubagentTaskStore();
+    const scopeId = 'background-direct-interrupt';
+    const run = await Run.create<t.IState>({
+      runId: 'background-direct-interrupt-run',
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgentWithPrimitiveInterruptTool(confirmTool)],
+        compileOptions: { checkpointer: new MemorySaver() },
+      },
+      subagentTasks: { store, scopeId },
+      humanInTheLoop: { enabled: true },
+      customHandlers: {
+        [GraphEvents.TOOL_END]: new ToolEndHandler(),
+        [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      },
+      returnContent: true,
+    });
+    const childCall = makeSubagentToolCall('call_unexpected_direct_interrupt');
+    childCall.args = { ...childCall.args, run_in_background: true };
+    run.Graph!.overrideTestModel(['Delegating...', 'Final parent answer.'], 1, [
+      childCall,
+    ]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('confirm using a background child')] },
+      callerConfig
+    );
+    expect(run.getInterrupt()).toBeUndefined();
+    let tasks = store.list(scopeId);
+    for (
+      let attempt = 0;
+      attempt < 200 && tasks[0]?.status === 'running';
+      attempt++
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      tasks = store.list(scopeId);
+    }
+    expect(tasks).toHaveLength(1);
+    expect(confirmAttempts).toBe(1);
+    expect(tasks[0].status).toBe('error');
+    expect(store.claim(scopeId, tasks[0].taskId)).toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('cannot pause for human input'),
+    });
+  });
+
   it.each([
     {
       label: 'approve',
@@ -1096,6 +1372,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     );
 
     expect(rebuiltRun.getInterrupt()).toBeUndefined();
+    expect(updates.filter((event) => event.phase === 'error')).toEqual([]);
     expect(executedToolIds).toHaveLength(1);
     expect(deniedToolIds).toHaveLength(1);
     expect(completedSubagentCalls).toEqual([first.id, second.id]);
@@ -1139,6 +1416,8 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       }
     );
     const resolutionContexts: t.SubagentResolveContext[] = [];
+    const preparedContexts: t.SubagentContextInput[] = [];
+    let completedMessages: t.SubagentContextResult['messages'] = [];
     const createLazyParent = (): t.AgentInputs => {
       const parent = createParentAgentWithPrimitiveInterruptTool(
         primitiveInterruptTool
@@ -1177,7 +1456,24 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
           [GraphEvents.TOOL_END]: new ToolEndHandler(),
           [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
         },
-        humanInTheLoop: { enabled: true },
+        humanInTheLoop: { enabled: true, backgroundPausePolicy: 'deny' },
+        subagentContext: {
+          prepare: async (input) => {
+            preparedContexts.push(input);
+            return {
+              messages: [
+                new HumanMessage({
+                  id: 'shared-file-context',
+                  content: 'Shared file input',
+                }),
+              ],
+            };
+          },
+          complete: async (_input, result) => {
+            completedMessages = result.messages;
+            return { content: result.content };
+          },
+        },
       });
     const runId = `primitive-subagent-rebuild-${Date.now()}`;
     const parentCall = makeSubagentToolCall('call_primitive_rebuild');
@@ -1218,6 +1514,16 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
 
     expect(rebuiltRun.getInterrupt()).toBeUndefined();
     expect(resolutionContexts).toHaveLength(2);
+    expect(preparedContexts).toHaveLength(2);
+    expect(preparedContexts[1].resumed).toBe(true);
+    expect(
+      preparedContexts[0].executionContext.ancestry.at(-1)?.subagentRunId
+    ).toBe(preparedContexts[1].executionContext.ancestry.at(-1)?.subagentRunId);
+    expect(
+      completedMessages.filter(
+        (message) => message.id === 'shared-file-context'
+      )
+    ).toHaveLength(1);
     expect(resolutionContexts[0].executionId).toBe(
       resolutionContexts[1].executionId
     );
@@ -1450,112 +1756,122 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     ).toBe(true);
   });
 
-  it('forks nested resumes from each checkpoint in the manifest chain', async () => {
-    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
-      if (provider === Providers.OPENAI) {
-        return NestedHitlFakeChatModel;
-      }
-      return originalGetChatModelClass(provider);
-    }) as typeof providers.getChatModelClass);
+  it.each([true, false])(
+    'forks nested resumes from each checkpoint in the manifest chain (restore hooks=%s)',
+    async (restoreHooks) => {
+      getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+        if (provider === Providers.OPENAI) {
+          return NestedHitlFakeChatModel;
+        }
+        return originalGetChatModelClass(provider);
+      }) as typeof providers.getChatModelClass);
 
-    const checkpointer = new MemorySaver();
-    const registry = new HookRegistry();
-    const executedTools: string[] = [];
-    const baseRunId = `nested-subagent-rebuild-${Date.now()}`;
-    registry.registerSession(`${baseRunId}-initial`, 'PreToolUse', {
-      once: true,
-      pattern: '^calculator$',
-      hooks: [
-        async (): Promise<PreToolUseHookOutput> => ({
-          decision: 'ask',
-          reason: 'review nested calculator',
-        }),
-      ],
-    });
-    const customHandlers: Record<string, t.EventHandler> = {
-      [GraphEvents.TOOL_END]: new ToolEndHandler(),
-      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
-      [GraphEvents.ON_TOOL_EXECUTE]: {
-        handle: (_event, rawData): void => {
-          const request = rawData as t.ToolExecuteBatchRequest;
-          executedTools.push(...request.toolCalls.map((call) => call.name));
-          request.resolve(
-            request.toolCalls.map((call) => ({
-              toolCallId: call.id,
-              status: 'success' as const,
-              content: '42',
-            }))
-          );
-        },
-      },
-    };
-    const createRun = (runId: string): Promise<Run<t.IState>> =>
-      Run.create<t.IState>({
-        runId,
-        graphConfig: {
-          type: 'standard',
-          agents: [createParentAgentWithNestedChildTool()],
-          compileOptions: { checkpointer },
-        },
-        returnContent: true,
-        skipCleanup: true,
-        customHandlers,
-        hooks: registry,
-        humanInTheLoop: { enabled: true },
+      const checkpointer = new MemorySaver();
+      const registry = new HookRegistry();
+      const executedTools: string[] = [];
+      const baseRunId = `nested-subagent-rebuild-${Date.now()}`;
+      registry.registerSession(`${baseRunId}-initial`, 'PreToolUse', {
+        once: true,
+        pattern: '^calculator$',
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => ({
+            decision: 'ask',
+            reason: 'review nested calculator',
+          }),
+        ],
       });
-    const parentCall = makeSubagentToolCall(
-      'call_nested_researcher',
-      'Delegate a nested calculation'
-    );
-    const initialRun = await createRun(`${baseRunId}-initial`);
-    initialRun.Graph!.overrideTestModel(['Delegating...', 'Final answer.'], 5, [
-      parentCall,
-    ]);
+      const customHandlers: Record<string, t.EventHandler> = {
+        [GraphEvents.TOOL_END]: new ToolEndHandler(),
+        [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+        [GraphEvents.ON_TOOL_EXECUTE]: {
+          handle: (_event, rawData): void => {
+            const request = rawData as t.ToolExecuteBatchRequest;
+            executedTools.push(...request.toolCalls.map((call) => call.name));
+            request.resolve(
+              request.toolCalls.map((call) => ({
+                toolCallId: call.id,
+                status: 'success' as const,
+                content: '42',
+              }))
+            );
+          },
+        },
+      };
+      const createRun = (runId: string): Promise<Run<t.IState>> =>
+        Run.create<t.IState>({
+          runId,
+          graphConfig: {
+            type: 'standard',
+            agents: [createParentAgentWithNestedChildTool()],
+            compileOptions: { checkpointer },
+          },
+          returnContent: true,
+          skipCleanup: true,
+          customHandlers,
+          hooks:
+            restoreHooks || runId.endsWith('-initial') ? registry : undefined,
+          humanInTheLoop: { enabled: true },
+        });
+      const parentCall = makeSubagentToolCall(
+        'call_nested_researcher',
+        'Delegate a nested calculation'
+      );
+      const initialRun = await createRun(`${baseRunId}-initial`);
+      initialRun.Graph!.overrideTestModel(
+        ['Delegating...', 'Final answer.'],
+        5,
+        [parentCall]
+      );
 
-    await initialRun.processStream(
-      { messages: [new HumanMessage('calculate through two agents')] },
-      callerConfig
-    );
-    const paused = initialRun.getInterrupt();
-    expect(paused?.payload).toMatchObject({
-      type: 'tool_approval',
-      subagent: {
-        agent_id: 'calculator-grandchild',
-        parent_tool_call_id: 'call_nested_calculator_worker',
-      },
-    });
-    const oldParentCheckpoint = {
-      ...callerConfig,
-      configurable: {
-        ...callerConfig.configurable,
-        checkpoint_id: paused?.checkpointId,
-        checkpoint_ns: paused?.checkpointNs ?? '',
-      },
-    };
-    const rebuiltRun = await createRun(`${baseRunId}-rebuilt`);
-    rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
-    const warningSpy = jest
-      .spyOn(console, 'warn')
-      .mockImplementation((): void => undefined);
-    try {
-      await initialRun.resume([{ type: 'approve' }], callerConfig);
-      await rebuiltRun.resume(
-        [{ type: 'reject', reason: 'reject stale nested branch' }],
-        oldParentCheckpoint
+      await initialRun.processStream(
+        { messages: [new HumanMessage('calculate through two agents')] },
+        callerConfig
       );
-      expect(warningSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining('toolCallStepIds missing entry')
+      const paused = initialRun.getInterrupt();
+      expect(paused?.payload).toMatchObject({
+        type: 'tool_approval',
+        subagent: {
+          agent_id: 'calculator-grandchild',
+          parent_tool_call_id: 'call_nested_calculator_worker',
+        },
+      });
+      const oldParentCheckpoint = {
+        ...callerConfig,
+        configurable: {
+          ...callerConfig.configurable,
+          checkpoint_id: paused?.checkpointId,
+          checkpoint_ns: paused?.checkpointNs ?? '',
+        },
+      };
+      const rebuiltRun = await createRun(`${baseRunId}-rebuilt`);
+      rebuiltRun.Graph!.overrideTestModel(['Final answer.'], 1);
+      const warningSpy = jest
+        .spyOn(console, 'warn')
+        .mockImplementation((): void => undefined);
+      try {
+        await initialRun.resume([{ type: 'approve' }], callerConfig);
+        await rebuiltRun.resume(
+          [{ type: 'reject', reason: 'reject stale nested branch' }],
+          oldParentCheckpoint
+        );
+        expect(warningSpy).not.toHaveBeenCalledWith(
+          expect.stringContaining('toolCallStepIds missing entry')
+        );
+      } finally {
+        warningSpy.mockRestore();
+      }
+
+      expect(initialRun.getInterrupt()).toBeUndefined();
+      expect(rebuiltRun.getInterrupt()).toBeUndefined();
+      expect(executedTools).toEqual(['calculator']);
+      expect(initialRun.getChildCheckpointThreadIds().length).toBeGreaterThan(
+        2
       );
-    } finally {
-      warningSpy.mockRestore();
+      expect(rebuiltRun.getChildCheckpointThreadIds().length).toBeGreaterThan(
+        1
+      );
     }
-
-    expect(initialRun.getInterrupt()).toBeUndefined();
-    expect(rebuiltRun.getInterrupt()).toBeUndefined();
-    expect(executedTools).toEqual(['calculator']);
-    expect(initialRun.getChildCheckpointThreadIds().length).toBeGreaterThan(2);
-    expect(rebuiltRun.getChildCheckpointThreadIds().length).toBeGreaterThan(1);
-  });
+  );
 
   it('restores child tool-output references into rebuilt branches', async () => {
     getChatModelClassSpy.mockImplementation(((provider: Providers) => {

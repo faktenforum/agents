@@ -48,11 +48,14 @@ import {
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
+  HARD_MAX_TOOL_RESULT_CHARS,
   calculateMaxToolCallInputChars,
+} from '@/utils/truncation';
+import {
   projectToolCallInputs,
   serializeToolCallInput,
 } from '@/messages/prune';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isAnthropicThinkingContentBlock } from '@/messages/reasoningTypes';
 import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };
@@ -418,7 +421,7 @@ export function _convertMessagesToOpenAIParams(
       role = 'developer';
     }
 
-    let hasAnthropicThinkingBlock: boolean = false;
+    let hasReasoningBlock = false;
 
     let content: unknown;
     if (
@@ -441,8 +444,8 @@ export function _convertMessagesToOpenAIParams(
       content = message.content;
     } else {
       content = message.content.map((m) => {
-        if ('type' in m && m.type === 'thinking') {
-          hasAnthropicThinkingBlock = true;
+        if (isAnthropicThinkingContentBlock(m)) {
+          hasReasoningBlock = true;
           return m;
         }
         if (isDataContentBlock(m)) {
@@ -473,7 +476,7 @@ export function _convertMessagesToOpenAIParams(
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToBoundedOpenAI
       );
-      completionParam.content = hasAnthropicThinkingBlock ? content : '';
+      completionParam.content = hasReasoningBlock ? content : '';
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null

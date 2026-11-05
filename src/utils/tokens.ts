@@ -6,6 +6,7 @@ import {
   isAtomicToolContentBlock,
   serializeStructuredValueBounded,
 } from './toolContent';
+import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { ContentTypes } from '@/common/enum';
 
 export type EncodingName = 'o200k_base' | 'claude';
@@ -15,6 +16,7 @@ export type UnsafeTokenMeasurementReason =
   | 'content_proxy'
   | 'metadata_proxy'
   | 'metadata_accessor'
+  | 'metadata_limit'
   | 'invalid_count';
 
 export class UnsafeTokenMeasurementError extends Error {
@@ -120,6 +122,11 @@ const MAX_STRUCTURED_TOKENIZATION_CHARS = 200_000;
 /** One UTF-16 character can encode to several tokenizer pieces. */
 const MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR = 4;
 const MAX_STRUCTURED_SAFETY_INSPECTION_WORK = 10_000;
+const MAX_RAW_TOOL_CALLS = MAX_STRUCTURED_SAFETY_INSPECTION_WORK;
+/** Bounds BPE work per plain-text segment without omitting any text. */
+const MAX_TEXT_TOKENIZATION_CHARS = 8_192;
+/** Covers tokenizer segmentation changes on both sides of a chunk boundary. */
+const TEXT_TOKEN_CHUNK_BOUNDARY_SAFETY_TOKENS = 4;
 
 /**
  * Extracts image dimensions from the first bytes of a base64-encoded
@@ -886,22 +893,24 @@ function getBoundedTextTokenCount(
   value: string,
   getTokenCount: (text: string) => number
 ): number {
-  const preview =
-    value.length > MAX_STRUCTURED_TOKENIZATION_CHARS
-      ? value.slice(0, MAX_STRUCTURED_TOKENIZATION_CHARS)
-      : value;
-  const previewTokens = ensureSafeTokenMeasurement(
-    getTokenCount(preview),
-    'tokenizer'
-  );
-  const omittedChars = value.length - preview.length;
-  if (omittedChars <= 0) {
-    return previewTokens;
+  let numTokens = 0;
+  for (
+    let offset = 0;
+    offset < value.length;
+    offset += MAX_TEXT_TOKENIZATION_CHARS
+  ) {
+    const chunkTokens = ensureSafeTokenMeasurement(
+      getTokenCount(value.slice(offset, offset + MAX_TEXT_TOKENIZATION_CHARS)),
+      'tokenizer'
+    );
+    const boundaryTokens =
+      offset > 0 ? TEXT_TOKEN_CHUNK_BOUNDARY_SAFETY_TOKENS : 0;
+    numTokens = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      numTokens + chunkTokens + boundaryTokens
+    );
   }
-  return Math.min(
-    Number.MAX_SAFE_INTEGER,
-    previewTokens + omittedChars * MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR
-  );
+  return numTokens;
 }
 
 function getBoundedStructuredTokenCount(
@@ -937,6 +946,63 @@ function getBoundedStructuredTokenCount(
     Number.MAX_SAFE_INTEGER,
     previewTokens + omittedChars * MAX_TOKENS_PER_OMITTED_STRUCTURED_CHAR
   );
+}
+
+export function readTokenMetadataProperty(
+  value: object,
+  key: PropertyKey,
+  path: string
+): unknown {
+  const seen = new Set<object>();
+  let current: object | null = value;
+  for (let depth = 0; current != null && depth < 100; depth++) {
+    if (isProxy(current)) {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_proxy',
+        path,
+      });
+    }
+    if (seen.has(current)) {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path,
+      });
+    }
+    seen.add(current);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(current, key);
+    } catch {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path,
+      });
+    }
+    if (descriptor != null) {
+      if (!('value' in descriptor)) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_accessor',
+          path,
+        });
+      }
+      return descriptor.value;
+    }
+    try {
+      current = Object.getPrototypeOf(current) as object | null;
+    } catch {
+      throw new UnsafeTokenMeasurementError({
+        reason: 'metadata_accessor',
+        path,
+      });
+    }
+  }
+  if (current != null) {
+    throw new UnsafeTokenMeasurementError({
+      reason: 'metadata_accessor',
+      path,
+    });
+  }
+  return undefined;
 }
 
 export function getTokenCountForMessage(
@@ -1180,6 +1246,130 @@ export function getTokenCountForMessage(
             : getBoundedStructuredTokenCount(args, countText);
       }
     }
+    const rawCalls =
+      toolCalls.length > 0 || additionalKwargs == null
+        ? undefined
+        : readTokenMetadataProperty(
+          additionalKwargs,
+          'tool_calls',
+          'additional_kwargs.tool_calls'
+        );
+    if (rawCalls != null) {
+      if (isProxy(rawCalls)) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_proxy',
+          path: 'additional_kwargs.tool_calls',
+        });
+      }
+      if (!Array.isArray(rawCalls)) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_accessor',
+          path: 'additional_kwargs.tool_calls',
+        });
+      }
+      if (rawCalls.length > MAX_RAW_TOOL_CALLS) {
+        throw new UnsafeTokenMeasurementError({
+          reason: 'metadata_limit',
+          path: 'additional_kwargs.tool_calls',
+        });
+      }
+      for (let i = 0; i < rawCalls.length; i++) {
+        const rawCall = readTokenMetadataProperty(
+          rawCalls,
+          String(i),
+          `additional_kwargs.tool_calls[${i}]`
+        );
+        if (
+          rawCall == null ||
+          typeof rawCall !== 'object' ||
+          isProxy(rawCall)
+        ) {
+          throw new UnsafeTokenMeasurementError({
+            reason: 'metadata_proxy',
+            path: `additional_kwargs.tool_calls[${i}]`,
+          });
+        }
+        const callPath = `additional_kwargs.tool_calls[${i}]`;
+        if (hasUnsafeStructuredSerialization(rawCall)) {
+          throw new UnsafeTokenMeasurementError({
+            reason: 'metadata_accessor',
+            path: callPath,
+          });
+        }
+        const callId = readTokenMetadataProperty(
+          rawCall,
+          'id',
+          `${callPath}.id`
+        );
+        const callType = readTokenMetadataProperty(
+          rawCall,
+          'type',
+          `${callPath}.type`
+        );
+        const rawFunction = readTokenMetadataProperty(
+          rawCall,
+          'function',
+          `${callPath}.function`
+        );
+        const rawCustom = readTokenMetadataProperty(
+          rawCall,
+          'custom',
+          `${callPath}.custom`
+        );
+        let projectedFunction = rawFunction;
+        if (rawFunction != null && typeof rawFunction === 'object') {
+          if (hasUnsafeStructuredSerialization(rawFunction)) {
+            throw new UnsafeTokenMeasurementError({
+              reason: 'metadata_accessor',
+              path: `${callPath}.function`,
+            });
+          }
+          const name = readTokenMetadataProperty(
+            rawFunction,
+            'name',
+            `${callPath}.function.name`
+          );
+          const args = readTokenMetadataProperty(
+            rawFunction,
+            'arguments',
+            `${callPath}.function.arguments`
+          );
+          projectedFunction = { name, arguments: args };
+        }
+        let projectedCustom = rawCustom;
+        if (rawCustom != null && typeof rawCustom === 'object') {
+          if (hasUnsafeStructuredSerialization(rawCustom)) {
+            throw new UnsafeTokenMeasurementError({
+              reason: 'metadata_accessor',
+              path: `${callPath}.custom`,
+            });
+          }
+          const name = readTokenMetadataProperty(
+            rawCustom,
+            'name',
+            `${callPath}.custom.name`
+          );
+          const input = readTokenMetadataProperty(
+            rawCustom,
+            'input',
+            `${callPath}.custom.input`
+          );
+          projectedCustom = { name, input };
+        }
+        if (typeof callId === 'string' && representedToolCallIds.has(callId)) {
+          continue;
+        }
+        numTokens += getBoundedStructuredTokenCount(
+          {
+            id: callId,
+            type: callType,
+            custom: projectedCustom,
+            function: projectedFunction,
+          },
+          countText
+        );
+      }
+    }
     let legacyFunctionCall: PropertyDescriptor | undefined;
     try {
       legacyFunctionCall =
@@ -1250,6 +1440,25 @@ export function apportionTokenCounts(
  */
 const CLAUDE_TOKEN_CORRECTION = 1.1;
 
+const tokenCounterEncodings = new WeakMap<
+  (message: BaseMessage) => number,
+  EncodingName
+>();
+
+/**
+ * Encoding a counter measures in, for counters built here.
+ *
+ * `undefined` for a counter the host supplied itself: unknown, not wrong. A
+ * caller that needs a count in a specific encoding can therefore tell "counts
+ * in the encoding I need" from "counts in a different one" without treating
+ * every foreign counter as suspect.
+ */
+export function encodingOfTokenCounter(
+  tokenCounter: (message: BaseMessage) => number
+): EncodingName | undefined {
+  return tokenCounterEncodings.get(tokenCounter);
+}
+
 /**
  * Creates a token counter function using the specified encoding.
  * Lazily loads the encoding data on first use via dynamic import.
@@ -1260,13 +1469,17 @@ export const createTokenCounter = async (
   const tok = await getTokenizer(encoding);
   const countTokens = (text: string): number => tok.count(text);
   const isClaude = encoding === 'claude';
-  return (message: BaseMessage): number => {
-    const count = getTokenCountForMessage(message, countTokens, encoding);
-    const correctedCount = isClaude
-      ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
-      : count;
-    return ensureSafeTokenMeasurement(correctedCount, 'message');
-  };
+  const counter = markTokenCounterCacheCompatible(
+    (message: BaseMessage): number => {
+      const count = getTokenCountForMessage(message, countTokens, encoding);
+      const correctedCount = isClaude
+        ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION)
+        : count;
+      return ensureSafeTokenMeasurement(correctedCount, 'message');
+    }
+  );
+  tokenCounterEncodings.set(counter, encoding);
+  return counter;
 };
 
 /** Utility to manage the token encoder lifecycle explicitly. */

@@ -3,6 +3,7 @@ export * from './run';
 export * from './stream';
 export * from './events';
 export * from './messages';
+export { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } from './langfuseToolOutputTracing';
 
 /* Graphs */
 export * from './graphs';
@@ -15,6 +16,7 @@ export * from './summarization';
 
 /* Tools */
 export * from './tools/Calculator';
+export * from './tools/GitHubCompare';
 export * from './tools/CodeExecutor';
 export * from './tools/BashExecutor';
 export * from './tools/ProgrammaticToolCalling';
@@ -43,6 +45,9 @@ export * from './hooks';
 /* Programmatic sessions */
 export * from './session';
 
+/* Event actors */
+export * from './eventActor';
+
 /* HITL helpers */
 export * from './hitl';
 
@@ -69,15 +74,21 @@ export {
 export type { Interrupt } from '@langchain/langgraph';
 
 /* LLM */
-export { CustomOpenAIClient } from './llm/openai';
-export { ChatOpenRouter } from './llm/openrouter';
+export { markTokenCounterCacheCompatible } from './llm/tokenCounterCacheCompatibility';
+/** Provider chat-model classes moved off the root barrel: importing any of them here
+ *  forced every host to pay that provider SDK's module init at boot. They remain
+ *  available from their own entries, e.g. `@librechat/agents/llm/openai`. */
 export type {
   OpenRouterReasoning,
   OpenRouterReasoningEffort,
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
 export { getChatModelClass } from './llm/providers';
-export { CustomChatMistralAI } from './llm/mistral';
+export { registerProvider } from './provider-registration';
+export type {
+  ProviderFamily,
+  ProviderRegistrationOptions,
+} from './provider-registration';
 export {
   smoothStream,
   resolveStreamDelay,
@@ -88,6 +99,14 @@ export type { SmoothItem, SmoothPiece } from './llm/stream/smoother';
 export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
+export { prepareProviderRequest } from './llm/prepareProviderRequest';
+export type {
+  PreparedProviderRequest,
+  PrepareProviderRequestParams,
+  ProviderMessageProjectionMode,
+  ProviderPayloadMeasurement,
+  ProviderRequestContext,
+} from './llm/prepareProviderRequest';
 export { canSealPreempt } from './llm/preempt';
 export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';
 export {
@@ -101,3 +120,15 @@ export type {
   StreamLimitState,
   StreamLimitKind,
 } from './llm/streamLimits';
+export * from './decisions';
+export * from './rerank';
+
+export {
+  PROVIDER_TEXT_PROTECTION_VERSION,
+  ProviderTextProtectionError,
+} from './protection/providerText';
+export type {
+  ProviderTextProtection,
+  ProviderTextProtectionResult,
+  ProviderTextProtectionErrorCode,
+} from './protection/providerText';

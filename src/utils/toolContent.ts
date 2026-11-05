@@ -1,8 +1,9 @@
-import { isProxy } from 'node:util/types';
+import { isArrayBuffer, isDate, isProxy } from 'node:util/types';
 import { ToolMessage, type BaseMessage } from '@langchain/core/messages';
 import {
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
   truncateToolResultContent,
+  sliceWithoutSplittingSurrogates,
 } from './truncation';
 
 type ToolContent = BaseMessage['content'];
@@ -151,11 +152,17 @@ function jsonStringLength(
 
 type NativeDateRead = { matched: true; time: number } | { matched: false };
 
+/**
+ * `isArrayBuffer` reads the internal slot natively (no user code, cross-realm safe) and
+ * costs nothing for the plain objects that make up almost all content; the getter's
+ * throw path was the expensive part, so it only runs once the brand is already known.
+ */
 function readNativeArrayBufferByteLength(value: unknown): number | undefined {
   if (
     value == null ||
     typeof value !== 'object' ||
-    NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER == null
+    NATIVE_ARRAY_BUFFER_BYTE_LENGTH_GETTER == null ||
+    !isArrayBuffer(value)
   ) {
     return undefined;
   }
@@ -167,7 +174,7 @@ function readNativeArrayBufferByteLength(value: unknown): number | undefined {
 }
 
 function readNativeDate(value: unknown): NativeDateRead {
-  if (value == null || typeof value !== 'object') {
+  if (value == null || typeof value !== 'object' || !isDate(value)) {
     return { matched: false };
   }
   try {
@@ -415,7 +422,7 @@ type SegmentedStringBuffer = {
 export type BoundedStructuredSerialization = {
   /** Provider-facing head/tail preview, bounded by `maxChars`. */
   content: string;
-  /** Exact serialized prefix up to the defensive traversal-work ceiling. */
+  /** Code-point-aligned serialized prefix up to the traversal-work ceiling. */
   prefix: string;
   /** Exact length, or `Number.MAX_SAFE_INTEGER` when traversal was capped. */
   originalChars: number;
@@ -499,6 +506,10 @@ function materializeSegmentedStringBuffer(
   return segments.join('');
 }
 
+/**
+ * Retains exact code-unit prefixes internally. Trimming surrogate edges here
+ * would let later chunks fill the gap and corrupt the prefix; trim on exposure.
+ */
 function appendSerializedChunk(
   collector: StructuredSerializationCollector,
   chunk: string
@@ -947,7 +958,7 @@ function formatBoundedStructuredContent(
   suffix: string
 ): string {
   if (collector.totalChars <= maxChars) {
-    return prefix.slice(0, collector.totalChars);
+    return sliceWithoutSplittingSurrogates(prefix, 0, collector.totalChars);
   }
 
   const indicator = collector.work.exceeded
@@ -956,10 +967,13 @@ function formatBoundedStructuredContent(
       `${maxChars} limit] …\n\n`;
   const available = maxChars - indicator.length;
   if (available <= 0) {
-    return prefix.slice(0, maxChars);
+    return sliceWithoutSplittingSurrogates(prefix, 0, maxChars);
   }
   if (available < 200) {
-    return prefix.slice(0, available) + indicator.trimEnd();
+    return (
+      sliceWithoutSplittingSurrogates(prefix, 0, available) +
+      indicator.trimEnd()
+    );
   }
 
   const headSize = Math.ceil(available * 0.7);
@@ -976,7 +990,11 @@ function formatBoundedStructuredContent(
     tailStart = tailNewline + 1;
   }
 
-  return prefix.slice(0, headEnd) + indicator + suffix.slice(tailStart);
+  return (
+    sliceWithoutSplittingSurrogates(prefix, 0, headEnd) +
+    indicator +
+    sliceWithoutSplittingSurrogates(suffix, tailStart)
+  );
 }
 
 /**
@@ -1030,7 +1048,7 @@ export function serializeStructuredValueBounded(
       prefix,
       suffix
     ),
-    prefix: prefix.slice(0, normalizedPrefixChars),
+    prefix: sliceWithoutSplittingSurrogates(prefix, 0, normalizedPrefixChars),
     originalChars,
     truncated:
       collector.work.exceeded || collector.totalChars > normalizedMaxChars,
@@ -1818,7 +1836,7 @@ function classifyToolContentBlock(
     }
   }
   const remaining = { value: MAX_ATOMIC_VALIDATION_WORK };
-  let kind = TOOL_BLOCK_OPAQUE;
+  let kind: number;
   try {
     if (
       hasUnsafeCallableToJSON(
@@ -1925,7 +1943,11 @@ function serializeDenseTextBlocksWithinLimit(
     }
     preview += textBlocks[i].text.slice(0, available - preview.length);
   }
-  return (preview + indicator).slice(0, normalizedMaxChars);
+  return sliceWithoutSplittingSurrogates(
+    sliceWithoutSplittingSurrogates(preview, 0) + indicator,
+    0,
+    normalizedMaxChars
+  );
 }
 
 export type CompactToolContentResult = {
@@ -2701,7 +2723,7 @@ export function cloneToolMessageWithContent(
     status: message.status,
     artifact,
     metadata: message.metadata,
-    additional_kwargs: message.additional_kwargs,
+    additional_kwargs: { ...message.additional_kwargs },
     response_metadata: message.response_metadata,
   });
 }

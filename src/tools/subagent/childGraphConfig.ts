@@ -15,6 +15,7 @@ import {
   MAX_GRAPH_SUBAGENT_MEMBERS,
   MAX_GRAPH_SUBAGENT_TURNS,
 } from './runtimeLimits';
+import { getSubagentHostArgSpecs } from './hostArgs';
 
 const RESERVED_GRAPH_MEMBER_IDS = new Set([
   '__start__',
@@ -69,6 +70,7 @@ type GraphSubagentConfigCandidate = {
   configId?: unknown;
   agentInputs?: unknown;
   resolveAgentInputs?: unknown;
+  hostArgs?: unknown;
   self?: unknown;
 };
 
@@ -156,10 +158,11 @@ function assertGraphSubagentConfigShape(
     candidate.agentInputs !== undefined ||
     candidate.resolveAgentInputs !== undefined ||
     candidate.configId !== undefined ||
+    candidate.hostArgs !== undefined ||
     candidate.self !== undefined
   ) {
     throw new Error(
-      `Graph subagent "${configType}" cannot define agentInputs or self, or lazy fields configId/resolveAgentInputs.`
+      `Graph subagent "${configType}" cannot define agentInputs or self, or lazy fields configId/resolveAgentInputs/hostArgs.`
     );
   }
 }
@@ -482,6 +485,14 @@ function normalizeSingleAgentConfig(
       `Subagent "${config.type}" cannot combine self with resolveAgentInputs.`
     );
   }
+  if (
+    getSubagentHostArgSpecs(config).length > 0 &&
+    (config.resolveAgentInputs == null || config.agentInputs != null)
+  ) {
+    throw new Error(
+      `Subagent "${config.type}" declares hostArgs, which only a lazy resolveAgentInputs config without eager agentInputs can receive.`
+    );
+  }
   if (config.agentInputs != null) {
     return config as ResolvedSingleAgentSubagentConfig;
   }
@@ -600,6 +611,9 @@ function prepareChildInputs({
     initialSummary: undefined,
     discoveredTools: undefined,
     graphTools: self ? undefined : agentInputs.graphTools,
+    compactionSemanticIndex: self
+      ? undefined
+      : agentInputs.compactionSemanticIndex,
   };
   if (allowNested) {
     childInputs.maxSubagentDepth = Math.max(0, parentMaxDepth - 1);

@@ -42,6 +42,7 @@ import {
   HookRegistry,
   TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
 } from '@/hooks';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { SubagentExecutor } from '@/tools/subagent/SubagentExecutor';
 import { AgentContext } from '@/agents/AgentContext';
 import { Providers } from '@/common';
@@ -205,6 +206,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     const healthyResolver = jest.fn(async () => makeAgent('healthy-child'));
     const healthyConfig = makeLazyConfig('healthy', healthyResolver);
     const executor = createExecutor([failingConfig, healthyConfig]);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
     const failed = await executor.execute({
       description: 'Fail this selected child.',
@@ -224,6 +226,45 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(failed.content).not.toContain('private-selected-resolver-secret');
     expect(succeeded.content).toBe('Task completed');
     expect(healthyResolver).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      '[SubagentExecutor] Subagent resolution failed',
+      expect.objectContaining({
+        phase: 'config',
+        subagentType: 'failing',
+        aborted: false,
+        type: 'Error',
+      })
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('oauth-token');
+    warn.mockRestore();
+  });
+
+  it('labels a start-up failure caused by an aborted child signal', async () => {
+    const controller = new AbortController();
+    const config = makeLazyConfig('aborted', async () => {
+      controller.abort();
+      throw new Error('resolver saw the abort');
+    });
+    const executor = createExecutor([config]);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const failed = await executor.execute({
+      description: 'Abort while resolving.',
+      subagentType: config.type,
+      parentToolCallId: 'call_aborted',
+      signal: controller.signal,
+    });
+
+    expect(failed.content).toBe(
+      'Subagent error: Unable to initialize the selected subagent.'
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[SubagentExecutor] Subagent resolution failed',
+      expect.objectContaining({ subagentType: 'aborted', aborted: true })
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('resolver saw');
+    warn.mockRestore();
   });
 
   it('releases lazy resolution when SubagentStart denies', async () => {
@@ -1976,35 +2017,42 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(result.content).not.toContain('private cancellation reason');
   });
 
-  it('rethrows a stream-limit trip while awaiting lazy resolution', async () => {
-    const breaker = new AbortController();
-    let markResolutionStarted = (): void => undefined;
-    const resolutionStarted = new Promise<void>((resolve) => {
-      markResolutionStarted = resolve;
-    });
-    const config = makeLazyConfig('researcher', async () => {
-      markResolutionStarted();
-      return new Promise<AgentInputs>(() => undefined);
-    });
-    const executor = createExecutor([config]);
-    const trip = new StreamLimitExceededError({
-      kind: 'tool_call_args',
-      limit: 10,
-      observed: 11,
-      toolName: 'db_query',
-    });
+  it.each([
+    {
+      label: 'stream limit',
+      trip: new StreamLimitExceededError({
+        kind: 'tool_call_args',
+        limit: 10,
+        observed: 11,
+        toolName: 'db_query',
+      }),
+    },
+    { label: 'protection', trip: new ProviderTextProtectionError('blocked') },
+  ])(
+    'rethrows a $label trip while awaiting lazy resolution',
+    async ({ trip }) => {
+      const breaker = new AbortController();
+      let markResolutionStarted = (): void => undefined;
+      const resolutionStarted = new Promise<void>((resolve) => {
+        markResolutionStarted = resolve;
+      });
+      const config = makeLazyConfig('researcher', async () => {
+        markResolutionStarted();
+        return new Promise<AgentInputs>(() => undefined);
+      });
+      const executor = createExecutor([config]);
+      const execution = executor.execute({
+        description: 'Stop this selection.',
+        subagentType: config.type,
+        parentToolCallId: 'call_limit',
+        breaker,
+      });
+      await resolutionStarted;
+      breaker.abort(trip);
 
-    const execution = executor.execute({
-      description: 'Stop this selection.',
-      subagentType: config.type,
-      parentToolCallId: 'call_limit',
-      breaker,
-    });
-    await resolutionStarted;
-    breaker.abort(trip);
-
-    await expect(execution).rejects.toBe(trip);
-  });
+      await expect(execution).rejects.toBe(trip);
+    }
+  );
 
   it('prefers eager agent inputs without calling an attached resolver', async () => {
     const resolveAgentInputs = jest.fn(async () => makeAgent('unexpected'));
@@ -2047,10 +2095,23 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     const parentToolCallId = 'call_legacy_eager';
     const resumeExecution = makeResumeExecution(parentToolCallId, configId);
     delete resumeExecution.subagentType;
+    resumeExecution.graphState.fadingTier = {
+      v: 2,
+      budgetTokens: 25_000,
+      masked: true,
+      latched: true,
+    };
+    resumeExecution.graphState.fadingTiers = {
+      'eager-child': resumeExecution.graphState.fadingTier,
+    };
+    let observedInput: StandardGraphInput | undefined;
     const executor = createExecutor([eagerConfig], {
       checkpointer: new MemorySaver(),
       humanInTheLoop: { enabled: true },
-      createChildGraph: makeRecoveredGraph,
+      createChildGraph: (input) => {
+        observedInput = input;
+        return makeRecoveredGraph();
+      },
     });
     const forkTarget = executor as unknown as {
       forkCheckpointSnapshot: () => Promise<void>;
@@ -2073,6 +2134,12 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     });
 
     expect(result.content).toBe('persisted result');
+    expect(observedInput?.fadingTier).toEqual(
+      resumeExecution.graphState.fadingTier
+    );
+    expect(observedInput?.fadingTiers).toEqual(
+      resumeExecution.graphState.fadingTiers
+    );
   });
 
   it('preserves nested lazy descriptors and decrements the child depth', async () => {

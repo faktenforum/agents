@@ -4,6 +4,7 @@
  * Tests manual invocation with mock tools and Code API responses.
  */
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
   createProgrammaticToolCallingTool,
@@ -16,6 +17,11 @@ import {
   unwrapToolResponse,
 } from '../ProgrammaticToolCalling';
 import {
+  createBashProgrammaticToolCallingTool,
+  createBashProgrammaticToolCallingSchema,
+  normalizeBashToolResultsForReplay,
+} from '../BashProgrammaticToolCalling';
+import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
   createGetExpensesTool,
@@ -23,9 +29,14 @@ import {
   createCalculatorTool,
 } from '@/test/mockTools';
 import {
-  createBashProgrammaticToolCallingSchema,
-  normalizeBashToolResultsForReplay,
-} from '../BashProgrammaticToolCalling';
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
+  selectProgrammaticTools,
+} from '../ProgrammaticCallerPolicy';
+import {
+  appendExecutionArtifactFileSummary,
+  stripCodeSessionFileSummary,
+} from '../CodeSessionFileSummary';
 import { Constants } from '@/common';
 
 describe('ProgrammaticToolCalling', () => {
@@ -37,6 +48,9 @@ describe('ProgrammaticToolCalling', () => {
       expect(description).toContain('keyword args only');
       expect(description).toContain('never pass a dict');
       expect(description).toContain('Tool results are decoded Python values');
+      expect(schema.properties.tool_manifest.description).toContain(
+        'validated before execution starts'
+      );
     });
 
     it('explains bash inner-tool stdout shape', () => {
@@ -53,7 +67,20 @@ describe('ProgrammaticToolCalling', () => {
       expect(description).toContain('/mnt/data/sf.json');
       expect(description).toContain('Failed executions register nothing');
       expect(description).toContain('`/tmp` never survives the call');
+      expect(schema.properties.tool_manifest.uniqueItems).toBe(true);
     });
+  });
+
+  it('strips attached-workspace artifact summaries before output reuse', () => {
+    const output = appendExecutionArtifactFileSummary('done', [
+      {
+        id: 'artifact-1',
+        name: 'report.txt',
+        storage_session_id: 'session-1',
+      },
+    ]);
+
+    expect(stripCodeSessionFileSummary(output)).toBe('done');
   });
 
   describe('normalizeBashToolResultsForReplay', () => {
@@ -908,6 +935,77 @@ for member in team:
     });
   });
 
+  describe('Programmatic Tool Manifest', () => {
+    const allowedToolDefs: t.LCTool[] = [
+      { name: 'search', allowed_callers: ['code_execution'] },
+      {
+        name: 'calculate',
+        allowed_callers: ['direct', 'code_execution'],
+      },
+    ];
+    const disallowedToolDefs = [{ name: 'send_email' }];
+
+    it('requires a manifest for mixed caller configurations', () => {
+      expect(() =>
+        selectProgrammaticTools({
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toThrow('requires a tool_manifest');
+    });
+
+    it('rejects direct-only manifest entries before execution', () => {
+      expect(() =>
+        selectProgrammaticTools({
+          requestedToolNames: ['send_email'],
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toThrow('not marked for code_execution');
+    });
+
+    it('selects declared allowed tools without parsing code', () => {
+      expect(
+        selectProgrammaticTools({
+          requestedToolNames: ['calculate', 'search', 'search'],
+          allowedToolDefs,
+          disallowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toEqual([allowedToolDefs[1], allowedToolDefs[0]]);
+    });
+
+    it('preserves the all-tools fallback when no direct-only tools exist', () => {
+      expect(
+        selectProgrammaticTools({
+          allowedToolDefs,
+          programmaticToolName: 'run_tools_with_code',
+        })
+      ).toBe(allowedToolDefs);
+    });
+
+    it('preserves legacy manual tool-definition injection', () => {
+      expect(
+        resolveProgrammaticToolDefinitions({ tools: allowedToolDefs })
+      ).toBe(allowedToolDefs);
+    });
+
+    it('restricts callback execution to the selected manifest', () => {
+      const searchTool = createGetTeamMembersTool();
+      const emailTool = createGetExpensesTool();
+      const toolMap: t.ToolMap = new Map([
+        ['search', searchTool],
+        ['send_email', emailTool],
+      ]);
+
+      expect(projectProgrammaticToolMap(toolMap, [{ name: 'search' }])).toEqual(
+        new Map([['search', searchTool]])
+      );
+    });
+  });
+
   describe('formatCompletedResponse', () => {
     it('formats response with stdout', () => {
       const response: t.ProgrammaticExecutionResponse = {
@@ -923,6 +1021,21 @@ for member in team:
       expect(output).toContain('stdout:\nHello, World!');
       expect(artifact.session_id).toBe('sess_abc123');
       expect(artifact.files).toEqual([]);
+    });
+
+    it('preserves explicit persisted-file deletions in the execution artifact', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'removed data.csv\n',
+        stderr: '',
+        files: [],
+        deleted_files: ['data.csv'],
+        session_id: 'sess_delete',
+      };
+
+      const [, artifact] = formatCompletedResponse(response);
+
+      expect(artifact.deleted_files).toEqual(['data.csv']);
     });
 
     it('shows empty output message when no stdout', () => {
@@ -955,6 +1068,152 @@ for member in team:
       expect(output).toContain('stdout:\nOutput');
       expect(output).toContain('stderr:\nWarning: deprecated function');
     });
+
+    it('surfaces artifact delivery failures while preserving execution output', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'Code completed\n',
+        stderr: '',
+        files: [],
+        session_id: 'sess_abc123',
+        artifact_delivery: {
+          code: 'artifact_delivery_failed',
+          status: 'failed',
+          attempted: 1,
+          delivered: 0,
+          failed: 1,
+        },
+      };
+
+      const [output, artifact] = formatCompletedResponse(response);
+
+      expect(output).toContain('stdout:\nCode completed');
+      expect(output).toContain('Artifact delivery warning:');
+      expect(output).toContain('do not rerun automatically');
+      expect(artifact.artifact_delivery).toEqual(response.artifact_delivery);
+    });
+
+    it.each(['session', 'execution'] as const)(
+      'warns about truncation before the %s file summary',
+      (filePersistence) => {
+        const marker: t.ArtifactTruncation = {
+          code: 'artifact_truncated',
+          reasons: { size: 2 },
+          skipped: ['omitted.csv'],
+          skipped_count: 2,
+        };
+        const files = [{ id: 'file-1', name: 'kept.csv' }];
+        const response = {
+          status: 'completed',
+          stdout: 'done\n',
+          files,
+          artifact_truncation: { ...marker, extra: 'ignored' },
+        };
+
+        const [output, artifact] = formatCompletedResponse(
+          response,
+          '',
+          filePersistence
+        );
+
+        expect(output).toContain('2 file(s) were omitted from delivery');
+        expect(output).toContain('omitted.csv (1 of 2 shown)');
+        expect(output).toContain('do not rerun automatically');
+        expect(output.indexOf('file(s) were omitted')).toBeLessThan(
+          output.indexOf('Generated files:')
+        );
+        expect(artifact.artifact_truncation).toEqual(marker);
+        expect(artifact.files).toEqual(files);
+      }
+    );
+
+    it('warns even when no programmatic files were delivered', () => {
+      const marker: t.ArtifactTruncation = {
+        code: 'artifact_truncated',
+        reasons: { depth: 1 },
+        skipped: ['nested/omitted.csv'],
+        skipped_count: 1,
+      };
+      const [output, artifact] = formatCompletedResponse({
+        status: 'completed',
+        stdout: 'done\n',
+        files: [],
+        artifact_truncation: marker,
+      });
+
+      expect(output).toContain('1 file(s) were omitted from delivery');
+      expect(output).not.toContain('Generated files:');
+      expect(artifact.artifact_truncation).toEqual(marker);
+    });
+
+    it.each([{ size: -1 }, { max_files: 70 }, {}])(
+      'ignores malformed truncation reasons %j in programmatic responses',
+      (reasons) => {
+        const [output, artifact] = formatCompletedResponse({
+          status: 'completed',
+          stdout: 'done\n',
+          files: [],
+          artifact_truncation: {
+            code: 'artifact_truncated',
+            reasons,
+            skipped: ['omitted.csv'],
+            skipped_count: 1,
+          },
+        });
+
+        expect(output).not.toContain('omitted from delivery');
+        expect(artifact.artifact_truncation).toBeUndefined();
+      }
+    );
+
+    it.each([1, 70])(
+      'preserves other response metadata when reason count is %i',
+      (reasonCount) => {
+        const response: t.ProgrammaticExecutionResponse = {
+          status: 'completed',
+          stdout: 'done\n',
+          stderr: 'diagnostic\n',
+          session_id: 'session-123',
+          runtime_session_id: 'runtime-123',
+          runtime_status: 'reused',
+          files: [{ id: 'file-1', name: 'kept.csv' }],
+          deleted_files: ['removed.csv'],
+          artifact_delivery: {
+            code: 'artifact_delivery_failed',
+            status: 'partial',
+            attempted: 2,
+            delivered: 1,
+            failed: 1,
+          },
+          artifact_truncation: {
+            code: 'artifact_truncated',
+            reasons: { size: reasonCount },
+            skipped: ['omitted.csv'],
+            skipped_count: 1,
+          },
+        };
+        const [output, artifact] = formatCompletedResponse(response);
+
+        expect(output).toContain('stdout:\ndone');
+        expect(output).toContain('stderr:\ndiagnostic');
+        expect(output).toContain('Artifact delivery warning:');
+        expect(output).toContain('Generated files:');
+        expect(output.includes('omitted from delivery')).toBe(
+          reasonCount === 1
+        );
+        expect(artifact).toEqual({
+          session_id: response.session_id,
+          runtime_session_id: response.runtime_session_id,
+          runtime_status: response.runtime_status,
+          files: response.files,
+          deleted_files: response.deleted_files,
+          artifact_delivery: response.artifact_delivery,
+          ...(reasonCount === 1
+            ? { artifact_truncation: response.artifact_truncation }
+            : {}),
+        });
+      }
+    );
 
     it('adds a /tmp scratch reminder when source code used /tmp', () => {
       const response: t.ProgrammaticExecutionResponse = {
@@ -1031,7 +1290,6 @@ for member in team:
   describe('createProgrammaticToolCallingTool - Manual Invocation', () => {
     let ptcTool: ReturnType<typeof createProgrammaticToolCallingTool>;
     let toolMap: t.ToolMap;
-    let toolDefinitions: t.LCTool[];
 
     beforeEach(() => {
       const tools = [
@@ -1040,11 +1298,6 @@ for member in team:
         createGetWeatherTool(),
       ];
       toolMap = new Map(tools.map((t) => [t.name, t]));
-      toolDefinitions = Array.from(
-        createProgrammaticToolRegistry().values()
-      ).filter((t) =>
-        ['get_team_members', 'get_expenses', 'get_weather'].includes(t.name)
-      );
 
       ptcTool = createProgrammaticToolCallingTool({
         baseUrl: 'http://mock-api',
@@ -1055,8 +1308,6 @@ for member in team:
       await expect(
         ptcTool.invoke({
           code: 'result = await get_weather(city="SF")\nprint(result)',
-          tools: toolDefinitions,
-          toolMap,
         })
       ).rejects.toThrow('No toolMap provided');
     });
@@ -1064,8 +1315,6 @@ for member in team:
     it('throws error when toolMap is empty', async () => {
       const args = {
         code: 'result = await get_weather(city="SF")\nprint(result)',
-        tools: toolDefinitions,
-        toolMap: new Map(),
       };
       const toolCall = {
         name: 'programmatic_tool_calling',
@@ -1131,6 +1380,62 @@ for member in team:
     beforeEach(() => {
       const tools = [createGetWeatherTool()];
       toolMap = new Map(tools.map((t) => [t.name, t]));
+    });
+
+    it('rejects a direct-only Python tool before requiring sandbox context', async () => {
+      const tool = createProgrammaticToolCallingTool();
+      const toolCall = {
+        id: 'ptc-python',
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        args: {},
+        type: 'tool_call' as const,
+        disallowedToolDefs: [
+          {
+            name: 'direct-only-tool',
+            allowed_callers: ['direct'],
+          },
+        ],
+      } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+      await expect(
+        tool.invoke(
+          {
+            code: 'await direct_only_tool(query="test")',
+            tool_manifest: ['direct-only-tool'],
+          },
+          { toolCall }
+        )
+      ).rejects.toThrow(
+        'Tool "direct-only-tool" cannot be called from "run_tools_with_code" because the tool is not marked for code_execution'
+      );
+    });
+
+    it('rejects a direct-only bash tool before requiring sandbox context', async () => {
+      const tool = createBashProgrammaticToolCallingTool();
+      const toolCall = {
+        id: 'ptc-bash',
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        args: {},
+        type: 'tool_call' as const,
+        disallowedToolDefs: [
+          {
+            name: 'direct-only-tool',
+            allowed_callers: ['direct'],
+          },
+        ],
+      } satisfies ToolCall & Partial<t.ProgrammaticCache>;
+
+      await expect(
+        tool.invoke(
+          {
+            code: 'direct_only_tool \'{"query":"test"}\'',
+            tool_manifest: ['direct-only-tool'],
+          },
+          { toolCall }
+        )
+      ).rejects.toThrow(
+        'Tool "direct-only-tool" cannot be called from "run_tools_with_code" because the tool is not marked for code_execution'
+      );
     });
 
     it('returns error for invalid city without throwing', async () => {
@@ -1350,11 +1655,9 @@ for member in team:
   });
 
   describe('bash bridge script does not require python3 (Codex P2 #19)', () => {
-    /* eslint-disable @typescript-eslint/no-require-imports */
     const {
       _createBashProgramForTests,
     } = require('../local/LocalProgrammaticToolCalling');
-    /* eslint-enable @typescript-eslint/no-require-imports */
 
     it('uses curl as the primary HTTP helper with python3 only as fallback', () => {
       const script: string = _createBashProgramForTests(
@@ -1399,7 +1702,7 @@ for member in team:
       const { tool } = await import('@langchain/core/tools');
       const { z } = await import('zod');
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       let callsMade = 0;
@@ -1418,7 +1721,6 @@ for member in team:
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
         hooks: [
-          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async (input) => {
             if (input.toolName === 'write_file') {
               return { decision: 'deny', reason: 'no writes from bridge' };
@@ -1431,7 +1733,7 @@ for member in team:
       // Internal createToolBridge isn't exported, but exercising it via
       // a synthetic HTTP request mirrors the real path. We use a tiny
       // helper to access the (testing-internal) bridge factory.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const http = require('http') as typeof import('http');
 
       // Use the same internal factory the production path uses by
@@ -1462,38 +1764,50 @@ for member in team:
       expect(gate.denyReason).toContain('no writes from bridge');
     });
 
-    it('threads executingAgentId from the hook context to bridge PreToolUse hooks', async () => {
+    it('threads agent identity from the hook context to bridge PreToolUse hooks', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
       const registry = new HookRegistry();
       let seen: string | undefined = 'UNSET';
+      let seenContext: t.SubagentExecutionContext | undefined;
+      const executionContext: t.SubagentExecutionContext = {
+        rootRunId: 'root-run',
+        hookSessionId: 'r1',
+        depth: 1,
+        ancestry: [],
+      };
       registry.register('PreToolUse', {
         hooks: [
-          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async (input) => {
             seen = input.executingAgentId;
+            seenContext = input.executionContext;
             return { decision: 'allow' };
           },
         ],
       });
       await ptcMod.applyPreToolUseHooksForBridge(
-        { registry, runId: 'r1', executingAgentId: 'repo_investigator' },
+        {
+          registry,
+          runId: 'r1',
+          executingAgentId: 'repo_investigator',
+          executionContext,
+        },
         'write_file',
         'call_1',
         { path: '/tmp/x' }
       );
       expect(seen).toBe('repo_investigator');
+      expect(seenContext).toEqual(executionContext);
     });
 
     it('passes through when no hook denies (allow path)', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
-        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
         hooks: [async () => ({ decision: 'allow' })],
       });
 
@@ -1509,13 +1823,12 @@ for member in team:
 
     it('applies updatedInput to the inner tool args', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
         hooks: [
-          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async () => ({
             decision: 'allow',
             updatedInput: { path: '/tmp/rewritten' },
@@ -1533,14 +1846,60 @@ for member in team:
       expect(gate.input).toEqual({ path: '/tmp/rewritten' });
     });
 
+    it('fails closed on a broken approval hook in a background child bridge', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        internal: true,
+        hooks: [
+          async () => {
+            throw new Error('approval service unavailable');
+          },
+          async () => ({ decision: 'allow' }),
+        ],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'background-child', failClosedOnHookError: true },
+        'write_file',
+        'call_bg_1',
+        { path: '/tmp/file' }
+      );
+      expect(gate.denyReason).toContain(
+        'Approval policy could not be evaluated'
+      );
+      expect(gate.denyReason).toContain('write_file');
+    });
+
+    it('identifies a denied background bridge tool when approval is needed', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async () => ({ decision: 'ask', reason: 'needs human approval' }),
+        ],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'background-child', failClosedOnHookError: true },
+        'write_file',
+        'call_bg_ask',
+        { path: '/tmp/file' }
+      );
+      expect(gate.denyReason).toContain('Approval required for "write_file"');
+      expect(gate.denyReason).toContain('needs human approval');
+      expect(gate.denyReason).toContain('in the foreground');
+    });
+
     it('treats `ask` as fail-closed deny (HITL not reachable from bridge)', async () => {
       const { HookRegistry } = await import('@/hooks');
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+
       const ptcMod = require('../local/LocalProgrammaticToolCalling');
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
-        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
         hooks: [async () => ({ decision: 'ask' })],
       });
 

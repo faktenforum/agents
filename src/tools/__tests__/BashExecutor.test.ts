@@ -26,7 +26,9 @@ describe('buildBashExecutionToolDescription', () => {
     expect(BashExecutionToolDescription).toContain(
       'Failed executions register nothing'
     );
-    expect(BashExecutionToolDescription).toContain('`/tmp` never survives the call');
+    expect(BashExecutionToolDescription).toContain(
+      '`/tmp` never survives the call'
+    );
   });
 
   it('appends the tool-output references guide when enabled', () => {
@@ -104,5 +106,19 @@ describe('buildBashExecutionToolDescription', () => {
       );
       expect(composed).toContain(BashToolOutputReferencesGuide);
     });
+  });
+
+  it('removes /mnt/data persistence claims from attached workspace parameters', async () => {
+    const { buildBashExecutionToolSchema } = await import('../BashExecutor');
+    const description = buildBashExecutionToolSchema({
+      attachedWorkspace: true,
+    }).properties.command.description;
+
+    expect(description).toContain('selected persistent project');
+    expect(description).toContain(
+      'Write anything needed later into the selected project'
+    );
+    expect(description).not.toContain('Prior /mnt/data files');
+    expect(description).not.toContain('Anything a later call needs');
   });
 });

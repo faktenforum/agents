@@ -13,6 +13,7 @@ export default defineConfig([globalIgnores([
     "**/*.mjs",
     "src/proto/",
     "src/scripts/",
+    "test/stubs/",
     "types/**/*",
     "./script_docs.ts",
     "**/*.spec.ts",
@@ -35,7 +36,7 @@ export default defineConfig([globalIgnores([
         sourceType: "module",
 
         parserOptions: {
-            project: ["./tsconfig.json", "./scripts/tsconfig.json"],
+            project: ["./tsconfig.json", "./scripts/tsconfig.json", "./test/tsconfig.json"],
         },
     },
 

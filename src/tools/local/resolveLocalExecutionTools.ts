@@ -1,13 +1,14 @@
 import type * as t from '@/types';
 import {
-  createLocalBashProgrammaticToolCallingTool,
-  createLocalProgrammaticToolCallingTool,
-} from './LocalProgrammaticToolCalling';
-import {
+  CLOUDFLARE_CODING_TOOL_NAMES,
   createCloudflareCodingToolBundle,
   createCloudflareCodingTools,
   createCloudflareExecutionTool,
 } from '@/tools/cloudflare';
+import {
+  createLocalBashProgrammaticToolCallingTool,
+  createLocalProgrammaticToolCallingTool,
+} from './LocalProgrammaticToolCalling';
 import {
   createLocalCodingToolBundle,
   createLocalCodingToolDefinitions,
@@ -18,6 +19,10 @@ import {
   createLocalCodeExecutionTool,
 } from './LocalExecutionTools';
 import {
+  allowsToolCaller,
+  isToolDefinitionActive,
+} from '@/tools/CallerCapabilities';
+import {
   Constants,
   CODE_EXECUTION_TOOLS,
   LOCAL_CODING_BUNDLE_NAMES,
@@ -26,6 +31,8 @@ import {
 type ResolveLocalToolsResult = {
   toolMap: t.ToolMap;
   directToolNames: Set<string>;
+  /** Names whose toolMap entries were created or replaced by this resolver. */
+  localImplementationNames: Set<string>;
   /**
    * Set when `local.fileCheckpointing === true` AND the auto-bind
    * coding suite is in use. ToolNode stashes this on the node and
@@ -58,6 +65,51 @@ function shouldIncludeCodingTools(config?: t.ToolExecutionConfig): boolean {
   );
 }
 
+export function isProgrammaticRunnerAutoBound(
+  name: string,
+  config?: t.ToolExecutionConfig
+): boolean {
+  if (
+    !shouldIncludeCodingTools(config) ||
+    (name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+      name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
+  ) {
+    return false;
+  }
+  if (shouldUseCloudflareSandboxExecution(config)) {
+    return getSelectedCloudflareCodingToolNames(
+      getCloudflareConfig(config)
+    ).has(name);
+  }
+  return (
+    shouldUseLocalExecution(config) &&
+    (getSelectedLocalCodingToolNames(config?.local ?? {})?.has(name) ?? true)
+  );
+}
+
+/** Mirrors whether resolver policy creates or replaces this runner locally. */
+export function isProgrammaticRunnerResolvedDirectly(
+  name: string,
+  config?: t.ToolExecutionConfig,
+  hasExplicitBinding: boolean = false
+): boolean {
+  if (isProgrammaticRunnerAutoBound(name, config)) {
+    return true;
+  }
+  if (
+    !hasExplicitBinding ||
+    (name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+      name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
+  ) {
+    return false;
+  }
+  return (
+    (shouldUseLocalExecution(config) ||
+      shouldUseCloudflareSandboxExecution(config)) &&
+    !shouldIncludeCodingTools(config)
+  );
+}
+
 function getCloudflareConfig(
   config?: t.ToolExecutionConfig
 ): t.CloudflareSandboxExecutionConfig {
@@ -72,7 +124,25 @@ function getCloudflareConfig(
 function getSelectedCloudflareCodingToolNames(
   config: t.CloudflareSandboxExecutionConfig
 ): Set<string> {
-  return new Set(config.codingToolNames ?? LOCAL_CODING_BUNDLE_NAMES);
+  const requestedNames = new Set(
+    config.codingToolNames ?? CLOUDFLARE_CODING_TOOL_NAMES
+  );
+  return new Set(
+    CLOUDFLARE_CODING_TOOL_NAMES.filter((name) => requestedNames.has(name))
+  );
+}
+
+/** The local coding tools selected by `local.codingToolNames`, or `undefined` for the whole suite. */
+function getSelectedLocalCodingToolNames(
+  config: t.LocalExecutionConfig
+): Set<string> | undefined {
+  if (config.codingToolNames == null) {
+    return undefined;
+  }
+  const requestedNames = new Set(config.codingToolNames);
+  return new Set(
+    LOCAL_CODING_BUNDLE_NAMES.filter((name) => requestedNames.has(name))
+  );
 }
 
 function filterCloudflareCodingToolAllowlist(
@@ -83,15 +153,59 @@ function filterCloudflareCodingToolAllowlist(
   if (existingTools.length === 0) {
     return tools;
   }
-  return existingTools.filter((existingTool) => {
-    if (!('name' in existingTool) || typeof existingTool.name !== 'string') {
-      return true;
+  const keeps = (name: string | undefined): boolean =>
+    name == null ||
+    !LOCAL_CODING_BUNDLE_NAMES.includes(name) ||
+    selectedNames.has(name);
+  const filtered: unknown[] = [];
+  for (const existingTool of existingTools as unknown[]) {
+    const declarations = functionDeclarationsOf(existingTool);
+    if (declarations == null) {
+      if (keeps(bindableToolName(existingTool))) filtered.push(existingTool);
+      continue;
     }
-    return (
-      !LOCAL_CODING_BUNDLE_NAMES.includes(existingTool.name) ||
-      selectedNames.has(existingTool.name)
+    // Google tool objects group several functions; keep the allowed ones.
+    const kept = declarations.filter((declaration) =>
+      keeps(bindableToolName(declaration))
     );
-  });
+    if (kept.length === declarations.length) {
+      filtered.push(existingTool);
+    } else if (kept.length > 0) {
+      filtered.push({
+        ...(existingTool as object),
+        functionDeclarations: kept,
+      });
+    }
+  }
+  return filtered as t.GraphTools;
+}
+
+/**
+ * Name of a bindable tool in any supported shape: `{ name }`, OpenAI's
+ * `{ function: { name } }` or Bedrock's `{ toolSpec: { name } }`.
+ */
+function bindableToolName(tool: unknown): string | undefined {
+  if (tool == null || typeof tool !== 'object') return undefined;
+  const {
+    name,
+    function: fn,
+    toolSpec,
+  } = tool as {
+    name?: unknown;
+    function?: { name?: unknown };
+    toolSpec?: { name?: unknown };
+  };
+  if (typeof name === 'string') return name;
+  if (typeof fn?.name === 'string') return fn.name;
+  return typeof toolSpec?.name === 'string' ? toolSpec.name : undefined;
+}
+
+/** The `functionDeclarations` of a Google tool object, if it is one. */
+function functionDeclarationsOf(tool: unknown): unknown[] | undefined {
+  if (tool == null || typeof tool !== 'object') return undefined;
+  const declarations = (tool as { functionDeclarations?: unknown })
+    .functionDeclarations;
+  return Array.isArray(declarations) ? declarations : undefined;
 }
 
 function pruneCloudflareCodingToolAllowlist(
@@ -150,9 +264,43 @@ function mergeToolsByName(
   return orderedTools;
 }
 
+function filterToolsForDirectCaller(
+  tools: t.GraphTools | undefined,
+  toolRegistry?: t.LCToolRegistry,
+  discoveredToolNames: ReadonlySet<string> = new Set()
+): t.GraphTools | undefined {
+  if (tools == null || toolRegistry == null) {
+    return tools;
+  }
+  return tools.filter((tool) => {
+    if (!('name' in tool) || typeof tool.name !== 'string') {
+      return true;
+    }
+    const toolDef = toolRegistry.get(tool.name);
+    return (
+      toolDef == null ||
+      (allowsToolCaller(toolDef, 'direct') &&
+        isToolDefinitionActive(toolDef, discoveredToolNames))
+    );
+  });
+}
+
+function addDirectToolName(
+  directToolNames: Set<string>,
+  name: string,
+  toolRegistry?: t.LCToolRegistry
+): void {
+  const toolDef = toolRegistry?.get(name);
+  if (toolDef == null || allowsToolCaller(toolDef, 'direct')) {
+    directToolNames.add(name);
+  }
+}
+
 export function resolveLocalToolsForBinding(args: {
   tools?: t.GraphTools;
   toolExecution?: t.ToolExecutionConfig;
+  toolRegistry?: t.LCToolRegistry;
+  discoveredToolNames?: ReadonlySet<string>;
 }): t.GraphTools | undefined {
   if (
     !shouldUseLocalExecution(args.toolExecution) &&
@@ -166,9 +314,13 @@ export function resolveLocalToolsForBinding(args: {
     if (shouldIncludeCodingTools(args.toolExecution)) {
       const selectedNames =
         getSelectedCloudflareCodingToolNames(cloudflareConfig);
-      return mergeToolsByName(
-        filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
-        createCloudflareCodingTools(cloudflareConfig)
+      return filterToolsForDirectCaller(
+        mergeToolsByName(
+          filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
+          createCloudflareCodingTools(cloudflareConfig)
+        ),
+        args.toolRegistry,
+        args.discoveredToolNames
       );
     }
 
@@ -187,14 +339,30 @@ export function resolveLocalToolsForBinding(args: {
           cloudflareTool != null
       );
 
-    return replacements.length === 0
-      ? args.tools
-      : mergeToolsByName(args.tools, replacements);
+    const resolvedTools =
+      replacements.length === 0
+        ? args.tools
+        : mergeToolsByName(args.tools, replacements);
+    return filterToolsForDirectCaller(
+      resolvedTools,
+      args.toolRegistry,
+      args.discoveredToolNames
+    );
   }
 
   const localConfig = args.toolExecution?.local ?? {};
   if (shouldIncludeCodingTools(args.toolExecution)) {
-    return mergeToolsByName(args.tools, createLocalCodingTools(localConfig));
+    const selectedNames = getSelectedLocalCodingToolNames(localConfig);
+    return filterToolsForDirectCaller(
+      mergeToolsByName(
+        selectedNames == null
+          ? args.tools
+          : filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
+        createLocalCodingTools(localConfig)
+      ),
+      args.toolRegistry,
+      args.discoveredToolNames
+    );
   }
 
   const replacements = ((args.tools as t.GenericTool[] | undefined) ?? [])
@@ -209,9 +377,15 @@ export function resolveLocalToolsForBinding(args: {
     )
     .filter((localTool): localTool is t.GenericTool => localTool != null);
 
-  return replacements.length === 0
-    ? args.tools
-    : mergeToolsByName(args.tools, replacements);
+  const resolvedTools =
+    replacements.length === 0
+      ? args.tools
+      : mergeToolsByName(args.tools, replacements);
+  return filterToolsForDirectCaller(
+    resolvedTools,
+    args.toolRegistry,
+    args.discoveredToolNames
+  );
 }
 
 export function resolveLocalToolRegistry(args: {
@@ -228,19 +402,104 @@ export function resolveLocalToolRegistry(args: {
       getCloudflareConfig(args.toolExecution)
     )
     : undefined;
+  const localSelected =
+    selectedNames == null
+      ? getSelectedLocalCodingToolNames(args.toolExecution?.local ?? {})
+      : undefined;
+
+  if (selectedNames != null) {
+    const callableInsideCloudflare = new Set(selectedNames);
+    callableInsideCloudflare.delete(Constants.PROGRAMMATIC_TOOL_CALLING);
+    callableInsideCloudflare.delete(Constants.BASH_PROGRAMMATIC_TOOL_CALLING);
+    for (const [name, definition] of registry) {
+      if (callableInsideCloudflare.has(name)) {
+        continue;
+      }
+      const allowedCallers = definition.allowed_callers ?? ['direct'];
+      if (allowedCallers.includes('code_execution')) {
+        registry.set(name, {
+          ...definition,
+          allowed_callers: allowedCallers.filter(
+            (caller) => caller !== 'code_execution'
+          ),
+        });
+      }
+    }
+  }
+
+  if (localSelected != null) {
+    for (const name of LOCAL_CODING_BUNDLE_NAMES) {
+      if (!localSelected.has(name)) registry.delete(name);
+    }
+  }
+
   for (const definition of createLocalCodingToolDefinitions()) {
-    if (selectedNames != null && !selectedNames.has(definition.name)) {
+    const keep = selectedNames ?? localSelected;
+    if (keep != null && !keep.has(definition.name)) {
       registry.delete(definition.name);
       continue;
     }
-    registry.set(definition.name, definition);
+    const existingDefinition = registry.get(definition.name);
+    registry.set(
+      definition.name,
+      existingDefinition == null
+        ? definition
+        : { ...definition, ...existingDefinition }
+    );
   }
   return registry;
+}
+
+/**
+ * Drops host-bound coding tools outside `local.codingToolNames`, so prompt
+ * projections (instruction tokens, runner guidance) see the same tools that
+ * are finally bound. Returns `tools` unchanged when no local allowlist applies.
+ */
+export function filterToolsByLocalAllowlist(
+  tools: t.GraphTools | undefined,
+  toolExecution?: t.ToolExecutionConfig
+): t.GraphTools | undefined {
+  if (
+    !shouldUseLocalExecution(toolExecution) ||
+    !shouldIncludeCodingTools(toolExecution)
+  ) {
+    return tools;
+  }
+  const selectedNames = getSelectedLocalCodingToolNames(
+    toolExecution?.local ?? {}
+  );
+  return selectedNames == null
+    ? tools
+    : filterCloudflareCodingToolAllowlist(tools, selectedNames);
+}
+
+/** Names that this execution config creates or replaces in the local tool map. */
+export function resolveLocalImplementationNames(
+  toolNames: Iterable<string>,
+  toolExecution?: t.ToolExecutionConfig
+): Set<string> {
+  if (
+    !shouldUseLocalExecution(toolExecution) &&
+    !shouldUseCloudflareSandboxExecution(toolExecution)
+  ) {
+    return new Set();
+  }
+  if (shouldIncludeCodingTools(toolExecution)) {
+    return shouldUseCloudflareSandboxExecution(toolExecution)
+      ? getSelectedCloudflareCodingToolNames(getCloudflareConfig(toolExecution))
+      : (getSelectedLocalCodingToolNames(toolExecution?.local ?? {}) ??
+          new Set(LOCAL_CODING_BUNDLE_NAMES));
+  }
+  const existingNames = new Set(toolNames);
+  return new Set(
+    [...CODE_EXECUTION_TOOLS].filter((name) => existingNames.has(name))
+  );
 }
 
 export function resolveLocalExecutionTools(args: {
   toolMap: t.ToolMap;
   toolExecution?: t.ToolExecutionConfig;
+  toolRegistry?: t.LCToolRegistry;
   /**
    * Caller-provided checkpointer that overrides the bundle's
    * auto-created one. The Graph layer threads a single per-Run
@@ -252,6 +511,10 @@ export function resolveLocalExecutionTools(args: {
   fileCheckpointer?: t.LocalFileCheckpointer;
 }): ResolveLocalToolsResult {
   const directToolNames = new Set<string>();
+  const localImplementationNames = resolveLocalImplementationNames(
+    args.toolMap.keys(),
+    args.toolExecution
+  );
   if (
     !shouldUseLocalExecution(args.toolExecution) &&
     !shouldUseCloudflareSandboxExecution(args.toolExecution)
@@ -259,6 +522,7 @@ export function resolveLocalExecutionTools(args: {
     return {
       toolMap: args.toolMap,
       directToolNames,
+      localImplementationNames,
     };
   }
 
@@ -281,14 +545,24 @@ export function resolveLocalExecutionTools(args: {
         fileCheckpointer = bundle.checkpointer;
         for (const cloudflareTool of bundle.tools) {
           toolMap.set(cloudflareTool.name, cloudflareTool);
-          directToolNames.add(cloudflareTool.name);
+          localImplementationNames.add(cloudflareTool.name);
+          addDirectToolName(
+            directToolNames,
+            cloudflareTool.name,
+            args.toolRegistry
+          );
         }
       } else {
         for (const cloudflareTool of createCloudflareCodingTools(
           cloudflareConfig
         )) {
           toolMap.set(cloudflareTool.name, cloudflareTool);
-          directToolNames.add(cloudflareTool.name);
+          localImplementationNames.add(cloudflareTool.name);
+          addDirectToolName(
+            directToolNames,
+            cloudflareTool.name,
+            args.toolRegistry
+          );
         }
       }
     }
@@ -307,15 +581,25 @@ export function resolveLocalExecutionTools(args: {
       }
 
       toolMap.set(name, cloudflareTool);
-      directToolNames.add(name);
+      localImplementationNames.add(name);
+      addDirectToolName(directToolNames, name, args.toolRegistry);
     }
 
-    return { toolMap, directToolNames, fileCheckpointer };
+    return {
+      toolMap,
+      directToolNames,
+      localImplementationNames,
+      fileCheckpointer,
+    };
   }
 
   const localConfig = args.toolExecution?.local ?? {};
 
   if (shouldIncludeCodingTools(args.toolExecution)) {
+    const selectedNames = getSelectedLocalCodingToolNames(localConfig);
+    if (selectedNames != null) {
+      pruneCloudflareCodingToolAllowlist(toolMap, selectedNames);
+    }
     // Use the bundle factory when fileCheckpointing is on so we can
     // surface the checkpointer back to the caller — without this, the
     // execution-path tools each captured into a checkpointer that was
@@ -332,12 +616,14 @@ export function resolveLocalExecutionTools(args: {
       fileCheckpointer = bundle.checkpointer;
       for (const localTool of bundle.tools) {
         toolMap.set(localTool.name, localTool);
-        directToolNames.add(localTool.name);
+        localImplementationNames.add(localTool.name);
+        addDirectToolName(directToolNames, localTool.name, args.toolRegistry);
       }
     } else {
       for (const localTool of createLocalCodingTools(localConfig)) {
         toolMap.set(localTool.name, localTool);
-        directToolNames.add(localTool.name);
+        localImplementationNames.add(localTool.name);
+        addDirectToolName(directToolNames, localTool.name, args.toolRegistry);
       }
     }
   }
@@ -363,8 +649,14 @@ export function resolveLocalExecutionTools(args: {
     }
 
     toolMap.set(name, localTool);
-    directToolNames.add(name);
+    localImplementationNames.add(name);
+    addDirectToolName(directToolNames, name, args.toolRegistry);
   }
 
-  return { toolMap, directToolNames, fileCheckpointer };
+  return {
+    toolMap,
+    directToolNames,
+    localImplementationNames,
+    fileCheckpointer,
+  };
 }

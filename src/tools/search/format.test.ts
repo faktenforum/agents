@@ -13,7 +13,10 @@ const makeOrganic = (
 
 const highlight = (text: string, score = 0.9): t.Highlight => ({ text, score });
 
-const reference = (url: string, originalIndex = 0): t.UsedReferences[number] => ({
+const reference = (
+  url: string,
+  originalIndex = 0
+): t.UsedReferences[number] => ({
   type: 'link',
   originalIndex,
   reference: { originalUrl: url, title: 'Ref', text: 'ref' },
@@ -73,7 +76,9 @@ describe('formatResultsForLLM highlight budget', () => {
     expect(output).toContain('A'.repeat(100));
     expect(output).not.toContain('B'.repeat(100));
     expect(countHighlightBlocks(output)).toBe(1);
-    expect(output).toContain('_[1 additional highlight omitted to fit the context budget');
+    expect(output).toContain(
+      '_[1 additional highlight omitted to fit the context budget'
+    );
   });
 
   test('truncates the boundary highlight when meaningful room remains', () => {
@@ -86,7 +91,9 @@ describe('formatResultsForLLM highlight budget', () => {
     expect(output).toContain('…[truncated]');
     expect(output).toContain('A'.repeat(500));
     expect(output).not.toContain('A'.repeat(501));
-    expect(output).toContain('_[1 additional highlight omitted to fit the context budget');
+    expect(output).toContain(
+      '_[1 additional highlight omitted to fit the context budget'
+    );
   });
 
   test('drops the boundary highlight entirely when too little room remains', () => {
@@ -116,7 +123,9 @@ describe('formatResultsForLLM highlight budget', () => {
     expect(output).toContain('Summary: Snippet for https://a.com');
     expect(output).toContain('"Title for https://a.com"');
     expect(countHighlightBlocks(output)).toBe(0);
-    expect(output).toContain('_[1 additional highlight omitted to fit the context budget');
+    expect(output).toContain(
+      '_[1 additional highlight omitted to fit the context budget'
+    );
   });
 
   test('emits no omission marker when every highlight fits the budget', () => {
@@ -237,6 +246,51 @@ describe('formatResultsForLLM highlight budget', () => {
 
     expect(output).toContain('A'.repeat(100));
     expect(output).not.toContain('N'.repeat(100));
-    expect(output).toContain('_[1 additional highlight omitted to fit the context budget');
+    expect(output).toContain(
+      '_[1 additional highlight omitted to fit the context budget'
+    );
+  });
+});
+
+describe('formatResultsForLLM on a failed search', () => {
+  test.each([null, undefined])('handles %p result data', (results) => {
+    expect(formatResultsForLLM(0, results).output).toBe(
+      'Search failed: Search provider returned no result data'
+    );
+  });
+
+  test('tells the model the search failed instead of returning an empty output', () => {
+    const results: t.SearchResultData = {
+      organic: [],
+      topStories: [],
+      images: [],
+      videos: [],
+      news: [],
+      relatedSearches: [],
+      error: 'search provider request failed',
+    };
+
+    const { output, references } = formatResultsForLLM(0, results, 50000);
+
+    expect(output).toBe('Search failed: search provider request failed');
+    expect(references).toEqual([]);
+  });
+
+  test('keeps any partial results after the failure notice', () => {
+    const results: t.SearchResultData = {
+      organic: [makeOrganic('https://a.com', [highlight('A')])],
+      error: 'news lookup failed',
+    };
+
+    const { output } = formatResultsForLLM(0, results, 50000);
+
+    expect(output).toMatch(/^Search failed: news lookup failed/);
+    expect(output).toContain('=== Web Results, Turn 0 ===');
+  });
+
+  test('ignores an empty-string error', () => {
+    const results: t.SearchResultData = { organic: [], error: '' };
+
+    expect(formatResultsForLLM(0, results, 50000).output).toBe('');
   });
 });

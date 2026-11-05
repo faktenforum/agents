@@ -29,7 +29,9 @@ import type {
   MessageContentReasoningBlock,
 } from '../types';
 import { serializeStructuredValueBounded } from '@/utils/toolContent';
+import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { neutralizeHarmonyRequest } from './harmony';
 
 /**
  * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
@@ -37,13 +39,6 @@ import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
  * signatures Bedrock cannot validate, so they are dropped on a cross-provider
  * handoff (e.g. Anthropic → Bedrock) rather than crashing the conversion.
  */
-const FOREIGN_REASONING_TYPES = [
-  'thinking',
-  'redacted_thinking',
-  'reasoning',
-  'think',
-];
-
 /**
  * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
  * URL context or Google Search). Only Google can execute these and validate
@@ -58,6 +53,15 @@ const FOREIGN_SERVER_TOOL_TYPES = ['toolCall', 'toolResponse'];
  * also has no tool calls, fall back to this placeholder text.
  */
 const BEDROCK_EMPTY_TEXT_PLACEHOLDER = '_';
+/**
+ * Whether a converted user message carries top-level text and document blocks, recorded
+ * during its single conversion pass and OR-ed through merging so finalization never
+ * rescans content.
+ */
+const userGroupShape = new WeakMap<
+  BedrockMessage,
+  { hasText: boolean; hasDocument: boolean }
+>();
 
 /**
  * Convert a LangChain reasoning block to a Bedrock reasoning block.
@@ -711,13 +715,16 @@ function coerceBedrockToolUseInput(input: unknown): Record<string, unknown> {
     : {};
 }
 
-function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
+function convertAIMessageToConverseMessage(
+  msg: BaseMessage,
+  replayReasoning = true
+): BedrockMessage {
   // Check for v1 format from other providers (PR #9766 fix)
   const responseMetadata = msg.response_metadata as
     | { output_version?: string }
     | undefined;
   if (responseMetadata?.output_version === 'v1') {
-    return convertFromV1ToChatBedrockConverseMessage(msg);
+    return convertFromV1ToChatBedrockConverseMessage(msg, replayReasoning);
   }
 
   const assistantMsg: BedrockMessage = {
@@ -730,9 +737,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   } else if (Array.isArray(msg.content)) {
     const parsedToolCallIds = new Set(
       isAIMessage(msg)
-        ? (msg.tool_calls ?? []).flatMap((toolCall) =>
-          toolCall.id != null ? [toolCall.id] : []
-        )
+        ? (msg.tool_calls ?? []).flatMap(({ id }) => id ?? [])
         : []
     );
     const concatenatedBlocks = concatenateLangchainReasoningBlocks(
@@ -772,10 +777,14 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         // Bedrock Converse rejects reasoningContent whose reasoningText.text is
-        // null/empty (a signature-only block that never merged with its text).
-        // Drop it rather than emit an invalid request; the empty-turn
-        // placeholder below covers a turn left with no content.
-        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+        // null/empty (a signature-only block that never merged with its text),
+        // and OpenAI models reject reasoningContent outright. Drop
+        // it rather than emit an invalid request; the empty-turn placeholder
+        // below covers a turn left with no content.
+        if (
+          !replayReasoning ||
+          !isSerializableBedrockReasoningBlock(reasoningBlock)
+        ) {
           return;
         }
         contentBlocks.push({
@@ -788,7 +797,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           contentBlocks.push({
             cachePoint,
           } as BedrockContentBlock);
-        } else if (FOREIGN_REASONING_TYPES.some((t) => t === block.type)) {
+        } else if (isReasoningContentBlock(block)) {
           // Reasoning from another provider (Anthropic `thinking`/
           // `redacted_thinking`, Google `reasoning`, LibreChat `think`).
           // Bedrock's native reasoning is `reasoning_content` (handled above); a
@@ -853,7 +862,8 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
  * (Implements PR #9766 fix for output_version v1 detection)
  */
 function convertFromV1ToChatBedrockConverseMessage(
-  msg: BaseMessage
+  msg: BaseMessage,
+  replayReasoning = true
 ): BedrockMessage {
   const contentBlocks: BedrockContentBlock[] = [];
   const assistantMsg: BedrockMessage = {
@@ -895,7 +905,11 @@ function convertFromV1ToChatBedrockConverseMessage(
         /** Bedrock Converse rejects `reasoningText` with a null/empty `text`
          * (`Member must not be null`), e.g. when the producing model omitted
          * reasoning text (`thinking.display: "omitted"`) — drop rather than send. */
-        if (reasoning.reasoning == null || reasoning.reasoning === '') {
+        if (
+          !replayReasoning ||
+          reasoning.reasoning == null ||
+          reasoning.reasoning === ''
+        ) {
           droppedUnserializableContent = true;
           continue;
         }
@@ -906,7 +920,10 @@ function convertFromV1ToChatBedrockConverseMessage(
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
-        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+        if (
+          !replayReasoning ||
+          !isSerializableBedrockReasoningBlock(reasoningBlock)
+        ) {
           droppedUnserializableContent = true;
           continue;
         }
@@ -965,20 +982,72 @@ function convertFromV1ToChatBedrockConverseMessage(
 function convertHumanMessageToConverseMessage(
   msg: BaseMessage
 ): BedrockMessage {
-  const userMessage: BedrockMessage = {
-    role: 'user',
-    content: [],
+  const contentBlocks: BedrockContentBlock[] = [];
+  let hasText = false;
+  let hasDocument = false;
+  // Whitespace with nothing before it to fold into is held until the next text fragment,
+  // so `[' ', 'hello']` and `[image, ' ', 'hello']` keep their leading space instead of
+  // losing it; whitespace left over at the end has nothing to attach to and is dropped.
+  let pendingWhitespace = '';
+  const appendText = (text: string): void => {
+    const candidate = pendingWhitespace + text;
+    if (appendSerializableBedrockTextBlock(contentBlocks, candidate)) {
+      hasText = true;
+      pendingWhitespace = '';
+      return;
+    }
+    pendingWhitespace = candidate;
   };
 
   if (typeof msg.content === 'string') {
-    userMessage.content = [{ text: msg.content }];
+    appendText(msg.content);
   } else if (Array.isArray(msg.content)) {
-    userMessage.content = msg.content.map((block) =>
-      convertLangChainContentBlockToConverseContentBlock({ block })
-    );
+    for (const block of msg.content) {
+      if (
+        block.type === 'text' &&
+        typeof (block as { text?: unknown }).text === 'string'
+      ) {
+        appendText((block as { text: string }).text);
+        continue;
+      }
+      const converted = convertLangChainContentBlockToConverseContentBlock({
+        block,
+      });
+      if ('document' in converted) {
+        hasDocument = true;
+      }
+      contentBlocks.push(converted);
+    }
   }
 
-  return userMessage;
+  const message: BedrockMessage = { role: 'user', content: contentBlocks };
+  userGroupShape.set(message, { hasText, hasDocument });
+  return message;
+}
+
+/**
+ * Bedrock rejects an empty user message just as it rejects a blank text block
+ * (`The text field in the ContentBlock object at messages.N.content.0 is blank`), and the
+ * rejection fences the whole conversation on every retry. A promptless send — attachment, no
+ * typed text — serializes to exactly that. Applied only once a user group is complete: an
+ * empty human turn adjacent to a tool result merges into it below, and a per-message
+ * placeholder would inject a synthetic `_` into an otherwise valid message.
+ */
+function finalizeUserMessage(message: BedrockMessage): void {
+  if (message.role !== 'user') {
+    return;
+  }
+  if (message.content == null || message.content.length === 0) {
+    message.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
+    return;
+  }
+  // Converse also requires a text block in any message that carries a document block. A
+  // promptless document upload arrives as blank text plus the document; the blank is
+  // dropped during conversion, so supply the placeholder if no text survived.
+  const shape = userGroupShape.get(message);
+  if (shape != null && shape.hasDocument && !shape.hasText) {
+    message.content.push({ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER });
+  }
 }
 
 /**
@@ -1063,13 +1132,60 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   };
 }
 
+/** Options for {@link convertToConverseMessages}. */
+export interface ConvertToConverseMessagesOptions {
+  /**
+   * The model the request is for, which decides whether prior reasoning is replayed and
+   * whether harmony control tokens in text are neutralized.
+   */
+  model?: string;
+}
+
+/**
+ * Whether the model is an identified OpenAI model on Bedrock (`openai.*`, a geo/global
+ * inference profile such as `global.openai.*`, or an ARN naming one). Missing model IDs and
+ * opaque resource ARNs are not identified.
+ */
+export function isBedrockOpenAIModel(model?: string): boolean {
+  if (model == null || model === '') {
+    return false;
+  }
+  let id = model.toLowerCase();
+  if (id.startsWith('arn:')) {
+    const modelId =
+      /^arn:[^:]+:bedrock:[^:]*:[^:]*:(?:foundation-model|inference-profile)\/(.+)$/.exec(
+        id
+      )?.[1];
+    if (modelId == null) {
+      return false;
+    }
+    id = modelId;
+  }
+  return /(?:^|\.)openai\./.test(id);
+}
+
+/**
+ * OpenAI Bedrock models reject prior `reasoningContent`, including on Claude-to-GPT handoffs.
+ * Only suppress replay for identified OpenAI targets; other model families retain the existing
+ * behavior because their Bedrock reasoning-replay requirements have not been verified here.
+ * Missing model IDs and opaque resource ARNs also retain the existing behavior.
+ */
+export function replaysBedrockReasoning(model?: string): boolean {
+  return !isBedrockOpenAIModel(model);
+}
+
 /**
  * Convert LangChain messages to Bedrock Converse messages.
  */
-export function convertToConverseMessages(messages: BaseMessage[]): {
+export function convertToConverseMessages(
+  messages: BaseMessage[],
+  options: ConvertToConverseMessagesOptions = {}
+): {
   converseMessages: BedrockMessage[];
   converseSystem: BedrockSystemContentBlock[];
 } {
+  const openAITarget = isBedrockOpenAIModel(options.model);
+  const replayReasoning = !openAITarget;
   const converseSystem = messages
     .filter((msg) => msg._getType() === 'system')
     .flatMap((msg) => convertSystemMessageToConverseMessage(msg));
@@ -1078,7 +1194,7 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
     .filter((msg) => msg._getType() !== 'system')
     .map((msg) => {
       if (msg._getType() === 'ai') {
-        return convertAIMessageToConverseMessage(msg);
+        return convertAIMessageToConverseMessage(msg, replayReasoning);
       } else if (msg._getType() === 'human' || msg._getType() === 'generic') {
         return convertHumanMessageToConverseMessage(msg);
       } else if (msg._getType() === 'tool') {
@@ -1110,13 +1226,39 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
       const lastMessage = acc[acc.length - 1];
       if (lastMessage.role === 'user' && curr.role === 'user') {
         lastMessage.content = lastMessage.content?.concat(curr.content ?? []);
+        const lastShape = userGroupShape.get(lastMessage);
+        const nextShape = userGroupShape.get(curr);
+        if (lastShape != null || nextShape != null) {
+          userGroupShape.set(lastMessage, {
+            hasText:
+              (lastShape?.hasText ?? false) || (nextShape?.hasText ?? false),
+            hasDocument:
+              (lastShape?.hasDocument ?? false) ||
+              (nextShape?.hasDocument ?? false),
+          });
+        }
       } else {
+        finalizeUserMessage(lastMessage);
         acc.push(curr);
       }
       return acc;
     },
     []
   );
+  if (combinedConverseMessages.length > 0) {
+    finalizeUserMessage(
+      combinedConverseMessages[combinedConverseMessages.length - 1]
+    );
+  }
 
-  return { converseMessages: combinedConverseMessages, converseSystem };
+  if (!openAITarget) {
+    return { converseMessages: combinedConverseMessages, converseSystem };
+  }
+  return {
+    converseMessages: combinedConverseMessages,
+    converseSystem: neutralizeHarmonyRequest(
+      combinedConverseMessages,
+      converseSystem
+    ),
+  };
 }

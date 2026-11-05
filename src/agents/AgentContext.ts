@@ -1,15 +1,32 @@
 /* eslint-disable no-console */
 import { RunnableLambda } from '@langchain/core/runnables';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import {
+  HumanMessage,
+  SystemMessage,
+  coerceMessageLikeToMessage,
+} from '@langchain/core/messages';
 import type {
   UsageMetadata,
   BaseMessage,
   BaseMessageFields,
+  BaseMessageLike,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
+import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
 import type * as t from '@/types';
 import {
+  type CallerCapabilityProjection,
+  allowsToolCaller,
+  applyCallerCapabilityDefinitionOverrides,
+  createCallerCapabilityProjectionSnapshot,
+  isToolDefinitionActive,
+  isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
+import {
   addTailCacheControl,
+  stripAnthropicCacheControl,
   addCacheControlToStablePrefixMessages,
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
@@ -18,6 +35,13 @@ import {
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
+import {
+  isProgrammaticRunnerAutoBound,
+  isProgrammaticRunnerResolvedDirectly,
+  filterToolsByLocalAllowlist,
+  resolveLocalImplementationNames,
+  resolveLocalToolRegistry,
+} from '@/tools/local/resolveLocalExecutionTools';
 import {
   DEFAULT_RESERVE_RATIO,
   ORIGINAL_CONTENT_MAX_CHARS,
@@ -32,6 +56,11 @@ import {
   Constants,
   Providers,
 } from '@/common';
+import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { markProviderTextInput } from '@/protection/providerTextInput';
+import { buildSummaryCarrierText } from '@/summarization/shared';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -49,6 +78,20 @@ type AgentSystemContentBlock =
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 
+type ProgrammaticToolInstructionTarget = {
+  name: string;
+  codeGuidance: string;
+  executesDirectly: boolean;
+};
+
+/**
+ * Consecutive summarization attempts that may return no usable summary before
+ * the run stops asking. Every such attempt spends a full model call over the
+ * whole history and leaves the message set exactly as it was, so the cap
+ * bounds spend as much as it bounds the compaction loop.
+ */
+const MAX_SUMMARIZATION_FAILURES = 3;
+
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
@@ -59,10 +102,13 @@ export class AgentContext {
   static fromConfig(
     agentConfig: t.AgentInputs,
     tokenCounter?: t.TokenCounter,
-    indexTokenCountMap?: Record<string, number>
+    indexTokenCountMap?: Record<string, number>,
+    toolExecution?: t.ToolExecutionConfig
   ): AgentContext {
     const {
       agentId,
+      endpoint,
+      codeSessionKey,
       name,
       provider,
       clientOptions,
@@ -81,7 +127,9 @@ export class AgentContext {
       vision,
       discoveredTools,
       summarizationEnabled,
+      summarizeOnly,
       summarizationConfig,
+      compactionSemanticIndex,
       initialSummary,
       contextPruningConfig,
       maxToolResultChars,
@@ -93,6 +141,8 @@ export class AgentContext {
 
     const agentContext = new AgentContext({
       agentId,
+      endpoint,
+      codeSessionKey,
       name: name ?? agentId,
       provider,
       clientOptions,
@@ -102,6 +152,7 @@ export class AgentContext {
       tools,
       toolMap,
       toolRegistry,
+      toolExecution,
       toolDefinitions,
       instructions,
       additionalInstructions: additional_instructions,
@@ -113,12 +164,20 @@ export class AgentContext {
       vision,
       discoveredTools,
       summarizationEnabled,
+      summarizeOnly,
       summarizationConfig,
+      compactionSemanticIndex,
       contextPruningConfig,
       maxToolResultChars,
     });
 
-    agentContext._sourceInputs = agentConfig;
+    agentContext._sourceInputs =
+      compactionSemanticIndex == null
+        ? agentConfig
+        : {
+          ...agentConfig,
+          compactionSemanticIndex: agentContext.compactionSemanticIndex,
+        };
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
     /**
@@ -127,7 +186,11 @@ export class AgentContext {
      * subagent) into this same array and must not mutate the host's input.
      */
     if (graphTools && graphTools.length > 0) {
-      agentContext.graphTools = [...graphTools];
+      agentContext.graphTools = [
+        ...((filterToolsByLocalAllowlist(graphTools, toolExecution) as
+          | t.GenericTool[]
+          | undefined) ?? []),
+      ] as t.GraphTools;
     }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
@@ -144,7 +207,28 @@ export class AgentContext {
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
 
-      if (toolSchemaTokens != null && toolSchemaTokens > 0) {
+      /** A cached total counts the host's unfiltered tools. Once the local
+       *  allowlist removed some, recount, but only when the recount can
+       *  measure every retained tool (it reads `.schema`); otherwise the
+       *  larger cached total is the safer budget. */
+      const allowlistRemovedTools =
+        (tools?.length ?? 0) !== (agentContext.tools?.length ?? 0) ||
+        (toolDefinitions?.length ?? 0) !==
+          (agentContext.toolDefinitions?.length ?? 0) ||
+        (graphTools?.length ?? 0) !== (agentContext.graphTools?.length ?? 0);
+      const recountMeasuresAll = [
+        ...((agentContext.tools as unknown[] | undefined) ?? []),
+        ...((agentContext.graphTools as unknown[] | undefined) ?? []),
+      ].every(
+        (tool) =>
+          tool != null &&
+          typeof (tool as { schema?: unknown }).schema === 'object'
+      );
+      if (
+        toolSchemaTokens != null &&
+        toolSchemaTokens > 0 &&
+        !(allowlistRemovedTools && recountMeasuresAll)
+      ) {
         /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
         agentContext.toolSchemaTokens = toolSchemaTokens;
         agentContext.tokenCalculationPromise = Promise.resolve();
@@ -169,10 +253,14 @@ export class AgentContext {
 
   /** Agent identifier */
   agentId: string;
+  /** Logical endpoint selected by the host before provider resolution. */
+  endpoint: string;
+  /** Partition for this agent's transient code session and file refs. */
+  codeSessionKey?: string;
   /** Human-readable name for this agent (used in handoff context). Falls back to agentId if not provided. */
   name?: string;
   /** Provider for this specific agent */
-  provider: Providers;
+  provider: t.ProviderName;
   /** Client options for this agent */
   clientOptions?: t.ClientOptions;
   /** Per-agent Langfuse tracing configuration. */
@@ -209,6 +297,8 @@ export class AgentContext {
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
   tokenCounter?: t.TokenCounter;
+  /** Exact stable-message counts reused by request-scoped context-pressure meters. */
+  readonly contextPressureTokenCounts?: ExactTokenCountCache;
   /** Token count for the system message (instructions text). */
   systemMessageTokens: number = 0;
   /** Token count for instruction text emitted outside the system message. */
@@ -222,10 +312,22 @@ export class AgentContext {
   deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
+  /** Latched context-fading tier from the pruner — persisted across runs via contextMeta. */
+  fadingTier?: t.FadingTier;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
   resolvedInstructionOverhead?: number;
   private _pendingOriginalToolContent?: Map<number, string>;
   private pendingOriginalToolContentChars = 0;
+  /** Provider-bound projection for this Run; graph messages remain canonical. */
+  private providerProjectedMessages?: BaseMessage[];
+  /** Canonical object identities corresponding to the projected slots. */
+  private providerProjectionSources?: BaseMessage[];
+  /** Canonical messages by ID, used to distinguish identity replay from replacement. */
+  private providerProjectionSourcesById?: Map<string, BaseMessage>;
+  /** Conservative counts retained by canonical identity across a rebuild. */
+  private providerProjectionRecountFloors?: WeakMap<BaseMessage, number>;
+  /** Recount after discarding a projection whose token map contains capped sizes. */
+  private providerProjectionRequiresRecount = false;
   /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
   get pendingOriginalToolContent(): Map<number, string> | undefined {
     return this._pendingOriginalToolContent;
@@ -267,6 +369,8 @@ export class AgentContext {
    * Used for tool search and programmatic tool calling.
    */
   toolRegistry?: t.LCToolRegistry;
+  /** Run-scoped backend used to identify auto-bound programmatic runners. */
+  private toolExecution?: t.ToolExecutionConfig;
   /**
    * Serializable tool definitions for event-driven execution.
    * When provided, ToolNode operates in event-driven mode.
@@ -311,8 +415,14 @@ export class AgentContext {
   useLegacyContent: boolean = false;
   /** Enables graph-level summarization for this agent */
   summarizationEnabled?: boolean;
+  /** Summarize-only run: request a summary on the first model step and end after it */
+  summarizeOnly?: boolean;
+  /** Whether the summarize-only run has already issued its one request */
+  private _manualSummarizationRequested: boolean = false;
   /** Summarization runtime settings used by graph pruning hooks */
   summarizationConfig?: t.SummarizationConfig;
+  /** Host-supplied advisory guidance consumed only when compaction runs. */
+  compactionSemanticIndex?: t.CompactionSemanticIndex;
   /** Current summary text produced by the summarize node, integrated into system message */
   private summaryText?: string;
   /** Token count of the current summary (tracked for token accounting) */
@@ -324,6 +434,8 @@ export class AgentContext {
    * - `'none'`: no summary present
    */
   private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
+  /** Whether a mid-run summary must appear before every retained message. */
+  private summaryPrecedesMessages: boolean = false;
   /**
    * Durable summary that survives reset() calls. Set from initialSummary
    * during fromConfig() and updated by setSummary() so that the latest
@@ -332,14 +444,24 @@ export class AgentContext {
    */
   private _durableSummaryText?: string;
   private _durableSummaryTokenCount: number = 0;
+  private durableSummaryPrecedesMessages: boolean = false;
   /** Number of summarization cycles that have occurred for this agent context */
   private _summaryVersion: number = 0;
+  /** Whether this run compacted canonical history and reset its fading tier. */
+  private _fadingTierReset: boolean = false;
   /**
    * Message count at the time summarization was last triggered.
    * Used to prevent re-summarizing the same unchanged message set.
    * Summarization is allowed to fire again only when new messages appear.
    */
   private _lastSummarizationMsgCount: number = 0;
+  /**
+   * Consecutive summarization attempts that produced no usable summary.
+   * An empty or failed summary leaves the message set exactly as it was, so
+   * the next prune cycle would ask again on identical state. Cleared by
+   * `setSummary` and by `reset()`.
+   */
+  private _summarizationFailures: number = 0;
   /**
    * Whether this agent supports vision capabilities (image processing).
    * Defaults to false if not explicitly set.
@@ -377,6 +499,8 @@ export class AgentContext {
 
   constructor({
     agentId,
+    endpoint,
+    codeSessionKey,
     name,
     provider,
     clientOptions,
@@ -387,6 +511,7 @@ export class AgentContext {
     tools,
     toolMap,
     toolRegistry,
+    toolExecution,
     toolDefinitions,
     instructions,
     additionalInstructions,
@@ -397,13 +522,17 @@ export class AgentContext {
     vision,
     discoveredTools,
     summarizationEnabled,
+    summarizeOnly,
     summarizationConfig,
+    compactionSemanticIndex,
     contextPruningConfig,
     maxToolResultChars,
   }: {
     agentId: string;
+    endpoint?: string;
+    codeSessionKey?: string;
     name?: string;
-    provider: Providers;
+    provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     langfuse?: t.LangfuseConfig;
     maxContextTokens?: number;
@@ -412,6 +541,7 @@ export class AgentContext {
     tools?: t.GraphTools;
     toolMap?: t.ToolMap;
     toolRegistry?: t.LCToolRegistry;
+    toolExecution?: t.ToolExecutionConfig;
     toolDefinitions?: t.LCTool[];
     instructions?: string;
     additionalInstructions?: string;
@@ -422,11 +552,15 @@ export class AgentContext {
     vision?: boolean;
     discoveredTools?: string[];
     summarizationEnabled?: boolean;
+    summarizeOnly?: boolean;
     summarizationConfig?: t.SummarizationConfig;
+    compactionSemanticIndex?: t.CompactionSemanticIndex;
     contextPruningConfig?: t.ContextPruningConfig;
     maxToolResultChars?: number;
   }) {
     this.agentId = agentId;
+    this.endpoint = endpoint ?? provider;
+    this.codeSessionKey = codeSessionKey;
     this.name = name;
     this.provider = provider;
     this.clientOptions = clientOptions;
@@ -434,10 +568,21 @@ export class AgentContext {
     this.maxContextTokens = maxContextTokens;
     this.streamBuffer = streamBuffer;
     this.tokenCounter = tokenCounter;
-    this.tools = tools;
+    this.contextPressureTokenCounts =
+      tokenCounter != null && isTokenCounterCacheCompatible(tokenCounter)
+        ? createExactTokenCountCache(tokenCounter)
+        : undefined;
+    this.tools = filterToolsByLocalAllowlist(tools, toolExecution);
     this.toolMap = toolMap;
-    this.toolRegistry = toolRegistry;
-    this.toolDefinitions = toolDefinitions;
+    this.toolRegistry = resolveLocalToolRegistry({
+      toolRegistry,
+      toolExecution,
+    });
+    this.toolExecution = toolExecution;
+    this.toolDefinitions = filterToolsByLocalAllowlist(
+      toolDefinitions as t.GraphTools | undefined,
+      toolExecution
+    ) as t.LCTool[] | undefined;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
     this.vision = vision;
@@ -453,7 +598,13 @@ export class AgentContext {
 
     this.useLegacyContent = useLegacyContent ?? false;
     this.summarizationEnabled = summarizationEnabled;
+    this.summarizeOnly = summarizeOnly;
     this.summarizationConfig = summarizationConfig;
+    if (compactionSemanticIndex != null) {
+      this.compactionSemanticIndex = snapshotCompactionSemanticIndex(
+        compactionSemanticIndex
+      );
+    }
     this.contextPruningConfig = contextPruningConfig;
     this.maxToolResultChars = maxToolResultChars;
 
@@ -464,37 +615,87 @@ export class AgentContext {
     }
   }
 
-  /**
-   * Builds instructions text for tools that are ONLY callable via programmatic code execution.
-   * These tools cannot be called directly by the LLM but are available through the
-   * configured programmatic tool.
-   *
-   * Includes:
-   * - Code_execution-only tools that are NOT deferred
-   * - Code_execution-only tools that ARE deferred but have been discovered via tool search
-   */
+  /** Builds the caller boundary and schemas for programmatic-only tools. */
   private buildProgrammaticOnlyToolsInstructions(): string {
-    if (!this.toolRegistry) return '';
+    const programmaticTools = this.getProgrammaticToolInstructionTargets();
+    if (programmaticTools.length === 0) return '';
+    const directProgrammaticTools = programmaticTools.filter(
+      (tool) => tool.executesDirectly
+    );
+    const eventProgrammaticTools = programmaticTools.filter(
+      (tool) => !tool.executesDirectly
+    );
+    const groups: Array<{
+      tools: ProgrammaticToolInstructionTarget[];
+      capabilities: CallerCapabilityProjection;
+      label: string;
+    }> = [];
+    if (directProgrammaticTools.length > 0) {
+      groups.push({
+        tools: directProgrammaticTools,
+        capabilities: this.getDirectProgrammaticCapabilityProjection(),
+        label: 'Direct programmatic runners',
+      });
+    }
+    if (eventProgrammaticTools.length > 0) {
+      groups.push({
+        tools: eventProgrammaticTools,
+        capabilities: this.getCallerCapabilityProjection(),
+        label: 'Event-dispatched programmatic runners',
+      });
+    }
+    if (groups.length === 0) {
+      return '';
+    }
+    const showGroupLabels = groups.length > 1;
+    return (
+      '\n\n## Programmatic Tool Calling' +
+      groups
+        .map(
+          ({ tools, capabilities, label }) =>
+            (showGroupLabels ? `\n\n### ${label}` : '') +
+            this.buildProgrammaticToolGroupInstructions(tools, capabilities)
+        )
+        .join('')
+    );
+  }
 
-    const programmaticOnlyTools: t.LCTool[] = [];
-    for (const [name, toolDef] of this.toolRegistry) {
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-      const isCodeExecutionOnly =
-        allowedCallers.includes('code_execution') &&
-        !allowedCallers.includes('direct');
+  private buildProgrammaticToolGroupInstructions(
+    programmaticTools: ProgrammaticToolInstructionTarget[],
+    capabilities: CallerCapabilityProjection
+  ): string {
+    const programmaticOnlyTools = capabilities.codeExecutionOnlyTools;
+    const programmaticToolNames = capabilities.codeExecutionTools.map(
+      (toolDef) => toolDef.name
+    );
+    const directOnlyToolNames = capabilities.directOnlyTools
+      .map((toolDef) => toolDef.name)
+      .filter((name) => !isProgrammaticControlTool(name));
 
-      if (!isCodeExecutionOnly) continue;
+    const programmaticRunnerNames = programmaticTools
+      .map((tool) => `\`${tool.name}\``)
+      .join(' or ');
+    const quotedProgrammaticNames =
+      programmaticToolNames.length > 0
+        ? programmaticToolNames.map((name) => `\`${name}\``).join(', ')
+        : 'none';
+    const directOnlyBoundary =
+      directOnlyToolNames.length > 0
+        ? `\nCall these tools directly; never list them in the \`tool_manifest\` or reference them inside ${programmaticRunnerNames}: ${directOnlyToolNames
+          .map((name) => `\`${name}\``)
+          .join(
+            ', '
+          )}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the exact registered names used by its code; the manifest is validated before execution starts.`
+        : '';
+    const boundary =
+      '\n\n' +
+      `Only these tools may be invoked inside ${programmaticRunnerNames}: ${quotedProgrammaticNames}.` +
+      directOnlyBoundary;
 
-      const isDeferred = toolDef.defer_loading === true;
-      const isDiscovered = this.discoveredToolNames.has(name);
-      if (!isDeferred || isDiscovered) {
-        programmaticOnlyTools.push(toolDef);
-      }
+    if (programmaticOnlyTools.length === 0) {
+      return boundary;
     }
 
-    if (programmaticOnlyTools.length === 0) return '';
-
-    const programmaticTool = this.getProgrammaticToolInstructionTarget();
     const toolDescriptions = programmaticOnlyTools
       .map((tool) => {
         let desc = `- **${tool.name}**`;
@@ -509,41 +710,124 @@ export class AgentContext {
       .join('\n\n');
 
     return (
-      '\n\n## Programmatic-Only Tools\n\n' +
-      `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
-      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.language} code that invokes them.\n\n` +
+      boundary +
+      '\n\n### Programmatic-Only Tools\n\n' +
+      `The following tools are available exclusively through ${programmaticRunnerNames}. ` +
+      `You cannot call these tools directly; instead, ${programmaticTools
+        .map(
+          (tool) =>
+            `use \`${tool.name}\` with ${tool.codeGuidance} that invokes them`
+        )
+        .join(', or ')}.\n\n` +
       toolDescriptions
     );
   }
 
-  private getProgrammaticToolInstructionTarget(): {
-    name: string;
-    language: 'bash' | 'Python';
-    } {
-    if (this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING)) {
-      return {
+  private getProgrammaticToolInstructionTargets(): ProgrammaticToolInstructionTarget[] {
+    const targets: ProgrammaticToolInstructionTarget[] = [];
+    if (
+      this.hasBoundTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
+      targets.push({
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
-        language: 'bash',
-      };
+        codeGuidance: 'Bash code',
+        executesDirectly: this.isProgrammaticRunnerDirectlyBound(
+          Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+        ),
+      });
     }
 
-    if (this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING)) {
-      return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
+    if (
+      this.hasBoundTool(Constants.PROGRAMMATIC_TOOL_CALLING) ||
+      isProgrammaticRunnerAutoBound(
+        Constants.PROGRAMMATIC_TOOL_CALLING,
+        this.toolExecution
+      )
+    ) {
+      const localDefault =
+        this.toolExecution?.engine === 'local' ||
+        this.toolExecution?.engine === 'cloudflare-sandbox';
+      targets.push({
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        codeGuidance: localDefault
+          ? 'Bash code by default, or set `lang: "py"` to use Python code'
+          : 'Python code',
+        executesDirectly: this.isProgrammaticRunnerDirectlyBound(
+          Constants.PROGRAMMATIC_TOOL_CALLING
+        ),
+      });
     }
 
-    return { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING, language: 'bash' };
+    return targets;
   }
 
-  private hasAvailableTool(name: string): boolean {
-    if (this.toolDefinitions?.some((tool) => tool.name === name) === true)
-      return true;
-    if (
-      this.tools?.some((tool) => 'name' in tool && tool.name === name) === true
-    ) {
-      return true;
+  /** Whether ToolNode executes this runner in-process instead of via an event. */
+  private isProgrammaticRunnerDirectlyBound(name: string): boolean {
+    return (
+      isProgrammaticRunnerResolvedDirectly(
+        name,
+        this.toolExecution,
+        this.toolDefinitions?.some((toolDef) => toolDef.name === name) === true
+      ) ||
+      this.graphTools?.some((tool) => 'name' in tool && tool.name === name) ===
+        true
+    );
+  }
+
+  /** Mirrors ToolNode's executable implementation gate for direct runners. */
+  private getDirectProgrammaticCapabilityProjection(): CallerCapabilityProjection {
+    const implementationNames = new Set<string>();
+    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
+    const resolverInputNames = new Set<string>();
+    if (isEventDriven) {
+      for (const toolDef of this.toolDefinitions ?? []) {
+        resolverInputNames.add(toolDef.name);
+      }
+    } else {
+      for (const tool of (this.tools as t.GenericTool[] | undefined) ?? []) {
+        if ('name' in tool && typeof tool.name === 'string') {
+          implementationNames.add(tool.name);
+          resolverInputNames.add(tool.name);
+        }
+      }
     }
-    if (this.toolMap?.has(name) === true) return true;
-    return this.toolRegistry?.has(name) === true;
+    for (const tool of (this.graphTools as t.GenericTool[] | undefined) ?? []) {
+      if ('name' in tool && typeof tool.name === 'string') {
+        implementationNames.add(tool.name);
+        resolverInputNames.add(tool.name);
+      }
+    }
+    for (const name of resolveLocalImplementationNames(
+      resolverInputNames,
+      this.toolExecution
+    )) {
+      implementationNames.add(name);
+    }
+    const activeCapabilities = this.getCallerCapabilityProjection();
+    const executableCapabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? [],
+      (toolDef) =>
+        implementationNames.has(toolDef.name) &&
+        isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    );
+    return {
+      directTools: activeCapabilities.directTools,
+      directOnlyTools: activeCapabilities.directOnlyTools,
+      codeExecutionTools: executableCapabilities.codeExecutionTools,
+      codeExecutionOnlyTools: executableCapabilities.codeExecutionOnlyTools,
+    };
+  }
+
+  private hasBoundTool(name: string): boolean {
+    return (
+      this.getToolsForBinding()?.some(
+        (tool) => 'name' in tool && tool.name === name
+      ) === true
+    );
   }
 
   /**
@@ -716,55 +1000,53 @@ export class AgentContext {
         : 0;
     }
 
-    return RunnableLambda.from((messages: BaseMessage[]) => {
-      const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
+    return markProviderTextInput(
+      RunnableLambda.from((messages: BaseMessage[]) => {
+        const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
 
-      // Build the non-system portion (summary + conversation), then apply
-      // cache markers separately so addCacheControl doesn't strip the
-      // SystemMessage's own cache_control breakpoint set above.
-      const hasSummaryBody =
-        this._summaryLocation === 'user_message' &&
-        this.summaryText != null &&
-        this.summaryText !== '';
+        // Build the non-system portion (summary + conversation), then apply
+        // cache markers separately so addCacheControl doesn't strip the
+        // SystemMessage's own cache_control breakpoint set above.
+        const hasSummaryBody =
+          this._summaryLocation === 'user_message' &&
+          this.summaryText != null &&
+          this.summaryText !== '';
 
-      const bodyWithSummary =
-        hasSummaryBody && promptCacheProvider == null
-          ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
-          : messages;
-      const dynamicTail = this.buildPromptCacheDynamicTail({
-        dynamicInstructions,
-        hasSummaryBody,
-        promptCacheProvider,
-        shouldMoveDynamicInstructions,
-      });
-      let body = this.buildBodyWithPromptCacheDynamicTail(
-        bodyWithSummary,
-        dynamicTail,
-        promptCacheProvider
-      );
-
-      if (
-        promptCacheProvider != null &&
-        dynamicTail.length === 0 &&
-        body.length >= 2
-      ) {
-        body = addTailCacheControl(
-          body,
-          this.getPromptCacheTtl(promptCacheProvider)
+        const bodyWithSummary =
+          hasSummaryBody && promptCacheProvider == null
+            ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
+            : messages;
+        const dynamicTail = this.buildPromptCacheDynamicTail({
+          dynamicInstructions,
+          hasSummaryBody,
+          promptCacheProvider,
+          shouldMoveDynamicInstructions,
+        });
+        let body = this.buildBodyWithPromptCacheDynamicTail(
+          bodyWithSummary,
+          dynamicTail,
+          promptCacheProvider
         );
-      }
-      return [...prefix, ...body];
-    }).withConfig({ runName: 'prompt' });
+
+        if (
+          promptCacheProvider != null &&
+          dynamicTail.length === 0 &&
+          body.length >= 2
+        ) {
+          body = addTailCacheControl(
+            body,
+            this.getPromptCacheTtl(promptCacheProvider)
+          );
+        }
+        return [...prefix, ...body];
+      })
+    ).withConfig({ runName: 'prompt' });
   }
 
   private buildSummaryHumanMessage(
     promptCacheProvider: PromptCacheProvider | undefined
   ): HumanMessage {
-    const wrappedSummary =
-      '<summary>\n' +
-      (this.summaryText as string) +
-      '\n</summary>\n\n' +
-      'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+    const wrappedSummary = buildSummaryCarrierText(this.summaryText as string);
 
     if (promptCacheProvider !== Providers.ANTHROPIC) {
       return new HumanMessage(wrappedSummary);
@@ -818,18 +1100,22 @@ export class AgentContext {
       return messages;
     }
 
-    const tailIndex = this.getPromptCacheDynamicTailIndex(
-      messages,
-      promptCacheProvider
-    );
+    const tailIndex =
+      this._summaryLocation === 'user_message' && this.summaryPrecedesMessages
+        ? 0
+        : this.getPromptCacheDynamicTailIndex(messages, promptCacheProvider);
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
-    const cacheablePrefix = this.addStablePromptCacheMarkers(
-      stablePrefix,
-      this.getPromptCacheTtl(promptCacheProvider)
+    const ttl = this.getPromptCacheTtl(promptCacheProvider);
+    const cacheablePrefix = this.addStablePromptCacheMarkers(stablePrefix, ttl);
+    // Mark only the conversation suffix: marking the assembled body would strip
+    // the stable-prefix breakpoint and could anchor an instruction-only carrier.
+    const cacheableTrailingMessages = addTailCacheControl(
+      trailingMessages,
+      ttl
     );
 
-    return [...cacheablePrefix, ...tail, ...trailingMessages];
+    return [...cacheablePrefix, ...tail, ...cacheableTrailingMessages];
   }
 
   private getPromptCacheDynamicTailIndex(
@@ -862,13 +1148,12 @@ export class AgentContext {
     messages: BaseMessage[],
     ttl?: PromptCacheTtl
   ): BaseMessage[] {
-    if (messages.length <= 1) {
-      return messages;
-    }
-
+    // Reserve the other three breakpoints for tools, system, and conversation tail.
+    // The opening message is not an anchor, including when it has inherited markers.
+    const openingMessage = stripAnthropicCacheControl(messages.slice(0, 1));
     return [
-      messages[0],
-      ...addCacheControlToStablePrefixMessages(messages.slice(1), 2, ttl),
+      ...openingMessage,
+      ...addCacheControlToStablePrefixMessages(messages.slice(1), 1, ttl),
     ];
   }
 
@@ -1010,6 +1295,7 @@ export class AgentContext {
    * Reset context for a new run
    */
   reset(options?: { preserveOriginalToolContent?: boolean }): void {
+    this._fadingTierReset = false;
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
@@ -1021,6 +1307,7 @@ export class AgentContext {
     this.indexTokenCountMap = { ...this.baseIndexTokenCountMap };
     this.currentUsage = undefined;
     this.pruneMessages = undefined;
+    this.clearProviderProjection(false);
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
     this.reasoningTransitionCount = 0;
@@ -1033,7 +1320,10 @@ export class AgentContext {
 
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
+    this.summaryPrecedesMessages = this.durableSummaryPrecedesMessages;
     this._lastSummarizationMsgCount = 0;
+    this._summarizationFailures = 0;
+    this._manualSummarizationRequested = false;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
     this.restoreContextBudgetAfterOverflow();
@@ -1074,9 +1364,21 @@ export class AgentContext {
     this.indexTokenCountMap = { ...baseTokenMap };
   }
 
+  /** Event definitions with matching runtime caller/defer metadata applied. */
+  getEffectiveToolDefinitions(): t.LCTool[] | undefined {
+    if (!this.toolDefinitions) {
+      return undefined;
+    }
+    return applyCallerCapabilityDefinitionOverrides(
+      this.toolDefinitions,
+      this.toolRegistry?.values()
+    );
+  }
+
   /** Active tool definitions for token accounting (excludes deferred-and-undiscovered entries). */
   private getActiveToolDefinitions(): t.LCTool[] {
-    if (!this.toolDefinitions) {
+    const effectiveToolDefinitions = this.getEffectiveToolDefinitions();
+    if (!effectiveToolDefinitions) {
       return [];
     }
     /**
@@ -1086,15 +1388,10 @@ export class AgentContext {
      * alone left programmatic-only definitions counted in
      * `toolSchemaTokens` even though they were never bound.
      */
-    return this.toolDefinitions.filter((def) => {
-      const allowedCallers = def.allowed_callers ?? ['direct'];
-      if (!allowedCallers.includes('direct')) {
-        return false;
-      }
-      return (
-        def.defer_loading !== true || this.discoveredToolNames.has(def.name)
-      );
-    });
+    return resolveCallerCapabilityProjection(
+      effectiveToolDefinitions,
+      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    ).directTools;
   }
 
   /**
@@ -1283,15 +1580,25 @@ export class AgentContext {
     }
   }
 
-  setSummary(text: string, tokenCount: number): void {
+  setSummary(
+    text: string,
+    tokenCount: number,
+    options?: { precedesMessages?: boolean }
+  ): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'user_message';
+    this.summaryPrecedesMessages = options?.precedesMessages === true;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
+    this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
     this._summaryVersion += 1;
+    this._fadingTierReset = true;
+    this._summarizationFailures = 0;
     this.systemRunnableStale = true;
     this.pruneMessages = undefined;
+    this.fadingTier = undefined;
+    this.clearProviderProjection(false);
   }
 
   /** Sets a cross-run summary that is injected into the system prompt. */
@@ -1299,10 +1606,15 @@ export class AgentContext {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'system_prompt';
+    this.summaryPrecedesMessages = false;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
+    this.durableSummaryPrecedesMessages = false;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
+    this.pruneMessages = undefined;
+    this.fadingTier = undefined;
+    this.clearProviderProjection(false);
   }
 
   /**
@@ -1336,6 +1648,10 @@ export class AgentContext {
     return this._summaryVersion;
   }
 
+  get fadingTierReset(): boolean {
+    return this._fadingTierReset;
+  }
+
   /**
    * Returns true when the message count hasn't changed since the last
    * summarization — re-summarizing would produce an identical result.
@@ -1355,6 +1671,45 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
+  }
+
+  /**
+   * Claims the single summarization request a summarize-only run makes.
+   * True exactly once per run, on the first model step; the step that gets
+   * `false` is the one after the summary, which reports usage and ends
+   * without a model call. Always false when `summarizeOnly` is off.
+   */
+  claimManualSummarization(): boolean {
+    if (this.summarizeOnly !== true || this._manualSummarizationRequested) {
+      return false;
+    }
+    this._manualSummarizationRequested = true;
+    return true;
+  }
+
+  /**
+   * Records a summarization attempt that produced no usable summary — an
+   * empty model response, or a provider failure the run declined to paper
+   * over with a metadata stub. Cleared by the next successful summary.
+   */
+  recordSummarizationFailure(): void {
+    this._summarizationFailures += 1;
+  }
+
+  get summarizationFailures(): number {
+    return this._summarizationFailures;
+  }
+
+  /**
+   * True once consecutive no-progress attempts reach {@link MAX_SUMMARIZATION_FAILURES}.
+   * A summarizer that has returned nothing this many times in a row will keep
+   * returning nothing: each empty result leaves the history unchanged, so the
+   * next prune cycle re-triggers on the same state and the run burns its
+   * recursion budget on empty summary steps. Summarization stays off for the
+   * remainder of the run; `reset()` restores it for the next one.
+   */
+  get summarizationExhausted(): boolean {
+    return this._summarizationFailures >= MAX_SUMMARIZATION_FAILURES;
   }
 
   get overflowRecoveryAttempts(): number {
@@ -1431,6 +1786,7 @@ export class AgentContext {
       this.maxContextTokens = budgetTokens;
     }
     this.pruneMessages = undefined;
+    this.clearProviderProjection(true);
     this._lastSummarizationMsgCount = 0;
     this._lastOverflowPromptTokens =
       promptTokens != null
@@ -1439,9 +1795,151 @@ export class AgentContext {
     this._overflowRecoveryAttempts += 1;
   }
 
+  /**
+   * Returns the mutable provider projection for this Run while preserving the
+   * graph-owned messages as the canonical history. Appends are synchronized
+   * incrementally so the pruner's watermarks remain valid. Any rewritten or
+   * compacted canonical prefix starts a fresh projection and pruner.
+   */
+  getProviderProjectedMessages(messages: BaseMessage[]): BaseMessage[] {
+    const sources = this.providerProjectionSources;
+    let projection = this.providerProjectedMessages;
+    const priorLength = sources?.length ?? 0;
+    const prefixChanged =
+      sources != null &&
+      (messages.length < sources.length ||
+        (messages.length === priorLength
+          ? sources.some((source, index) => messages[index] !== source)
+          : priorLength > 0 &&
+            messages[priorLength - 1] !== sources[priorLength - 1]));
+
+    if (projection == null || sources == null || prefixChanged) {
+      if (prefixChanged) {
+        this.pruneMessages = undefined;
+        /** The originals map is keyed by index; a rewritten prefix would let
+         * the summarizer restore one tool's bytes onto another message. */
+        this.pendingOriginalToolContent = undefined;
+        this.prepareProviderProjectionRecount(sources);
+      }
+      projection = messages.map((message) =>
+        Array.isArray(message.content)
+          ? cloneMessage(message, [...message.content])
+          : message
+      );
+      this.providerProjectedMessages = projection;
+      this.providerProjectionSources = [...messages];
+      this.providerProjectionSourcesById = new Map(
+        messages.flatMap((message) =>
+          message.id == null ? [] : [[message.id, message] as const]
+        )
+      );
+      if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
+        const recounted: Record<string, number> = {};
+        for (let i = 0; i < messages.length; i++) {
+          const localCount = this.tokenCounter(messages[i]);
+          const conservativeFloor = this.providerProjectionRecountFloors?.get(
+            messages[i]
+          );
+          recounted[i] =
+            conservativeFloor == null
+              ? localCount
+              : Math.max(localCount, conservativeFloor);
+        }
+        this.indexTokenCountMap = recounted;
+        this.providerProjectionRequiresRecount = false;
+        this.providerProjectionRecountFloors = undefined;
+      }
+      return projection;
+    }
+
+    for (let i = sources.length; i < messages.length; i++) {
+      const message = messages[i];
+      sources.push(message);
+      if (message.id != null) {
+        this.providerProjectionSourcesById?.set(message.id, message);
+      }
+      projection.push(
+        Array.isArray(message.content)
+          ? cloneMessage(message, [...message.content])
+          : message
+      );
+    }
+    return projection;
+  }
+
+  /**
+   * Invalidates the provider projection when a graph reducer update rewrites
+   * canonical history. Reducer updates expose replacements and removals before
+   * they are folded into a potentially longer array, avoiding a prefix scan on
+   * the normal append-only path.
+   */
+  invalidateProviderProjectionForMessageUpdates(
+    updates:
+      | BaseMessage
+      | BaseMessageLike
+      | Array<BaseMessage | BaseMessageLike | null | undefined>
+      | null
+      | undefined
+  ): void {
+    if (this.providerProjectionSources == null) {
+      return;
+    }
+    const updateList = (Array.isArray(updates) ? updates : [updates]) as Array<
+      BaseMessageLike | null | undefined
+    >;
+    for (const rawUpdate of updateList) {
+      if (rawUpdate == null) {
+        continue;
+      }
+      const update = coerceMessageLikeToMessage(rawUpdate);
+      const priorSource =
+        update.id == null
+          ? undefined
+          : this.providerProjectionSourcesById?.get(update.id);
+      if (
+        update.getType() === 'remove' ||
+        (priorSource != null && priorSource !== update)
+      ) {
+        this.pruneMessages = undefined;
+        this.pendingOriginalToolContent = undefined;
+        this.clearProviderProjection(true);
+        return;
+      }
+    }
+  }
+
+  private clearProviderProjection(recountOnNextUse: boolean): void {
+    if (recountOnNextUse) {
+      this.prepareProviderProjectionRecount(this.providerProjectionSources);
+    } else {
+      this.providerProjectionRequiresRecount = false;
+      this.providerProjectionRecountFloors = undefined;
+    }
+    this.providerProjectedMessages = undefined;
+    this.providerProjectionSources = undefined;
+    this.providerProjectionSourcesById = undefined;
+  }
+
+  private prepareProviderProjectionRecount(
+    sources: BaseMessage[] | undefined
+  ): void {
+    this.providerProjectionRequiresRecount = true;
+    if (sources == null) {
+      return;
+    }
+    const floors = new WeakMap<BaseMessage, number>();
+    for (let i = 0; i < sources.length; i++) {
+      const count = this.indexTokenCountMap[i];
+      if (count != null && Number.isFinite(count) && count >= 0) {
+        floors.set(sources[i], count);
+      }
+    }
+    this.providerProjectionRecountFloors = floors;
+  }
+
   /** Applies token calibration only when the observation came from this provider. */
   applyObservedOverflowCalibration(
-    provider: Providers | undefined,
+    provider: t.ProviderName | undefined,
     observedCalibrationRatio: number | undefined
   ): void {
     if (
@@ -1505,6 +2003,8 @@ export class AgentContext {
       this.summaryTokenCount = 0;
       this._durableSummaryText = undefined;
       this._durableSummaryTokenCount = 0;
+      this.summaryPrecedesMessages = false;
+      this.durableSummaryPrecedesMessages = false;
       this._summaryLocation = 'none';
       this.systemRunnableStale = true;
     }
@@ -1655,6 +2155,7 @@ export class AgentContext {
       summarizationEnabled: this.summarizationEnabled,
       reserveRatio: this.summarizationConfig?.reserveRatio,
       calibrationRatio: opts?.calibrationRatio ?? this.calibrationRatio,
+      fadingTier: this.fadingTier,
       getInstructionTokens: () => this.instructionTokens,
     });
     const {
@@ -1682,7 +2183,13 @@ export class AgentContext {
       remainingContextTokens,
       calibrationRatio,
     };
-    syncBudgetDerivedFields(usage);
+    syncBudgetDerivedFields(
+      usage,
+      context,
+      this.contextPressureTokenCounts?.count ?? tokenCounter,
+      undefined,
+      this.provider
+    );
     return usage;
   }
 
@@ -1721,6 +2228,24 @@ export class AgentContext {
   /** Returns a snapshot of the deferred tools discovered in this context. */
   getDiscoveredTools(): string[] {
     return Array.from(this.discoveredToolNames);
+  }
+
+  /** Returns the live projection shared by prompt and event execution. */
+  private getCallerCapabilityProjection(): CallerCapabilityProjection {
+    return resolveCallerCapabilityProjection(
+      mergeCallerCapabilityDefinitions(
+        this.toolDefinitions,
+        this.toolRegistry?.values()
+      ),
+      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
+    );
+  }
+
+  /** Returns the SDK-owned active caller projection for event-driven hosts. */
+  getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    return createCallerCapabilityProjectionSnapshot(
+      this.getCallerCapabilityProjection()
+    );
   }
 
   /**
@@ -1810,14 +2335,9 @@ export class AgentContext {
         return true;
       }
 
-      if (this.discoveredToolNames.has(tool.name)) {
-        const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-        return allowedCallers.includes('direct');
-      }
-
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
       return (
-        allowedCallers.includes('direct') && toolDef.defer_loading !== true
+        allowsToolCaller(toolDef, 'direct') &&
+        isToolDefinitionActive(toolDef, this.discoveredToolNames)
       );
     });
   }

@@ -2,7 +2,21 @@ import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import type { Readable } from 'node:stream';
+import type { CodeApiMethod } from '@/tools/diagnostics';
 import type * as t from '@/types';
+import {
+  appendArtifactDeliveryWarning,
+  normalizeArtifactDeliveryFailure,
+} from '@/tools/ArtifactDelivery';
+import {
+  appendArtifactTruncationWarning,
+  normalizeArtifactTruncation,
+} from '@/tools/ArtifactTruncation';
+import {
+  describeCodeApiError,
+  logCodeApiDiagnostic,
+} from '@/tools/diagnostics';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
@@ -18,6 +32,17 @@ config();
 export const getCodeBaseURL = (): string =>
   getEnvironmentVariable(EnvVar.CODE_BASEURL) ??
   Constants.OFFICIAL_CODE_BASEURL;
+
+export function buildCodeApiEndpoint(baseUrl: string, route: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}/${route.replace(/^\/+/, '')}`;
+}
+
+export function selectRuntimeSessionHint(
+  factoryHint?: string,
+  injectedHint?: string
+): string | undefined {
+  return factoryHint != null && factoryHint !== '' ? factoryHint : injectedHint;
+}
 
 export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
@@ -37,11 +62,15 @@ export const TMP_SCRATCH_OUTPUT_REMINDER =
 export const FAILED_EXECUTION_FILE_REMINDER =
   'Note: any files written during this failed call were not registered for later calls; fix the error and rerun before relying on them.';
 
-export function appendTmpScratchReminder(output: string, code: string): string {
+export function appendTmpScratchReminder(
+  output: string,
+  code: string,
+  reminder = TMP_SCRATCH_OUTPUT_REMINDER
+): string {
   if (!TMP_PATH_PATTERN.test(code)) {
     return output;
   }
-  return `${output.trimEnd()}\n${TMP_SCRATCH_OUTPUT_REMINDER}\n`;
+  return `${output.trimEnd()}\n${reminder}\n`;
 }
 
 export function appendFailedExecutionFileReminder(
@@ -49,6 +78,7 @@ export function appendFailedExecutionFileReminder(
   code: string
 ): string {
   if (
+    output.includes(CODE_API_CAPABILITY_ERROR_MESSAGE) ||
     !MNT_DATA_PATH_PATTERN.test(code) ||
     output.includes(FAILED_EXECUTION_FILE_REMINDER)
   ) {
@@ -108,8 +138,7 @@ export const CodeExecutionToolSchema = {
   required: ['lang', 'code'],
 } as const;
 
-const baseEndpoint = getCodeBaseURL();
-const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
+export const CODE_API_EXPECTED_PROFILE_HEADER = 'X-CodeAPI-Expected-Profile';
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
@@ -137,10 +166,67 @@ const SAFE_CODE_API_EXECUTION_ERROR_DETAILS: Readonly<
   'stdout length exceeded': 'Execution output exceeded the size limit.',
 };
 
+export const CODE_API_CAPABILITY_ERROR_MESSAGE =
+  'Code execution is not supported by the selected environment.';
+const CODE_API_CAPABILITY_ERROR_GUIDANCE =
+  'This is a permanent capability mismatch. Do not retry this tool in this environment; select a compatible environment or use an available workspace tool.';
+
+const CODE_API_CAPABILITY_LIMITATIONS: Readonly<
+  Partial<Record<string, string>>
+> = {
+  bridge_worker_mismatch:
+    'The selected worker does not support the requested execution capabilities (such as the stateful workspace required by programmatic tool calling).',
+  execution_profile_mismatch:
+    'The selected environment does not provide the requested execution profile.',
+  capability_mismatch:
+    'The selected environment lacks a required execution capability.',
+  unsupported_capability:
+    'The selected environment lacks a required execution capability.',
+  stateful_workspace_unsupported:
+    'The selected worker does not provide a stateful workspace.',
+};
+
+function getCodeApiCapabilityErrorMessage(
+  responseBody: string
+): string | undefined {
+  try {
+    const parsed = JSON.parse(responseBody) as {
+      error?: string;
+      code?: string;
+      message?: string;
+    } | null;
+    const code = parsed?.code ?? parsed?.error;
+    if (typeof code !== 'string') return undefined;
+    const normalizedCode = code.toLowerCase();
+    if (!Object.hasOwn(CODE_API_CAPABILITY_LIMITATIONS, normalizedCode))
+      return undefined;
+    let limitation = CODE_API_CAPABILITY_LIMITATIONS[normalizedCode];
+    if (limitation == null) return undefined;
+    if (
+      normalizedCode === 'bridge_worker_mismatch' &&
+      typeof parsed?.message === 'string' &&
+      /^Bridge worker [A-Za-z0-9._:-]+ does not provide a stateful workspace$/.test(
+        parsed.message
+      )
+    ) {
+      limitation =
+        CODE_API_CAPABILITY_LIMITATIONS.stateful_workspace_unsupported;
+    }
+    return `${CODE_API_CAPABILITY_ERROR_MESSAGE} ${limitation} ${CODE_API_CAPABILITY_ERROR_GUIDANCE}`;
+  } catch {
+    return undefined;
+  }
+}
+
 export class CodeApiRequestError extends Error {
+  readonly retryable: boolean;
+
   constructor(message = CODE_API_UNAVAILABLE_ERROR_MESSAGE) {
     super(message);
     this.name = 'CodeApiRequestError';
+    this.retryable =
+      message.includes(CODE_API_UNAVAILABLE_ERROR_MESSAGE) ||
+      message.includes('Code execution is temporarily rate-limited.');
   }
 }
 
@@ -210,7 +296,8 @@ export function buildCodeApiExecutionErrorMessage(response: {
 }
 
 export async function resolveCodeApiAuthHeaders(
-  authHeaders?: t.CodeApiAuthHeaders
+  authHeaders?: t.CodeApiAuthHeaders,
+  options?: { recoverable?: boolean }
 ): Promise<t.CodeApiAuthHeaderMap> {
   if (authHeaders == null) {
     return {};
@@ -219,23 +306,133 @@ export async function resolveCodeApiAuthHeaders(
     try {
       const resolvedHeaders = await authHeaders();
       return resolvedHeaders;
-    } catch {
+    } catch (error) {
+      if (options?.recoverable !== true) {
+        logCodeApiDiagnostic(
+          'CodeExecutor',
+          'error',
+          'auth header resolution failed; the Code API request was never sent',
+          describeCodeApiError(error)
+        );
+      }
       throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
     }
   }
   return authHeaders;
 }
 
-export async function buildCodeApiHttpErrorMessage(
-  _method: string,
-  _endpoint: string,
-  response: { status: number; text: () => Promise<string> }
-): Promise<string> {
-  let responseBody = '';
+export function addCodeApiExecutionProfileHeader(
+  headers: t.CodeApiAuthHeaderMap,
+  executionProfile?: t.CodeApiExecutionProfile
+): t.CodeApiAuthHeaderMap {
+  if (executionProfile == null) {
+    return headers;
+  }
+  return {
+    ...headers,
+    [CODE_API_EXPECTED_PROFILE_HEADER]: executionProfile,
+  };
+}
+
+type CodeApiErrorResponse = {
+  status: number;
+  text: () => Promise<string>;
+  /** node-fetch types this as `NodeJS.ReadableStream`, which does not declare
+   * `destroy`; every runtime instance is a `Readable`, and a test double may
+   * supply nothing at all. */
+  body?: NodeJS.ReadableStream | null;
+};
+
+/** Releases unread or incomplete error responses after bounded classification. */
+function discardResponseBody(response: CodeApiErrorResponse): void {
+  const body = response.body;
+  if (body == null || !('destroy' in body)) {
+    return;
+  }
+  const destroy = (body as NodeJS.ReadableStream & Partial<Readable>).destroy;
+  if (typeof destroy !== 'function') {
+    return;
+  }
   try {
-    responseBody = await response.text();
+    destroy.call(body);
   } catch {
-    responseBody = '';
+    /* Already finished or not destroyable; nothing is being held open. */
+  }
+}
+
+const MAX_CODE_API_ERROR_BODY_BYTES = 64 * 1024;
+const CODE_API_ERROR_BODY_TIMEOUT_MS = 1_000;
+
+/** Reads only small error envelopes, with a deadline for stalled upstreams. */
+async function readCodeApiErrorBody(
+  response: CodeApiErrorResponse
+): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const read = async (): Promise<string> => {
+      if (response.body != null && Symbol.asyncIterator in response.body) {
+        let bytes = 0;
+        const chunks: Buffer[] = [];
+        for await (const chunk of response.body as AsyncIterable<
+          Buffer | string
+        >) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bytes += buffer.length;
+          if (bytes > MAX_CODE_API_ERROR_BODY_BYTES) return '';
+          chunks.push(buffer);
+        }
+        return Buffer.concat(chunks).toString('utf8');
+      }
+      const body = await response.text();
+      return Buffer.byteLength(body) <= MAX_CODE_API_ERROR_BODY_BYTES
+        ? body
+        : '';
+    };
+    return await Promise.race([
+      read(),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(''), CODE_API_ERROR_BODY_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(timer);
+    discardResponseBody(response);
+  }
+}
+
+export async function buildCodeApiHttpErrorMessage(
+  method: CodeApiMethod,
+  _endpoint: string,
+  response: CodeApiErrorResponse,
+  options?: { recoverable?: boolean; profile?: t.CodeApiExecutionProfile }
+): Promise<string> {
+  /* Logged before the body is touched. A non-OK response can leave a chunked
+     body open, so logging first preserves the diagnostic even if the bounded
+     classification read times out.
+     The body itself is never logged — it is upstream free text that can echo
+     the header that was sent — and the endpoint is host-configured, so the
+     backend is named by the profile this module chose rather than by its
+     address. A recoverable caller reports its own outcome; logging here too
+     would raise an error-level alert for a lookup that succeeds by returning
+     nothing. */
+  if (options?.recoverable !== true) {
+    logCodeApiDiagnostic(
+      'CodeExecutor',
+      response.status === 429 ? 'warn' : 'error',
+      'Code API rejected the request',
+      {
+        method,
+        profile: options?.profile ?? 'unset',
+        status: response.status,
+      }
+    );
+  }
+  const responseBody = await readCodeApiErrorBody(response);
+  const capabilityError = getCodeApiCapabilityErrorMessage(responseBody);
+  if (capabilityError != null) {
+    return capabilityError;
   }
   if (response.status === 429) {
     const retryAfterSeconds = getRetryAfterSeconds(responseBody);
@@ -333,16 +530,24 @@ export const CodeExecutionToolDefinition = {
 function createCodeExecutionTool(
   params: t.CodeExecutionToolParams | null = {}
 ): DynamicStructuredTool {
+  const execEndpoint = buildCodeApiEndpoint(
+    params?.baseUrl ?? getCodeBaseURL(),
+    'exec'
+  );
+
   return tool(
     async (rawInput, config) => {
-      /* `statefulSessions` is a prompt-only flag (drives the description);
-       * keep it out of the wire body. */
+      /* `statefulSessions` drives the description and gates trusted runtime
+       * affinity hints. Keep the flag itself out of the wire body. */
       const {
         authHeaders,
-        statefulSessions: _statefulSessions,
+        baseUrl: _baseUrl,
+        executionProfile,
+        runtimeSessionHint,
+        statefulSessions,
         ...executionParams
       } = params ?? {};
-      void _statefulSessions;
+      void _baseUrl;
       /* Drop any model-supplied `runtime_session_hint` from the raw args: the
        * hint is host-controlled and must only ever come from ToolNode's
        * injected `_runtime_session_hint` (below). Spreading `...rest` into
@@ -383,14 +588,20 @@ function createCodeExecutionTool(
         ...executionParams,
       };
 
-      /* Stateful sessions: forward the hint so the Code API can route this
-       * execution to a warm per-session runtime. Additive — stateless
-       * servers ignore the unknown field. */
+      /* Stateful sessions: prefer the per-agent factory hint, falling back to
+       * legacy ToolNode injection. Explicit default-profile tools always drop
+       * the hint so a mixed graph cannot promote them to the stateful path. */
+      const effectiveRuntimeSessionHint = selectRuntimeSessionHint(
+        runtimeSessionHint,
+        _runtime_session_hint
+      );
       if (
-        typeof _runtime_session_hint === 'string' &&
-        _runtime_session_hint !== ''
+        statefulSessions === true &&
+        executionProfile !== 'default' &&
+        typeof effectiveRuntimeSessionHint === 'string' &&
+        effectiveRuntimeSessionHint !== ''
       ) {
-        postData.runtime_session_hint = _runtime_session_hint;
+        postData.runtime_session_hint = effectiveRuntimeSessionHint;
       }
 
       /* File injection: `_injected_files` from ToolNode (set when host
@@ -407,9 +618,11 @@ function createCodeExecutionTool(
         session_id.length > 0 &&
         !Array.isArray(postData.files)
       ) {
-        // eslint-disable-next-line no-console
-        console.debug(
-          `[CodeExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        logCodeApiDiagnostic(
+          'CodeExecutor',
+          'debug',
+          'session carried no injected files; exec will run without input files',
+          { files: 'none' }
         );
       }
 
@@ -421,19 +634,24 @@ function createCodeExecutionTool(
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            ...resolvedAuthHeaders,
+            ...addCodeApiExecutionProfileHeader(
+              resolvedAuthHeaders,
+              executionProfile
+            ),
           },
           body: JSON.stringify(postData),
         };
 
-        const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
-        if (proxyAgent) {
+        const proxyAgent = resolveFetchProxyAgent(execEndpoint);
+        if (proxyAgent != null) {
           fetchOptions.agent = proxyAgent;
         }
-        const response = await fetch(EXEC_ENDPOINT, fetchOptions);
+        const response = await fetch(execEndpoint, fetchOptions);
         if (!response.ok) {
           throw new CodeApiRequestError(
-            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+            await buildCodeApiHttpErrorMessage('POST', execEndpoint, response, {
+              profile: executionProfile,
+            })
           );
         }
 
@@ -450,7 +668,25 @@ function createCodeExecutionTool(
           formattedOutput,
           code
         );
+        const artifactDelivery = normalizeArtifactDeliveryFailure(
+          result.artifact_delivery
+        );
+        const outputWithDeliveryWarning = appendArtifactDeliveryWarning(
+          outputWithReminder,
+          artifactDelivery
+        );
+        const artifactTruncation = normalizeArtifactTruncation(
+          result.artifact_truncation
+        );
+        const outputWithWarnings = appendArtifactTruncationWarning(
+          outputWithDeliveryWarning,
+          artifactTruncation
+        );
         const hasFiles = result.files != null && result.files.length > 0;
+        const deletionEcho =
+          result.deleted_files != null
+            ? { deleted_files: result.deleted_files }
+            : {};
         /* Echo the durable runtime session (stateful backends only) so hosts
          * can surface a "session active / was reset" signal later. Additive:
          * absent on stateless servers. */
@@ -462,15 +698,29 @@ function createCodeExecutionTool(
             }
             : {};
         return [
-          appendCodeSessionFileSummary(outputWithReminder, result.files),
+          appendCodeSessionFileSummary(outputWithWarnings, result.files),
           (hasFiles
             ? {
               session_id: result.session_id,
               files: result.files,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
+                : {}),
+              ...deletionEcho,
               ...runtimeEcho,
             }
             : {
               session_id: result.session_id,
+              ...(artifactDelivery != null
+                ? { artifact_delivery: artifactDelivery }
+                : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
+                : {}),
+              ...deletionEcho,
               ...runtimeEcho,
             }) satisfies t.CodeExecutionArtifact,
         ];
@@ -479,7 +729,9 @@ function createCodeExecutionTool(
           normalizeCodeApiRequestError(error).message,
           code
         );
-        throw new Error(`Execution error:\n\n${messageWithReminder}`);
+        throw new CodeApiRequestError(
+          `Execution error:\n\n${messageWithReminder}`
+        );
       }
     },
     {

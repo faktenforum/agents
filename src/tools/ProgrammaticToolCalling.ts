@@ -1,5 +1,6 @@
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
+import { randomUUID } from 'node:crypto';
 import fetch, { RequestInit } from 'node-fetch';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
@@ -7,22 +8,45 @@ import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
 import {
   CODE_ARTIFACT_PATH_GUIDANCE,
+  addCodeApiExecutionProfileHeader,
   appendCodeSessionFileSummary,
   appendFailedExecutionFileReminder,
   buildCodeApiExecutionErrorMessage,
   buildCodeApiHttpErrorMessage,
   CodeApiRequestError,
+  buildCodeApiEndpoint,
   emptyOutputMessage,
   getCodeBaseURL,
   appendTmpScratchReminder,
   normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
+  selectRuntimeSessionHint,
 } from './CodeExecutor';
+import {
+  assertUnambiguousIdentifiers,
+  projectProgrammaticToolMap,
+  resolveProgrammaticToolDefinitions,
+  selectProgrammaticTools,
+  type ProgrammaticInvocationParams,
+} from './ProgrammaticCallerPolicy';
 import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import {
+  appendArtifactDeliveryWarning,
+  normalizeArtifactDeliveryFailure,
+} from '@/tools/ArtifactDelivery';
+import {
+  appendArtifactTruncationWarning,
+  normalizeArtifactTruncation,
+} from '@/tools/ArtifactTruncation';
+import {
+  describeCodeApiError,
+  logCodeApiDiagnostic,
+} from '@/tools/diagnostics';
+import { appendExecutionArtifactFileSummary } from './CodeSessionFileSummary';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
@@ -33,6 +57,8 @@ config();
 const DEFAULT_MAX_ROUND_TRIPS = 20;
 
 const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
+const CODE_API_PROGRAMMATIC_REQUEST_HEADER = 'X-LibreChat-Code-Request-ID';
+const CANCELLATION_REQUEST_TIMEOUT_MS = 2_000;
 
 // ============================================================================
 // Description Components (Single Source of Truth)
@@ -84,6 +110,10 @@ ${EXAMPLES}
 
 ${CORE_RULES}`;
 
+const TOOL_MANIFEST_DESCRIPTION =
+  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
+  'validated before execution starts. Pass [] when the code calls no tools at all.';
+
 export function createProgrammaticToolCallingSchema(
   maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
 ): ProgrammaticToolCallingJsonSchema {
@@ -95,6 +125,12 @@ export function createProgrammaticToolCallingSchema(
         type: 'string',
         minLength: 1,
         description: CODE_PARAM_DESCRIPTION,
+      },
+      tool_manifest: {
+        type: 'array',
+        items: { type: 'string' },
+        uniqueItems: true,
+        description: TOOL_MANIFEST_DESCRIPTION,
       },
       timeout: createCodeApiRunTimeoutSchema(maxRunTimeoutMs),
     },
@@ -434,7 +470,9 @@ export async function fetchSessionFiles(
       }
     }
     const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
-    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders, {
+      recoverable: true,
+    });
     const fetchOptions: RequestInit = {
       method: 'GET',
       headers: {
@@ -444,14 +482,16 @@ export async function fetchSessionFiles(
     };
 
     const proxyAgent = resolveFetchProxyAgent(filesEndpoint, proxy);
-    if (proxyAgent) {
+    if (proxyAgent != null) {
       fetchOptions.agent = proxyAgent;
     }
 
     const response = await fetch(filesEndpoint, fetchOptions);
     if (!response.ok) {
       throw new Error(
-        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response)
+        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response, {
+          recoverable: true,
+        })
       );
     }
 
@@ -464,9 +504,11 @@ export async function fetchSessionFiles(
       .filter(isCodeApiSessionFileWire)
       .map((file) => normalizeSessionFile(file, sessionId, scope));
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `Failed to fetch files for session: ${sessionId}, ${(error as Error).message}`
+    logCodeApiDiagnostic(
+      'ProgrammaticToolCalling',
+      'warn',
+      'session file lookup failed; continuing without input files',
+      describeCodeApiError(error)
     );
     return [];
   }
@@ -483,30 +525,94 @@ export async function makeRequest(
   endpoint: string,
   body: Record<string, unknown>,
   proxy?: string,
-  authHeaders?: t.CodeApiAuthHeaders
+  authHeaders?: t.CodeApiAuthHeaders,
+  executionProfile?: t.CodeApiExecutionProfile,
+  signal?: AbortSignal
 ): Promise<t.ProgrammaticExecutionResponse> {
   try {
     const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
+    const requestId = signal != null ? randomUUID() : undefined;
     const fetchOptions: RequestInit = {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': 'LibreChat/1.0',
-        ...resolvedAuthHeaders,
+        ...addCodeApiExecutionProfileHeader(
+          resolvedAuthHeaders,
+          executionProfile
+        ),
+        ...(requestId != null
+          ? { [CODE_API_PROGRAMMATIC_REQUEST_HEADER]: requestId }
+          : {}),
       },
       body: JSON.stringify(body),
+      signal: signal as RequestInit['signal'],
     };
 
     const proxyAgent = resolveFetchProxyAgent(endpoint, proxy);
-    if (proxyAgent) {
+    if (proxyAgent != null) {
       fetchOptions.agent = proxyAgent;
     }
 
-    const response = await fetch(endpoint, fetchOptions);
+    let cancellationRequest: Promise<void> | undefined;
+    const requestCancellation = (): void => {
+      if (requestId == null || cancellationRequest != null) {
+        return;
+      }
+      cancellationRequest = (async (): Promise<void> => {
+        const cancellationController = new AbortController();
+        const timeout = setTimeout(
+          () => cancellationController.abort(),
+          CANCELLATION_REQUEST_TIMEOUT_MS
+        );
+        try {
+          const cancelOptions: RequestInit = {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'LibreChat/1.0',
+              ...addCodeApiExecutionProfileHeader(
+                resolvedAuthHeaders,
+                executionProfile
+              ),
+            },
+            body: JSON.stringify({ request_id: requestId }),
+            signal: cancellationController.signal as RequestInit['signal'],
+          };
+          if (proxyAgent != null) {
+            cancelOptions.agent = proxyAgent;
+          }
+          await fetch(`${endpoint}/cancel`, cancelOptions);
+        } catch {
+          // Cancellation is best effort for older Code API versions and
+          // transient network failures. The original abort remains the public
+          // result while the server-side execution deadline is the fallback.
+        } finally {
+          clearTimeout(timeout);
+        }
+      })();
+    };
+    signal?.addEventListener('abort', requestCancellation, { once: true });
+    if (signal?.aborted === true) requestCancellation();
+
+    let response;
+    try {
+      response = await fetch(endpoint, fetchOptions);
+    } catch (error) {
+      if (signal?.aborted === true) {
+        requestCancellation();
+        await cancellationRequest;
+      }
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', requestCancellation);
+    }
 
     if (!response.ok) {
       throw new CodeApiRequestError(
-        await buildCodeApiHttpErrorMessage('POST', endpoint, response)
+        await buildCodeApiHttpErrorMessage('POST', endpoint, response, {
+          profile: executionProfile,
+        })
       );
     }
 
@@ -654,7 +760,7 @@ type ToolInputSchemaKind = {
 function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
   const kind: ToolInputSchemaKind = { object: false, string: false };
 
-  if (!schema || typeof schema !== 'object') {
+  if (schema == null || typeof schema !== 'object') {
     return kind;
   }
 
@@ -669,7 +775,7 @@ function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
   }
 
   const zodDef = (schema as { _def?: unknown })._def;
-  if (!zodDef || typeof zodDef !== 'object') {
+  if (zodDef == null || typeof zodDef !== 'object') {
     return kind;
   }
 
@@ -691,7 +797,7 @@ function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
         type?: unknown;
       }
     ).innerType ?? (zodDef as { schema?: unknown }).schema;
-  if (innerSchema) {
+  if (innerSchema != null) {
     const innerKind = detectSchemaKind(innerSchema);
     kind.object ||= innerKind.object;
     kind.string ||= innerKind.string;
@@ -825,7 +931,8 @@ export async function executeTools(
  */
 export function formatCompletedResponse(
   response: t.ProgrammaticExecutionResponse,
-  sourceCode = ''
+  sourceCode = '',
+  filePersistence: 'session' | 'execution' = 'session'
 ): [string, t.ProgrammaticExecutionArtifact] {
   let formatted = '';
 
@@ -840,12 +947,37 @@ export function formatCompletedResponse(
   }
 
   const outputWithReminder = appendTmpScratchReminder(formatted, sourceCode);
+  const artifactDelivery = normalizeArtifactDeliveryFailure(
+    response.artifact_delivery
+  );
+  const outputWithDeliveryWarning = appendArtifactDeliveryWarning(
+    outputWithReminder,
+    artifactDelivery
+  );
+  const artifactTruncation = normalizeArtifactTruncation(
+    response.artifact_truncation
+  );
+  const outputWithWarnings = appendArtifactTruncationWarning(
+    outputWithDeliveryWarning,
+    artifactTruncation
+  );
 
   return [
-    appendCodeSessionFileSummary(outputWithReminder, response.files),
+    filePersistence === 'execution'
+      ? appendExecutionArtifactFileSummary(outputWithWarnings, response.files)
+      : appendCodeSessionFileSummary(outputWithWarnings, response.files),
     {
       session_id: response.session_id,
       files: response.files,
+      ...(response.deleted_files != null
+        ? { deleted_files: response.deleted_files }
+        : {}),
+      ...(artifactDelivery != null
+        ? { artifact_delivery: artifactDelivery }
+        : {}),
+      ...(artifactTruncation != null
+        ? { artifact_truncation: artifactTruncation }
+        : {}),
       ...(response.runtime_session_id != null
         ? {
           runtime_session_id: response.runtime_session_id,
@@ -854,6 +986,82 @@ export function formatCompletedResponse(
         : {}),
     } satisfies t.ProgrammaticExecutionArtifact,
   ];
+}
+
+/**
+ * Mirrors the Code API's programmatic Python wrapper (`wrapUserCodeInAsync`).
+ *
+ * The programmatic contract promises top-level `await` works; plain `/exec`
+ * applies no wrapper, so forwarding source unchanged would turn valid
+ * programmatic input into a SyntaxError. The wrapper is self-contained, so a
+ * later divergence in the Code API's own copy cannot break this path.
+ */
+export function wrapPythonForPlainExecution(userCode: string): string {
+  const indented = userCode
+    .split('\n')
+    .map((line) => (line.trim() === '' ? '' : `    ${line}`))
+    .join('\n');
+
+  return (
+    'async def __user_main__():\n' +
+    '    """Auto-generated wrapper for user code to support top-level await"""\n' +
+    `${indented}\n` +
+    '\n' +
+    'if __name__ == "__main__":\n' +
+    '    import asyncio\n' +
+    '    asyncio.run(__user_main__())\n'
+  );
+}
+
+/**
+ * Runs code that selected no tools through plain `/exec`.
+ *
+ * `/exec/programmatic` rejects an empty tool manifest outright, and the sandbox
+ * has nothing to inject for such a call anyway — no stubs, no replay round
+ * trips. Routing it here makes a tool-free programmatic call behave exactly like
+ * the equivalent `execute_code`, against every deployed Code API, instead of
+ * failing with a rejection the model cannot act on.
+ */
+export async function runPlainExecution(args: {
+  baseUrl: string;
+  lang: 'bash' | 'py';
+  code: string;
+  /**
+   * Forwarded so the model-supplied cap applies as soon as the Code API honors
+   * it on `/exec`, which does not read `timeout` today. Session affinity and
+   * input files are honored there, so those ride the same body.
+   */
+  timeout?: number;
+  sessionId?: string;
+  files?: t.CodeEnvFile[];
+  runtimeSessionHint?: string;
+  proxy?: string;
+  authHeaders?: t.CodeApiAuthHeaders;
+  executionProfile?: t.CodeApiExecutionProfile;
+}): Promise<[string, t.ProgrammaticExecutionArtifact]> {
+  const response = await makeRequest(
+    buildCodeApiEndpoint(args.baseUrl, 'exec'),
+    {
+      lang: args.lang,
+      code:
+        args.lang === 'py' ? wrapPythonForPlainExecution(args.code) : args.code,
+      ...(args.timeout != null ? { timeout: args.timeout } : {}),
+      ...(args.sessionId != null && args.sessionId !== ''
+        ? { session_id: args.sessionId }
+        : {}),
+      ...(args.files != null && args.files.length > 0
+        ? { files: args.files }
+        : {}),
+      ...(args.runtimeSessionHint != null
+        ? { runtime_session_hint: args.runtimeSessionHint }
+        : {}),
+    },
+    args.proxy,
+    args.authHeaders,
+    args.executionProfile
+  );
+
+  return formatCompletedResponse(response, args.code);
 }
 
 // ============================================================================
@@ -887,11 +1095,11 @@ export function createProgrammaticToolCallingTool(
   const maxRunTimeoutMs = resolveCodeApiRunTimeoutMs(initParams.runTimeoutMs);
   const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.PTC_DEBUG === 'true';
-  const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
+  const EXEC_ENDPOINT = buildCodeApiEndpoint(baseUrl, 'exec/programmatic');
 
   return tool(
     async (rawParams, config) => {
-      const params = rawParams as { code: string; timeout?: number };
+      const params = rawParams as ProgrammaticInvocationParams;
       const { code } = params;
       const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
@@ -904,40 +1112,77 @@ export function createProgrammaticToolCallingTool(
         };
       const {
         toolMap,
-        toolDefs,
+        disallowedToolDefs,
         session_id,
         _injected_files,
         _runtime_session_hint,
       } = toolCall;
+      const toolDefs = resolveProgrammaticToolDefinitions(
+        toolCall as typeof toolCall & { tools?: t.LCTool[] }
+      );
 
-      if (toolMap == null || toolMap.size === 0) {
-        throw new Error(
-          'No toolMap provided. ' +
-            'ToolNode should inject this from AgentContext when invoked through the graph.'
-        );
+      const programmaticToolName =
+        toolCall.programmaticToolName ??
+        (typeof toolCall.name === 'string' && toolCall.name !== ''
+          ? toolCall.name
+          : Constants.PROGRAMMATIC_TOOL_CALLING);
+      const effectiveTools = selectProgrammaticTools({
+        requestedToolNames: params.tool_manifest,
+        allowedToolDefs: toolDefs,
+        disallowedToolDefs,
+        programmaticToolName,
+      });
+
+      /* These guard the replay path only. A call that selected no tools never
+       * replays, and event-driven ToolNode configurations legitimately inject
+       * an empty toolMap/toolDefs. Injected context is still required to
+       * conclude that — with nothing injected at all, an empty selection means
+       * the host wired the tool up wrong. */
+      const needsNoTools =
+        effectiveTools.length === 0 &&
+        (params.tool_manifest?.length === 0 ||
+          toolDefs != null ||
+          disallowedToolDefs != null);
+
+      if (!needsNoTools) {
+        if (toolMap == null || toolMap.size === 0) {
+          throw new Error(
+            'No toolMap provided. ' +
+              'ToolNode should inject this from AgentContext when invoked through the graph.'
+          );
+        }
+
+        if (toolDefs == null || toolDefs.length === 0) {
+          throw new Error(
+            'No tool definitions provided. ' +
+              'Either pass tools in the input or ensure ToolNode injects toolDefs.'
+          );
+        }
       }
 
-      if (toolDefs == null || toolDefs.length === 0) {
-        throw new Error(
-          'No tool definitions provided. ' +
-            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
-        );
-      }
+      assertUnambiguousIdentifiers(
+        effectiveTools,
+        normalizeToPythonIdentifier,
+        programmaticToolName
+      );
+
+      const effectiveToolMap = projectProgrammaticToolMap(
+        toolMap ?? new Map(),
+        effectiveTools
+      );
 
       let roundTrip = 0;
 
       try {
         // ====================================================================
-        // Phase 1: Filter tools and make initial request
+        // Phase 1: Send the validated tool manifest with the initial request
         // ====================================================================
-
-        const effectiveTools = filterToolsByUsage(toolDefs, code, debug);
 
         if (debug) {
           // eslint-disable-next-line no-console
           console.log(
             `[PTC Debug] Sending ${effectiveTools.length} tools to API ` +
-              `(filtered from ${toolDefs.length})`
+              `(selected from ${toolDefs?.length ?? 0})`
           );
         }
 
@@ -951,21 +1196,43 @@ export function createProgrammaticToolCallingTool(
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          // eslint-disable-next-line no-console
-          console.debug(
-            `[ProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          logCodeApiDiagnostic(
+            'ProgrammaticToolCalling',
+            'debug',
+            'session carried no injected files; exec will run without input files',
+            { files: 'none' }
           );
         }
 
-        /* Stateful sessions: hint rides the INITIAL request only; the server
-         * binds continuation round-trips to the same runtime via the
-         * continuation_token. Additive — ignored by stateless servers. PTC
-         * keeps its stateless prompt in v1; only the wire hint plumbs here. */
+        /* The hint rides the INITIAL request only; continuation_token binds
+         * later round-trips. Prefer trusted per-agent factory context over
+         * legacy ToolNode injection. Explicit default profiles always drop it.
+         * PTC keeps its stateless runtime prompt in v1. */
+        const selectedRuntimeSessionHint = selectRuntimeSessionHint(
+          initParams.runtimeSessionHint,
+          _runtime_session_hint
+        );
         const runtimeSessionHint =
-          typeof _runtime_session_hint === 'string' &&
-          _runtime_session_hint !== ''
-            ? _runtime_session_hint
+          initParams.executionProfile !== 'default' &&
+          typeof selectedRuntimeSessionHint === 'string' &&
+          selectedRuntimeSessionHint !== ''
+            ? selectedRuntimeSessionHint
             : undefined;
+
+        if (needsNoTools) {
+          return await runPlainExecution({
+            baseUrl,
+            lang: 'py',
+            code,
+            timeout,
+            sessionId: session_id,
+            files,
+            runtimeSessionHint,
+            proxy,
+            authHeaders: initParams.authHeaders,
+            executionProfile: initParams.executionProfile,
+          });
+        }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,
@@ -980,7 +1247,9 @@ export function createProgrammaticToolCallingTool(
               : {}),
           },
           proxy,
-          initParams.authHeaders
+          initParams.authHeaders,
+          initParams.executionProfile,
+          config.signal
         );
 
         // ====================================================================
@@ -1007,7 +1276,7 @@ export function createProgrammaticToolCallingTool(
 
           const toolResults = await executeTools(
             response.tool_calls ?? [],
-            toolMap
+            effectiveToolMap
           );
 
           response = await makeRequest(
@@ -1017,7 +1286,9 @@ export function createProgrammaticToolCallingTool(
               tool_results: toolResults,
             },
             proxy,
-            initParams.authHeaders
+            initParams.authHeaders,
+            initParams.executionProfile,
+            config.signal
           );
         }
 
@@ -1039,9 +1310,11 @@ export function createProgrammaticToolCallingTool(
           (error as Error).message,
           code
         );
-        throw new Error(
-          `Programmatic execution failed: ${messageWithReminder}`
-        );
+        const message = `Programmatic execution failed: ${messageWithReminder}`;
+        if (error instanceof CodeApiRequestError) {
+          throw new CodeApiRequestError(message);
+        }
+        throw new Error(message, { cause: error });
       }
     },
     {

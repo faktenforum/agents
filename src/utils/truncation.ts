@@ -5,6 +5,22 @@
  * consuming the entire context window.
  */
 
+/** Slices by UTF-16 code units, dropping orphaned surrogate halves at either edge. */
+export function sliceWithoutSplittingSurrogates(
+  value: string,
+  start: number,
+  end?: number
+): string {
+  const sliced = value.slice(start, end);
+  const first = sliced.charCodeAt(0);
+  const last = sliced.charCodeAt(sliced.length - 1);
+  const trimStart = first >= 0xdc00 && first <= 0xdfff;
+  const trimEnd = last >= 0xd800 && last <= 0xdbff;
+  return trimStart || trimEnd
+    ? sliced.slice(trimStart ? 1 : 0, sliced.length - (trimEnd ? 1 : 0))
+    : sliced;
+}
+
 /**
  * Absolute hard cap on tool result length (characters).
  * Even if the model has a 1M-token context, a single tool result
@@ -85,7 +101,9 @@ export function truncateToolInput(
 
   if (available < 100) {
     return {
-      _truncated: serialized.slice(0, maxChars) + indicator.trimEnd(),
+      _truncated:
+        sliceWithoutSplittingSurrogates(serialized, 0, maxChars) +
+        indicator.trimEnd(),
       _originalChars: serialized.length,
     };
   }
@@ -95,9 +113,9 @@ export function truncateToolInput(
 
   return {
     _truncated:
-      serialized.slice(0, headSize) +
+      sliceWithoutSplittingSurrogates(serialized, 0, headSize) +
       indicator +
-      serialized.slice(serialized.length - tailSize),
+      sliceWithoutSplittingSurrogates(serialized, serialized.length - tailSize),
     _originalChars: serialized.length,
   };
 }
@@ -126,12 +144,15 @@ export function truncateToolResultContent(
   const indicator = `\n\n… [truncated: ${content.length} chars exceeded ${maxChars} limit] …\n\n`;
   const available = maxChars - indicator.length;
   if (available <= 0) {
-    return content.slice(0, maxChars);
+    return sliceWithoutSplittingSurrogates(content, 0, maxChars);
   }
 
   // When budget is too small for a meaningful tail, fall back to head-only
   if (available < 200) {
-    return content.slice(0, available) + indicator.trimEnd();
+    return (
+      sliceWithoutSplittingSurrogates(content, 0, available) +
+      indicator.trimEnd()
+    );
   }
 
   const headSize = Math.ceil(available * 0.7);
@@ -150,5 +171,34 @@ export function truncateToolResultContent(
     tailStart = tailNewline + 1;
   }
 
-  return content.slice(0, headEnd) + indicator + content.slice(tailStart);
+  return (
+    sliceWithoutSplittingSurrogates(content, 0, headEnd) +
+    indicator +
+    sliceWithoutSplittingSurrogates(content, tailStart)
+  );
+}
+
+/** Absolute hard cap on a single tool-call input (characters). */
+export const HARD_MAX_TOOL_CALL_INPUT_CHARS = 200_000;
+
+/** Smallest JSON value a truncated tool-call input can shrink to. */
+export const MIN_JSON_VALUE_CHARS = 4;
+
+/**
+ * Computes the max tool-call input size for a context window: 15 % of the
+ * window in estimated characters (~4 chars/token), capped at 200K.
+ */
+export function calculateMaxToolCallInputChars(
+  maxContextTokens?: number
+): number {
+  if (maxContextTokens == null || maxContextTokens <= 0) {
+    return HARD_MAX_TOOL_CALL_INPUT_CHARS;
+  }
+  return Math.max(
+    MIN_JSON_VALUE_CHARS,
+    Math.min(
+      Math.floor(maxContextTokens * 0.15) * 4,
+      HARD_MAX_TOOL_CALL_INPUT_CHARS
+    )
+  );
 }

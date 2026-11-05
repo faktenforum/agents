@@ -42,7 +42,9 @@ import {
   STREAM_LIMIT_EPOCH_KEY,
   StreamLimitExceededError,
 } from '@/llm/streamLimits';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { GraphEvents, Providers, StepTypes } from '@/common';
+import * as eagerArgs from '@/tools/eagerEventExecution';
 import { ChatModelStreamHandler } from '@/stream';
 import { ToolNode } from '@/tools/ToolNode';
 import { HandlerRegistry } from '@/events';
@@ -259,6 +261,93 @@ function canonicalToolCall(
 }
 
 describe('eager args divergence (LibreChat#14371)', () => {
+  it('defers readiness parsing until a seal and reuses the parsed request', async () => {
+    const graph = createGraph();
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const parse = jest.spyOn(eagerArgs, 'coerceRecordArgs');
+    await streamChunks({
+      handler,
+      graph,
+      metadata,
+      toolCallChunks: toToolCallChunks('call_1', 'db_query', [
+        '{"sql":',
+        '"select 1"}',
+      ]),
+    });
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(parse).not.toHaveBeenCalled();
+    await streamNextToolIndex({ handler, graph, metadata, callId: 'call_2' });
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0].args).toEqual({ sql: 'select 1' });
+    expect(
+      parse.mock.calls.filter(([value]) => typeof value === 'string')
+    ).toEqual([['{"sql":"select 1"}']]);
+  });
+
+  const benchmark = process.env.BENCH_EAGER_READINESS === '1' ? it : it.skip;
+  benchmark(
+    'benchmarks tool stream handling with deterministic arguments',
+    async () => {
+      installToolExecuteResponder();
+      for (const size of [128, 8192, 49152]) {
+        const payload = JSON.stringify({
+          sql: Array.from(
+            { length: Math.ceil(size / 16) },
+            (_, i) => `column_${i.toString(16).padStart(8, '0')} `
+          )
+            .join('')
+            .slice(0, size),
+        });
+        for (const chunkSize of [64, 256]) {
+          const fragments: string[] = [];
+          for (let i = 0; i < payload.length; i += chunkSize) {
+            fragments.push(payload.slice(i, i + chunkSize));
+          }
+          const samples: number[] = [];
+          const cpuSamples: number[] = [];
+          for (let round = 0; round < 9; round++) {
+            const graph = createGraph();
+            const handler = new ChatModelStreamHandler();
+            const metadata = { langgraph_node: 'agent' };
+            const chunks = toToolCallChunks('call_1', 'db_query', fragments);
+            const cpuStart = process.cpuUsage();
+            const start = performance.now();
+            await streamChunks({
+              handler,
+              graph,
+              metadata,
+              toolCallChunks: chunks,
+            });
+            await streamNextToolIndex({
+              handler,
+              graph,
+              metadata,
+              callId: 'call_2',
+            });
+            const elapsed = performance.now() - start;
+            const cpu = process.cpuUsage(cpuStart);
+            if (round >= 2) {
+              samples.push(elapsed);
+              cpuSamples.push((cpu.user + cpu.system) / 1000);
+            }
+            expect(graph.eagerEventToolExecutions.has('call_1')).toBe(true);
+            jest.clearAllMocks();
+          }
+          process.stdout.write(
+            JSON.stringify({
+              size,
+              chunkSize,
+              elapsedMs: samples.sort((a, b) => a - b)[3],
+              cpuMs: cpuSamples.sort((a, b) => a - b)[3],
+            }) + '\n'
+          );
+        }
+      }
+    }
+  );
+
   afterEach(() => {
     jest.restoreAllMocks();
   });
@@ -511,7 +600,9 @@ describe('eager args divergence (LibreChat#14371)', () => {
       {
         chunk: {
           content: '',
-          tool_calls: [{ id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } }],
+          tool_calls: [
+            { id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } },
+          ],
           response_metadata: { finish_reason: 'tool_calls' },
         } as unknown as t.StreamChunk,
       },
@@ -574,53 +665,218 @@ describe('eager args divergence (LibreChat#14371)', () => {
     expect(toolExecuteCalls).toHaveLength(0);
   });
 
-  it('does not prestart eager tools when the breaker trips during tool-call handling', async () => {
-    const graph = createGraph();
-    const trip = new StreamLimitExceededError({
-      kind: 'tool_call_args',
-      limit: 10,
-      observed: 11,
-      toolName: 'db_query',
-    });
-    const originalDispatch = graph.dispatchRunStep;
-    graph.dispatchRunStep = (async (
-      stepKey: string,
-      details: unknown
-    ): Promise<string> => {
-      const stepId = await (
-        originalDispatch as unknown as (
-          stepKey: string,
-          details: unknown
-        ) => Promise<string>
-      )(stepKey, details);
-      graph.breakerAbort.abort(trip);
-      return stepId;
-    }) as typeof graph.dispatchRunStep;
-    const { toolExecuteCalls } = installToolExecuteResponder();
-    const handler = new ChatModelStreamHandler();
-    const metadata = { langgraph_node: 'agent' };
+  it.each([
+    {
+      label: 'stream limit',
+      trip: new StreamLimitExceededError({
+        kind: 'tool_call_args',
+        limit: 10,
+        observed: 11,
+        toolName: 'db_query',
+      }),
+    },
+    { label: 'blocked', trip: new ProviderTextProtectionError('blocked') },
+    { label: 'timeout', trip: new ProviderTextProtectionError('timeout') },
+    { label: 'cancelled', trip: new ProviderTextProtectionError('cancelled') },
+  ])(
+    'does not prestart eager tools after an awaited $label trip',
+    async ({ trip }) => {
+      const graph = createGraph();
+      const originalDispatch = graph.dispatchRunStep;
+      graph.dispatchRunStep = (async (
+        stepKey: string,
+        details: unknown
+      ): Promise<string> => {
+        const stepId = await (
+          originalDispatch as unknown as (
+            stepKey: string,
+            details: unknown
+          ) => Promise<string>
+        )(stepKey, details);
+        graph.breakerAbort.abort(trip);
+        return stepId;
+      }) as typeof graph.dispatchRunStep;
+      const { toolExecuteCalls } = installToolExecuteResponder();
+      const handler = new ChatModelStreamHandler();
+      const metadata = { langgraph_node: 'agent' };
 
-    /** The trip lands while handleToolCalls awaits the run-step dispatch —
-     * after the queued-event guard already passed. The recheck before the
-     * eager path must stop the prestart. */
+      /** The trip lands while handleToolCalls awaits the run-step dispatch —
+       * after the queued-event guard already passed. The recheck before the
+       * eager path must stop the prestart. */
+      await expect(
+        handler.handle(
+          GraphEvents.CHAT_MODEL_STREAM,
+          {
+            chunk: {
+              content: '',
+              tool_calls: [
+                { id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } },
+              ],
+              response_metadata: { finish_reason: 'tool_calls' },
+            } as unknown as t.StreamChunk,
+          },
+          metadata,
+          graph
+        )
+      ).rejects.toBe(trip);
+      expect(toolExecuteCalls).toHaveLength(0);
+    }
+  );
+
+  it.each(['blocked', 'timeout'] as const)(
+    'stops streamed seals when protection trips during awaited publication (%s)',
+    async (code) => {
+      const graph = createGraph();
+      const trip = new ProviderTextProtectionError(code);
+      const originalDispatch = graph.dispatchRunStep.bind(graph);
+      graph.dispatchRunStep = async (
+        key,
+        details,
+        metadata
+      ): Promise<string> => {
+        const id = await originalDispatch(key, details, metadata);
+        graph.breakerAbort.abort(trip);
+        return id;
+      };
+      const { toolExecuteCalls } = installToolExecuteResponder();
+      const chunk = new AIMessageChunk({
+        content: '',
+        tool_call_chunks: [
+          {
+            index: 0,
+            id: 'sealed-call',
+            name: 'db_query',
+            args: '{"sql":"SELECT 1;"}',
+          },
+        ],
+        response_metadata: {
+          [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+            BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
+          [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
+        },
+      });
+      chunk.tool_calls = [];
+      await expect(
+        new ChatModelStreamHandler().handle(
+          GraphEvents.CHAT_MODEL_STREAM,
+          { chunk },
+          { langgraph_node: 'agent' },
+          graph
+        )
+      ).rejects.toBe(trip);
+      expect(toolExecuteCalls).toHaveLength(0);
+      expect(graph.eagerEventToolExecutions.size).toBe(0);
+      expect(graph.eagerEventToolCallChunks.size).toBe(1);
+    }
+  );
+
+  it('drops already queued stream events after a protection trip', async () => {
+    const graph = createGraph();
+    const trip = new ProviderTextProtectionError('blocked');
+    graph.breakerAbort.abort(trip);
+    const { toolExecuteCalls } = installToolExecuteResponder();
     await expect(
-      handler.handle(
+      new ChatModelStreamHandler().handle(
         GraphEvents.CHAT_MODEL_STREAM,
         {
-          chunk: {
+          chunk: new AIMessageChunk({
             content: '',
             tool_calls: [
-              { id: 'call_1', name: 'db_query', args: { sql: 'SELECT 1;' } },
+              {
+                id: 'queued-call',
+                name: 'db_query',
+                args: { sql: 'SELECT 1;' },
+                type: 'tool_call',
+              },
             ],
             response_metadata: { finish_reason: 'tool_calls' },
-          } as unknown as t.StreamChunk,
+          }),
         },
-        metadata,
+        { langgraph_node: 'agent' },
         graph
       )
     ).rejects.toBe(trip);
+    expect(graph.dispatchRunStep).not.toHaveBeenCalled();
     expect(toolExecuteCalls).toHaveLength(0);
   });
+
+  it.each([
+    { signalSource: 'constructor', shape: 'parsed' },
+    { signalSource: 'constructor', shape: 'seal' },
+    { signalSource: 'call', shape: 'parsed' },
+    { signalSource: 'call', shape: 'seal' },
+  ])(
+    'honors inherited $signalSource trips after awaited $shape handling',
+    async ({ signalSource, shape }) => {
+      const parent = new AbortController();
+      const graph = createGraph(
+        signalSource === 'constructor' ? { signal: parent.signal } : {}
+      );
+      if (signalSource === 'call')
+        graph.config = { ...graph.config, signal: parent.signal };
+      const trip = new ProviderTextProtectionError('blocked');
+      const originalDispatch = graph.dispatchRunStep.bind(graph);
+      graph.dispatchRunStep = async (
+        key,
+        details,
+        metadata
+      ): Promise<string> => {
+        const id = await originalDispatch(key, details, metadata);
+        parent.abort(trip);
+        graph.config = {
+          ...graph.config,
+          signal: new AbortController().signal,
+        };
+        return id;
+      };
+      const { toolExecuteCalls } = installToolExecuteResponder();
+      const chunk =
+        shape === 'parsed'
+          ? new AIMessageChunk({
+            content: '',
+            tool_calls: [
+              {
+                id: 'inherited-call',
+                name: 'db_query',
+                args: { sql: 'SELECT 1;' },
+                type: 'tool_call',
+              },
+            ],
+            response_metadata: { finish_reason: 'tool_calls' },
+          })
+          : new AIMessageChunk({
+            content: '',
+            tool_call_chunks: [
+              {
+                index: 0,
+                id: 'inherited-call',
+                name: 'db_query',
+                args: '{"sql":"SELECT 1;"}',
+              },
+            ],
+            response_metadata: {
+              [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+                  BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
+              [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: {
+                kind: 'single',
+                index: 0,
+              },
+            },
+          });
+      if (shape === 'seal') chunk.tool_calls = [];
+      await expect(
+        new ChatModelStreamHandler().handle(
+          GraphEvents.CHAT_MODEL_STREAM,
+          { chunk },
+          { langgraph_node: 'agent' },
+          graph
+        )
+      ).rejects.toBe(trip);
+      expect(graph.breakerAbort.signal.aborted).toBe(false);
+      expect(toolExecuteCalls).toHaveLength(0);
+      expect(graph.eagerEventToolExecutions.size).toBe(0);
+    }
+  );
 
   it('sends a breaker-composed abort signal with eager prestart requests', async () => {
     const graph = createGraph();

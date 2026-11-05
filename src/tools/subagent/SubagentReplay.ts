@@ -1,8 +1,20 @@
 import type { ToolCall, ToolMessage } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type {
+  FadingTier,
+  FadingTiers,
+  RunStepResumeState,
+  ToolSessionContext,
+} from '@/types';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { ToolApprovalReplaySnapshot } from '@/hooks';
-import type { ToolSessionContext } from '@/types';
+import {
+  attachRunStepResumeState,
+  getRunStepResumeState,
+  isRunStepResumeState,
+  stripRunStepResumeState,
+} from '@/tools/runStepResume';
+import { isFadingTier, isLegacyFadingTier } from '@/messages/fading';
 
 export const SUBAGENT_RESUME_MANIFEST_CONFIG_KEY =
   '__librechat_subagent_resume_manifest';
@@ -23,6 +35,7 @@ const SUBAGENT_RESUME_PRIVATE_PAYLOAD_KEYS = [
   SUBAGENT_RESUME_WRAPPER_VERSION_KEY,
 ] as const;
 const MAX_RESUME_MANIFEST_DEPTH = 32;
+const HOST_ARGS_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
 export interface SubagentCheckpointReference {
   threadId: string;
@@ -57,7 +70,10 @@ export interface SubagentGraphResumeState {
   toolNodes: SubagentToolNodeResumeState[];
   eagerToolUsage: SubagentEagerToolUsageState[];
   eagerToolSuppressions: string[];
+  runStepState?: RunStepResumeState;
   toolOutputReferences?: ToolOutputReferenceState;
+  fadingTier?: FadingTier;
+  fadingTiers?: FadingTiers;
 }
 
 /** Private checkpoint payload linking a parent pause to an exact child state. */
@@ -68,6 +84,8 @@ export interface SubagentResumeExecution {
   subagentType?: string;
   /** Lazy child revision bound when this execution first resolved. */
   configId?: string;
+  /** SHA-256 identity of the host arguments bound to this execution; never the values. */
+  hostArgsDigest?: string;
   approvalExecutionScope: string;
   checkpoints: SubagentCheckpointReference[];
   graphState: SubagentGraphResumeState;
@@ -186,7 +204,7 @@ function isDirectPathTurnReference(
   return isString(entry.toolCallId) && isNonnegativeInteger(entry.turn);
 }
 
-function isToolNodeResumeState(
+export function isToolNodeResumeState(
   value: unknown
 ): value is SubagentToolNodeResumeState {
   if (value == null || typeof value !== 'object') {
@@ -251,7 +269,7 @@ function isToolOutputReferenceEntry(
   return isString(entry.key) && typeof entry.value === 'string';
 }
 
-function isToolOutputReferenceState(
+export function isToolOutputReferenceState(
   value: unknown
 ): value is ToolOutputReferenceState {
   if (value == null || typeof value !== 'object') {
@@ -275,6 +293,11 @@ function isToolOutputReferenceState(
   );
 }
 
+/** A current tier, or a legacy one the run then drops so it re-derives. */
+function isStoredFadingTier(value: unknown): boolean {
+  return isFadingTier(value) || isLegacyFadingTier(value);
+}
+
 function isGraphResumeState(value: unknown): value is SubagentGraphResumeState {
   if (value == null || typeof value !== 'object') {
     return false;
@@ -291,8 +314,14 @@ function isGraphResumeState(value: unknown): value is SubagentGraphResumeState {
     !state.eagerToolUsage.every(isEagerToolUsageState) ||
     !Array.isArray(state.eagerToolSuppressions) ||
     !state.eagerToolSuppressions.every(isString) ||
+    (state.runStepState != null && !isRunStepResumeState(state.runStepState)) ||
     (state.toolOutputReferences != null &&
-      !isToolOutputReferenceState(state.toolOutputReferences))
+      !isToolOutputReferenceState(state.toolOutputReferences)) ||
+    (state.fadingTier != null && !isStoredFadingTier(state.fadingTier)) ||
+    (state.fadingTiers != null &&
+      (typeof state.fadingTiers !== 'object' ||
+        Array.isArray(state.fadingTiers) ||
+        !Object.values(state.fadingTiers).every(isStoredFadingTier)))
   ) {
     return false;
   }
@@ -328,6 +357,7 @@ function isSubagentResumeExecution(
   const childRunId = execution.childRunId;
   const subagentType = execution.subagentType;
   const configId = execution.configId;
+  const hostArgsDigest = execution.hostArgsDigest;
   const approvalExecutionScope = execution.approvalExecutionScope;
   const checkpoints = execution.checkpoints;
   const graphState = execution.graphState;
@@ -337,6 +367,9 @@ function isSubagentResumeExecution(
     !isString(childRunId) ||
     (subagentType != null && !isString(subagentType)) ||
     (configId != null && !isString(configId)) ||
+    (hostArgsDigest != null &&
+      (typeof hostArgsDigest !== 'string' ||
+        !HOST_ARGS_DIGEST_PATTERN.test(hostArgsDigest))) ||
     !isString(approvalExecutionScope) ||
     !Array.isArray(checkpoints) ||
     checkpoints.length === 0 ||
@@ -412,6 +445,7 @@ function isSubagentResumeManifest(
 export function getSubagentResumeManifest(
   payload: unknown
 ): SubagentResumeManifest | undefined {
+  payload = stripRunStepResumeState(payload);
   if (payload == null || typeof payload !== 'object') {
     return undefined;
   }
@@ -489,6 +523,13 @@ export function attachSubagentResumeManifest(
   payload: unknown,
   manifest: SubagentResumeManifest
 ): object {
+  const runStepState = getRunStepResumeState(payload);
+  if (runStepState != null) {
+    return attachRunStepResumeState(
+      attachSubagentResumeManifest(stripRunStepResumeState(payload), manifest),
+      runStepState
+    );
+  }
   if (
     isWrappedSubagentResumePayload(payload) ||
     isInlineSubagentResumePayload(payload)
@@ -512,6 +553,7 @@ export function attachSubagentResumeManifest(
 }
 
 export function stripSubagentResumeManifest(payload: unknown): unknown {
+  payload = stripRunStepResumeState(payload);
   if (isWrappedSubagentResumePayload(payload)) {
     return payload[SUBAGENT_RESUME_WRAPPED_PAYLOAD_KEY];
   }
