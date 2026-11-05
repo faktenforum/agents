@@ -104,6 +104,15 @@ function createGoogleFunctionResponsePart({
  */
 export const iife = <T>(fn: () => T): T => fn();
 
+/** `gemini-3`, `gemini-3.8-flash`, `gemini-4-argon`, and any later major version. */
+const GEMINI_3_PLUS_PATTERN = /^gemini-(?:[3-9]|[1-9]\d+)(?:[.-]|$)/;
+
+/** Whether `model` (optionally `models/` or provider prefixed) is Gemini 3 or later. */
+export function isGemini3PlusModel(model?: string): boolean {
+  const modelId = model?.toLowerCase().split('/').pop() ?? '';
+  return GEMINI_3_PLUS_PATTERN.test(modelId);
+}
+
 export function getMessageAuthor(message: BaseMessage): string {
   const type = message._getType();
   if (ChatMessage.isInstance(message)) {
@@ -540,7 +549,7 @@ export function convertMessageContentToParts(
             return signature;
           }
         }
-        if (model?.includes('gemini-3') === true) {
+        if (isGemini3PlusModel(model)) {
           return DUMMY_SIGNATURE;
         }
         return '';
@@ -659,18 +668,38 @@ export function convertBaseMessagesToContent(
 }
 
 /**
- * Gemini models that reject a request whose `contents` end with a `model`-role
- * turn (a "prefill"). Google enforces this on newer generations (Gemini 3.7
- * Flash, Gemini 3.6 Flash, Gemini 3.5 Flash-Lite) while older/sibling models
- * still accept a trailing model turn, so the rule is model-scoped rather than
- * version-wide. Extend this list as Google applies the restriction to further
- * models.
+ * Gemini Flash generation from which Google rejects a request whose `contents`
+ * end with a `model`-role turn (a "prefill"). Every Flash release from 3.6
+ * onward enforces it, so the cutoff is derived from the model id rather than
+ * enumerated - a new Flash model is covered on release with no change here.
+ *
+ * Scoped to Flash deliberately: dropping the turn silently degrades a working
+ * prefill into a fresh generation, so the rule only widens where Google
+ * documents the restriction. Lines that reject it without matching the cutoff
+ * are listed in {@link NO_PREFILL_GEMINI_MODELS}.
  * @see https://ai.google.dev/gemini-api/docs/latest-model#api-changes-and-parameter-updates
  */
+const NO_PREFILL_FLASH_MIN_VERSION = { major: 3, minor: 6 } as const;
+
+/**
+ * `gemini-<major>[.<minor>]-flash`, with optional suffixes (`-latest`, `-lite`).
+ * Google ships both forms — `gemini-3.7-flash` and the major-only
+ * `gemini-3-flash-preview` — so the minor component is optional and an omitted
+ * one reads as `.0`.
+ */
+const GEMINI_FLASH_VERSION_PATTERN = /^gemini-(\d+)(?:\.(\d+))?-flash(?:$|-)/;
+
+/**
+ * Models that reject prefill outside the Flash version cutoff
+ * ({@link NO_PREFILL_FLASH_MIN_VERSION}). Gemini 3.5 Flash-Lite enforces the
+ * restriction while its sibling Gemini 3.5 Flash still accepts a trailing model
+ * turn, so the 3.5 generation cannot be expressed as a version cutoff. Gemini 4
+ * Argon is not a Flash model; its histories cannot end in a `model` turn.
+ * @see https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-4-argon
+ */
 const NO_PREFILL_GEMINI_MODELS = [
-  'gemini-3.7-flash',
-  'gemini-3.6-flash',
   'gemini-3.5-flash-lite',
+  'gemini-4-argon',
 ] as const;
 
 export function rejectsModelTurnPrefill(model?: string): boolean {
@@ -678,9 +707,22 @@ export function rejectsModelTurnPrefill(model?: string): boolean {
     return false;
   }
   const modelId = model.toLowerCase().split('/').pop() ?? '';
-  return NO_PREFILL_GEMINI_MODELS.some(
+  const listed = NO_PREFILL_GEMINI_MODELS.some(
     (id) => modelId === id || modelId.startsWith(`${id}-`)
   );
+  if (listed) {
+    return true;
+  }
+  const match = GEMINI_FLASH_VERSION_PATTERN.exec(modelId);
+  if (!match) {
+    return false;
+  }
+  const major = Number(match[1]);
+  const minor = Number(match[2] || '0');
+  if (major !== NO_PREFILL_FLASH_MIN_VERSION.major) {
+    return major > NO_PREFILL_FLASH_MIN_VERSION.major;
+  }
+  return minor >= NO_PREFILL_FLASH_MIN_VERSION.minor;
 }
 
 /**

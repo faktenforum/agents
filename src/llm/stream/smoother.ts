@@ -1,3 +1,5 @@
+import { isProtectedProviderTextSignal } from '@/protection/providerText';
+
 export const DEFAULT_STREAM_DELAY = 25;
 export const SMOOTH_TARGET_LATENCY_MS = 250;
 export const MAX_STREAM_QUEUE_CHUNKS = 256;
@@ -52,10 +54,7 @@ export function isSignalAborted(signal?: AbortSignal): boolean {
  */
 export const STREAM_BOUNDARY_LOOKAHEAD_CHARS = 64;
 
-export function findStreamChunkBoundary(
-  text: string,
-  minSize: number
-): number {
+export function findStreamChunkBoundary(text: string, minSize: number): number {
   if (minSize >= text.length) {
     return text.length;
   }
@@ -204,8 +203,8 @@ export async function* smoothStream<TEmit>({
   signal?: AbortSignal;
   abortUpstream?: () => void;
 }): AsyncGenerator<TEmit> {
-  if (!(delayMs > 0)) {
-    /** Disabled smoothing preserves fully lazy streaming: no background
+  if (!(delayMs > 0) || isProtectedProviderTextSignal(signal)) {
+    /** Disabled/protected smoothing preserves fully lazy streaming: no background
      * producer, no read-ahead — each provider chunk is pulled only when the
      * consumer asks, exactly like the pre-engine pass-through paths. */
     for await (const item of source) {
@@ -238,8 +237,7 @@ export async function* smoothStream<TEmit>({
 
   const hasQueuedItems = (): boolean => queuedItemIndex < queuedItems.length;
 
-  const getQueuedItemCount = (): number =>
-    queuedItems.length - queuedItemIndex;
+  const getQueuedItemCount = (): number => queuedItems.length - queuedItemIndex;
 
   const isQueueAtCapacity = (): boolean =>
     getQueuedItemCount() >= MAX_STREAM_QUEUE_CHUNKS ||
@@ -274,11 +272,7 @@ export async function* smoothStream<TEmit>({
   };
 
   const waitForQueueSpace = async (): Promise<void> => {
-    while (
-      isQueueAtCapacity() &&
-      !consumerClosed &&
-      !isSignalAborted(signal)
-    ) {
+    while (isQueueAtCapacity() && !consumerClosed && !isSignalAborted(signal)) {
       await new Promise<void>((resolve) => {
         const onAbort = (): void => {
           signal?.removeEventListener('abort', onAbort);

@@ -1,7 +1,10 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { buildSummaryCarrierText } from '@/summarization/shared';
 import { addBedrockCacheControl } from '@/messages/cache';
+import { createTokenCounter } from '@/utils/tokens';
 import { Constants, Providers } from '@/common';
 import { AgentContext } from '../AgentContext';
 
@@ -18,19 +21,26 @@ describe('AgentContext', () => {
     agentConfig?: Partial<t.AgentInputs>;
     tokenCounter?: t.TokenCounter;
     indexTokenCountMap?: Record<string, number>;
+    toolExecution?: t.ToolExecutionConfig;
   };
 
   const createBasicContext = (options: ContextOptions = {}): AgentContext => {
-    const { agentConfig = {}, tokenCounter, indexTokenCountMap } = options;
+    const {
+      agentConfig = {},
+      tokenCounter,
+      indexTokenCountMap,
+      toolExecution,
+    } = options;
     return AgentContext.fromConfig(
       {
         agentId: 'test-agent',
         provider: Providers.OPENAI,
         instructions: 'Test instructions',
         ...agentConfig,
-      },
+      } as t.AgentInputs,
       tokenCounter,
-      indexTokenCountMap
+      indexTokenCountMap,
+      toolExecution
     );
   };
 
@@ -59,6 +69,21 @@ describe('AgentContext', () => {
       expect(hostGraphTools).toHaveLength(1);
     });
 
+    it('drops graphTools outside the local coding allowlist', () => {
+      const runner = createMockTool('run_tools_with_code');
+      const askTool = createMockTool('ask_user_question');
+      const ctx = createBasicContext({
+        agentConfig: { graphTools: [runner, askTool] },
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      expect(
+        (ctx.graphTools as t.GenericTool[]).map((tool) => tool.name)
+      ).toEqual(['ask_user_question']);
+    });
+
     it('leaves graphTools undefined when the host supplies none (or an empty list)', () => {
       expect(createBasicContext().graphTools).toBeUndefined();
       expect(
@@ -79,6 +104,95 @@ describe('AgentContext', () => {
       const names = (bound as Array<{ name?: string }>).map((t) => t.name);
       expect(names).toContain('ask_user_question');
       expect(names).toContain('echo');
+    });
+  });
+
+  describe('Summary carrier', () => {
+    it('clears the per-run fading reset signal on a fresh reset', () => {
+      const ctx = createBasicContext();
+
+      ctx.setSummary('compacted history', 10);
+      expect(ctx.fadingTierReset).toBe(true);
+
+      ctx.reset();
+      expect(ctx.fadingTierReset).toBe(false);
+    });
+
+    /** The summary's stored token count is a measurement of the carrier built
+     *  by `buildSummaryCarrierText`. If this context ever injected different
+     *  text, every budget read against a persisted summary would be wrong by
+     *  the difference, silently. Asserting they are the same string is what
+     *  makes the accounting checkable in one place. */
+    it('injects exactly the carrier the summary was measured as', async () => {
+      const ctx = createBasicContext();
+      ctx.setSummary('checkpoint body', 0);
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('after compaction'),
+      ]);
+
+      const injected = result.find(
+        (message) =>
+          typeof message.content === 'string' &&
+          message.content.startsWith('<summary>')
+      );
+      expect(injected?.content).toBe(
+        buildSummaryCarrierText('checkpoint body')
+      );
+    });
+  });
+
+  describe('fromConfig — compaction semantic index', () => {
+    it('retains only the bounded snapshot in source inputs', () => {
+      const hostIndex: t.CompactionSemanticIndexEntry[] = [
+        {
+          type: 'activity_phase',
+          sourceMessageId: 'message-1',
+          sourceContentIndex: 0,
+          revision: 1,
+          status: 'committed',
+          text: 'Committed label',
+        },
+        {
+          type: 'activity_phase',
+          sourceMessageId: 'x'.repeat(513),
+          sourceContentIndex: 0,
+          revision: 1,
+          status: 'committed',
+          text: 'Rejected label',
+        },
+      ];
+      const context = createBasicContext({
+        agentConfig: { compactionSemanticIndex: hostIndex },
+      });
+
+      expect(context.compactionSemanticIndex).toHaveLength(1);
+      expect(context._sourceInputs?.compactionSemanticIndex).toBe(
+        context.compactionSemanticIndex
+      );
+      expect(context._sourceInputs?.compactionSemanticIndex).not.toBe(
+        hostIndex
+      );
+
+      const oversizedIndex = Array.from({ length: 257 }, (_, index) => ({
+        type: 'activity_phase' as const,
+        sourceMessageId: 'message-1',
+        sourceContentIndex: index,
+        revision: 1,
+        status: 'committed' as const,
+        text: 'Committed label',
+      }));
+      const oversizedContext = createBasicContext({
+        agentConfig: { compactionSemanticIndex: oversizedIndex },
+      });
+
+      expect(oversizedContext.compactionSemanticIndex).toEqual([]);
+      expect(oversizedContext._sourceInputs?.compactionSemanticIndex).toBe(
+        oversizedContext.compactionSemanticIndex
+      );
+      expect(oversizedContext._sourceInputs?.compactionSemanticIndex).not.toBe(
+        oversizedIndex
+      );
     });
   });
 
@@ -147,7 +261,13 @@ describe('AgentContext', () => {
       ]);
       expect(result[1].content).toBe('Hello');
       expect(result[2].content).toBe('Dynamic instructions');
-      expect(result[3].content).toBe('Second');
+      expect(result[3].content).toEqual([
+        {
+          type: 'text',
+          text: 'Second',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('places Anthropic dynamic instructions before a single latest user prompt', async () => {
@@ -165,7 +285,13 @@ describe('AgentContext', () => {
       ]);
 
       expect(result[1].content).toBe('Dynamic instructions');
-      expect(result[2].content).toBe('Latest');
+      expect(result[2].content).toEqual([
+        {
+          type: 'text',
+          text: 'Latest',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('omits Anthropic cache control when only dynamic system text exists', async () => {
@@ -289,7 +415,13 @@ describe('AgentContext', () => {
       ]);
       expect(result[1].content).toBe('Hello');
       expect(result[2].content).toBe('Dynamic instructions');
-      expect(result[3].content).toBe('Second');
+      expect(result[3].content).toEqual([
+        {
+          type: 'text',
+          text: 'Second',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('keeps dynamic-only OpenRouter instructions as system text', async () => {
@@ -333,7 +465,7 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
     });
 
-    it('does not cache OpenRouter body messages after dynamic instructions', async () => {
+    it('caches the latest OpenRouter body message after dynamic instructions', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.OPENROUTER,
@@ -353,7 +485,13 @@ describe('AgentContext', () => {
 
       expect(result[1].content).toBe('First');
       expect(result[2].content).toBe('Dynamic instructions');
-      expect(result[3].content).toBe('Second');
+      expect(result[3].content).toEqual([
+        {
+          type: 'text',
+          text: 'Second',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('keeps the first OpenRouter user message before single-turn dynamic instructions', async () => {
@@ -404,7 +542,13 @@ describe('AgentContext', () => {
         cache_control: { type: 'ephemeral' },
       });
       expect(result[3].content).toBe('Dynamic instructions');
-      expect(result[4].content).toBe('Latest');
+      expect(result[4].content).toEqual([
+        {
+          type: 'text',
+          text: 'Latest',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('keeps Anthropic dynamic instructions attached to the latest user turn during tool follow-up', async () => {
@@ -530,15 +674,10 @@ describe('AgentContext', () => {
         new AIMessage('4'),
         new HumanMessage('Now answer without tools'),
       ]);
-      const firstAssistant = result[2].content as TestSystemContentBlock[];
       const toolAnswer = result[6].content as TestSystemContentBlock[];
 
       expect(result[1].content).toBe('First turn, no tools');
-      expect(firstAssistant[0]).toMatchObject({
-        type: 'text',
-        text: 'First assistant response',
-        cache_control: { type: 'ephemeral' },
-      });
+      expect(result[2].content).toBe('First assistant response');
       expect(result[3].content).toBe('Use the tool');
       expect((result[4] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
       expect(result[5].getType()).toBe('tool');
@@ -548,7 +687,13 @@ describe('AgentContext', () => {
         cache_control: { type: 'ephemeral' },
       });
       expect(result[7].content).toBe('Dynamic instructions');
-      expect(result[8].content).toBe('Now answer without tools');
+      expect(result[8].content).toEqual([
+        {
+          type: 'text',
+          text: 'Now answer without tools',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('caches stable OpenRouter history before dynamic instructions', async () => {
@@ -578,7 +723,13 @@ describe('AgentContext', () => {
         cache_control: { type: 'ephemeral' },
       });
       expect(result[3].content).toBe('Dynamic instructions');
-      expect(result[4].content).toBe('Latest');
+      expect(result[4].content).toEqual([
+        {
+          type: 'text',
+          text: 'Latest',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('keeps OpenRouter opening user message before dynamic tool-follow-up context', async () => {
@@ -704,15 +855,10 @@ describe('AgentContext', () => {
         new AIMessage('4'),
         new HumanMessage('Now answer without tools'),
       ]);
-      const firstAssistant = result[2].content as TestSystemContentBlock[];
       const toolAnswer = result[6].content as TestSystemContentBlock[];
 
       expect(result[1].content).toBe('First turn, no tools');
-      expect(firstAssistant[0]).toMatchObject({
-        type: 'text',
-        text: 'First assistant response',
-        cache_control: { type: 'ephemeral' },
-      });
+      expect(result[2].content).toBe('First assistant response');
       expect(result[3].content).toBe('Use the tool');
       expect((result[4] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
       expect(result[5].getType()).toBe('tool');
@@ -722,7 +868,13 @@ describe('AgentContext', () => {
         cache_control: { type: 'ephemeral' },
       });
       expect(result[7].content).toBe('Dynamic instructions');
-      expect(result[8].content).toBe('Now answer without tools');
+      expect(result[8].content).toEqual([
+        {
+          type: 'text',
+          text: 'Now answer without tools',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
     });
 
     it('adds a single OpenRouter body cache point on the tail when there is no dynamic tail', async () => {
@@ -766,7 +918,94 @@ describe('AgentContext', () => {
 
       expect(result[1].content).toBe('First');
       expect(result[2].content).toContain('Rotating summary');
-      expect(result[3].content).toBe('Second');
+      expect(result[3].content).toEqual([
+        {
+          type: 'text',
+          text: 'Second',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]);
+    });
+
+    it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+      'places an intra-turn %s checkpoint before an assistant/tool tail',
+      async (provider) => {
+        const ctx = createBasicContext({
+          agentConfig: {
+            provider,
+            clientOptions: {
+              model:
+                provider === Providers.ANTHROPIC
+                  ? 'claude-haiku-4-5'
+                  : 'anthropic/claude-haiku-4.5',
+              promptCache: true,
+            },
+            instructions: 'Stable instructions',
+          },
+        });
+        ctx.setSummary('Intra-turn checkpoint', 7, {
+          precedesMessages: true,
+        });
+
+        const result = await ctx.systemRunnable!.invoke([
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'call_1', name: 'calculator', args: { value: 2 } },
+            ],
+          }),
+          new ToolMessage({
+            content: '4',
+            name: 'calculator',
+            tool_call_id: 'call_1',
+          }),
+        ]);
+
+        expect(JSON.stringify(result[1].content)).toContain(
+          'Intra-turn checkpoint'
+        );
+        expect((result[2] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+        expect(result[3].getType()).toBe('tool');
+      }
+    );
+
+    it('does not insert an Anthropic checkpoint between a native call and result', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-haiku-4-5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setSummary('Intra-turn checkpoint', 7, {
+        precedesMessages: true,
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new AIMessage({
+          content: [
+            { type: 'tool_use', id: 'call_1', name: 'search', input: {} },
+          ],
+        }),
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_1',
+              content: 'result',
+            },
+          ],
+        }),
+      ]);
+
+      expect(JSON.stringify(result[1].content)).toContain(
+        'Intra-turn checkpoint'
+      );
+      expect(result[2].getType()).toBe('ai');
+      expect(result[3].getType()).toBe('human');
     });
 
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {
@@ -882,6 +1121,26 @@ describe('AgentContext', () => {
   });
 
   describe('buildProgrammaticOnlyToolsInstructions', () => {
+    it('omits programmatic guidance when no runner is available', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolRegistry: new Map([
+            [
+              'programmatic_tool',
+              {
+                name: 'programmatic_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe('Base');
+    });
+
     it('includes code_execution-only tools in system message', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
@@ -935,7 +1194,7 @@ describe('AgentContext', () => {
       expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
-    it('excludes direct-callable tools from programmatic section', () => {
+    it('makes mixed direct and programmatic caller boundaries explicit', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
           'direct_tool',
@@ -953,13 +1212,366 @@ describe('AgentContext', () => {
             allowed_callers: ['direct', 'code_execution'],
           },
         ],
+        [
+          'programmatic_only_tool',
+          {
+            name: 'programmatic_only_tool',
+            description: 'Programmatic only',
+            allowed_callers: ['code_execution'],
+          },
+        ],
       ]);
 
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Base', toolRegistry },
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
       });
 
-      expect(ctx.systemRunnable).toBeDefined();
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_bash`: `both_tool`, `programmatic_only_tool`.'
+      );
+      expect(content).toContain(
+        'Call these tools directly; never list them in the `tool_manifest` or reference them inside `run_tools_with_bash`: `direct_tool`.'
+      );
+      expect(content).toContain(
+        'the manifest is validated before execution starts'
+      );
+      expect(content).toContain('### Programmatic-Only Tools');
+    });
+
+    it('uses the Cloudflare runner effective registry in guidance', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolRegistry: new Map([
+            [
+              'host_code_tool',
+              {
+                name: 'host_code_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'cloudflare-sandbox',
+          cloudflare: {
+            sandbox: {
+              exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+              readFile: async () => '',
+              writeFile: async () => undefined,
+              mkdir: async () => undefined,
+              listFiles: async () => [],
+              deleteFile: async () => undefined,
+            },
+          },
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain('`read_file`');
+      expect(content).not.toContain('`host_code_tool`');
+    });
+
+    it('uses executable registry guidance for a directly bound graph runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          graphTools: [
+            createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING),
+            createMockTool('executable_tool'),
+          ],
+          toolDefinitions: [
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('`executable_tool`');
+      expect(content).not.toContain('`event_schema_tool`');
+    });
+
+    it('uses executable guidance for an explicitly overridden local runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).not.toContain('`executable_tool`');
+      expect(content).not.toContain('`event_schema_tool`');
+    });
+
+    it('keeps a Cloudflare runner outside the coding allowlist event-dispatched', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+        },
+        toolExecution: {
+          engine: 'cloudflare-sandbox',
+          cloudflare: {
+            codingToolNames: [Constants.BASH_TOOL],
+            sandbox: {
+              exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+              readFile: async () => '',
+              writeFile: async () => undefined,
+              mkdir: async () => undefined,
+              listFiles: async () => [],
+              deleteFile: async () => undefined,
+            },
+          },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: `event_schema_tool`.'
+      );
+    });
+
+    it('keeps direct and event runner capability guidance separate', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          graphTools: [
+            createMockTool(Constants.PROGRAMMATIC_TOOL_CALLING),
+            createMockTool('executable_tool'),
+          ],
+          toolDefinitions: [
+            { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: 'event_schema_tool',
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'executable_tool',
+              {
+                name: 'executable_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('### Direct programmatic runners');
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: `executable_tool`.'
+      );
+      expect(content).toContain('### Event-dispatched programmatic runners');
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_bash`: `event_schema_tool`, `executable_tool`.'
+      );
+    });
+
+    it('recognizes auto-bound local programmatic runners', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolRegistry: new Map([
+            [
+              'host_code_tool',
+              {
+                name: 'host_code_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: { engine: 'local' },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain('inside `run_tools_with_bash`');
+      expect(content).toContain('or `run_tools_with_code`');
+      expect(content).toContain('`write_file`');
+      expect(content).not.toContain('`host_code_tool`');
+    });
+
+    it('describes the Bash default for an auto-bound code runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            {
+              name: Constants.BASH_TOOL,
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              Constants.BASH_TOOL,
+              {
+                name: Constants.BASH_TOOL,
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain('Bash code by default');
+      expect(content).toContain('`lang: "py"`');
+    });
+
+    it('emits direct-only guidance when the allowlist is empty', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).toContain('`direct_tool`');
+    });
+
+    it('preserves definition-only boundaries for a locally replaced runner', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            { name: Constants.PROGRAMMATIC_TOOL_CALLING },
+            { name: 'event_direct_tool', allowed_callers: ['direct'] },
+          ],
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { includeCodingTools: false },
+        },
+      });
+
+      const content = String((await ctx.systemRunnable!.invoke([]))[0].content);
+      expect(content).toContain(
+        'Only these tools may be invoked inside `run_tools_with_code`: none.'
+      );
+      expect(content).toContain(
+        'Call these tools directly; never list them in the `tool_manifest`'
+      );
+      expect(content).toContain('`event_direct_tool`');
+    });
+
+    it('omits deferred programmatic runners until discovery', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            {
+              name: Constants.PROGRAMMATIC_TOOL_CALLING,
+              defer_loading: true,
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      expect(String((await ctx.systemRunnable!.invoke([]))[0].content)).toBe(
+        'Base'
+      );
+
+      ctx.markToolsAsDiscovered([Constants.PROGRAMMATIC_TOOL_CALLING]);
+
+      expect(
+        String((await ctx.systemRunnable!.invoke([]))[0].content)
+      ).toContain('inside `run_tools_with_code`');
+    });
+
+    it('omits programmatic runners that are not direct-callable', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [
+            {
+              name: Constants.PROGRAMMATIC_TOOL_CALLING,
+              allowed_callers: ['code_execution'],
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'direct_tool',
+              { name: 'direct_tool', allowed_callers: ['direct'] },
+            ],
+          ]),
+        },
+      });
+
+      expect(String((await ctx.systemRunnable!.invoke([]))[0].content)).toBe(
+        'Base'
+      );
     });
 
     it('excludes deferred code_execution-only tools until discovered', () => {
@@ -1087,6 +1699,64 @@ describe('AgentContext', () => {
       const result = ctx.getToolsForBinding();
       expect(result?.length).toBe(1);
     });
+
+    it('applies registry caller overrides to event-driven model binding', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [
+            {
+              name: 'event_tool',
+              description: 'Model-facing schema',
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'event_tool',
+              {
+                name: 'event_tool',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+          ]),
+        },
+      });
+
+      expect(ctx.getToolsForBinding()).toEqual([]);
+      expect(ctx.getCallerCapabilityProjectionSnapshot()).toMatchObject({
+        directToolNames: [],
+        codeExecutionToolNames: ['event_tool'],
+      });
+    });
+
+    it('exposes effective defer metadata for provider cache partitioning', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [
+            {
+              name: 'event_tool',
+              defer_loading: true,
+            },
+          ],
+          toolRegistry: new Map([
+            [
+              'event_tool',
+              {
+                name: 'event_tool',
+                defer_loading: false,
+              },
+            ],
+          ]),
+        },
+      });
+
+      expect(ctx.getEffectiveToolDefinitions()).toEqual([
+        {
+          name: 'event_tool',
+          allowed_callers: undefined,
+          defer_loading: false,
+        },
+      ]);
+    });
   });
 
   describe('Token Accounting', () => {
@@ -1122,7 +1792,11 @@ describe('AgentContext', () => {
       ]);
 
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Short', toolRegistry },
+        agentConfig: {
+          instructions: 'Short',
+          toolRegistry,
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+        },
         tokenCounter: mockTokenCounter,
       });
 
@@ -1133,6 +1807,51 @@ describe('AgentContext', () => {
       void ctx.systemRunnable;
 
       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
+    });
+
+    it('ignores a cached toolSchemaTokens total once the local allowlist removes tools', async () => {
+      const defs: t.LCTool[] = ['read_file', 'bash_tool'].map((name) => ({
+        name,
+        description: name,
+        parameters: { type: 'object', properties: {} },
+      }));
+      const toolExecution: t.ToolExecutionConfig = {
+        engine: 'local',
+        local: { codingToolNames: ['read_file'] },
+      };
+      const filtered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+        toolExecution,
+      });
+      const unfiltered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+      });
+      await filtered.tokenCalculationPromise;
+      await unfiltered.tokenCalculationPromise;
+      expect(filtered.toolSchemaTokens).not.toBe(99999);
+      expect(unfiltered.toolSchemaTokens).toBe(99999);
+    });
+
+    it('keeps the cached total when a retained tool is a native schema the recount cannot measure', async () => {
+      const nativeSearch = {
+        type: 'function',
+        function: { name: 'web_search', parameters: {} },
+      } as unknown as t.GenericTool;
+      const ctx = createBasicContext({
+        agentConfig: {
+          tools: [createMockTool('bash_tool'), nativeSearch],
+          toolSchemaTokens: 99999,
+        },
+        tokenCounter: mockTokenCounter,
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBe(99999);
     });
 
     it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
@@ -1481,7 +2200,63 @@ describe('AgentContext', () => {
     });
   });
 
+  describe('provider projection rebuild', () => {
+    it('drops the index-keyed original tool content when the canonical prefix changes', () => {
+      const context = createBasicContext();
+      const tool = new ToolMessage({
+        content: 'result',
+        tool_call_id: 'call-1',
+        name: 'tool',
+      });
+      const first = [new HumanMessage('a'), tool];
+      context.getProviderProjectedMessages(first);
+      context.preserveOriginalToolContent(new Map([[1, 'original result']]));
+      expect(context.pendingOriginalToolContent?.get(1)).toBe(
+        'original result'
+      );
+
+      const shifted = [new HumanMessage('inserted'), ...first];
+      context.getProviderProjectedMessages(shifted);
+      expect(context.pendingOriginalToolContent).toBeUndefined();
+
+      context.preserveOriginalToolContent(new Map([[2, 'original result']]));
+      context.getProviderProjectedMessages([...shifted, new AIMessage('done')]);
+      expect(context.pendingOriginalToolContent?.get(2)).toBe(
+        'original result'
+      );
+    });
+  });
+
   describe('reset()', () => {
+    it('retains the stable-message token cache across resets', async () => {
+      const tokenCounter = await createTokenCounter();
+      const ctx = createBasicContext({ tokenCounter });
+      const tokenCountCache = ctx.contextPressureTokenCounts;
+
+      ctx.reset();
+
+      expect(tokenCountCache).toBeDefined();
+      expect(ctx.contextPressureTokenCounts).toBe(tokenCountCache);
+    });
+
+    it('does not persist counts from an unmarked custom counter', () => {
+      const ctx = createBasicContext({ tokenCounter: () => 1 });
+
+      expect(ctx.contextPressureTokenCounts).toBeUndefined();
+    });
+
+    it('accepts an explicitly compatible host token counter', () => {
+      const tokenCounter = markTokenCounterCacheCompatible(jest.fn(() => 1));
+      const ctx = createBasicContext({ tokenCounter });
+      const message = new HumanMessage('stable');
+      tokenCounter.mockClear();
+
+      ctx.contextPressureTokenCounts?.count(message);
+      ctx.contextPressureTokenCounts?.count(message);
+
+      expect(tokenCounter).toHaveBeenCalledTimes(1);
+    });
+
     it('clears all cached state', () => {
       const ctx = createBasicContext({ agentConfig: { instructions: 'Test' } });
 
@@ -1830,7 +2605,10 @@ describe('AgentContext', () => {
 
     it('maintains consistent indexTokenCountMap across turns', () => {
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Base instructions' },
+        agentConfig: {
+          instructions: 'Base instructions',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+        },
         tokenCounter: mockTokenCounter,
       });
 
@@ -1906,6 +2684,7 @@ describe('AgentContext', () => {
         agentConfig: {
           instructions: 'You are helpful.',
           toolRegistry,
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
         },
         tokenCounter: mockTokenCounter,
       });
@@ -1949,6 +2728,7 @@ describe('AgentContext', () => {
         agentConfig: {
           instructions: 'Assistant instructions',
           toolRegistry,
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
         },
         tokenCounter: mockTokenCounter,
       });
@@ -2296,6 +3076,59 @@ describe('AgentContext', () => {
       expect(messages[2]).toBe(originalRef);
       expect((messages[2] as unknown as ToolMessage).content).toBe(
         originalContent
+      );
+    });
+    it('reports retained tool shares without mutating canonical history', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 1_000;
+      ctx.maxToolResultChars = 200;
+
+      const toolCallId = 'projection-tool-call';
+      const originalResult = `result:${'x'.repeat(20_000)}`;
+      const toolCall = new AIMessage({
+        content: ' ',
+        tool_calls: [
+          {
+            id: toolCallId,
+            name: 'lookup',
+            args: { query: 'retained context' },
+          },
+        ],
+      });
+      const toolResult = new ToolMessage({
+        content: originalResult,
+        tool_call_id: toolCallId,
+        name: 'lookup',
+      });
+      const messages: Array<AIMessage | HumanMessage | ToolMessage> = [
+        new HumanMessage('question'),
+        toolCall,
+        toolResult,
+        new AIMessage('final answer'),
+      ];
+
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(messages[1]).toBe(toolCall);
+      expect(messages[2]).toBe(toolResult);
+      expect(toolResult.content).toBe(originalResult);
+
+      const toolMessageTokenCounts = usage!.breakdown.toolMessageTokenCounts;
+      expect(toolMessageTokenCounts).toBeDefined();
+      expect(Object.getPrototypeOf(toolMessageTokenCounts!)).toBeNull();
+      expect(toolMessageTokenCounts!.lookup).toBeGreaterThan(0);
+      expect(toolMessageTokenCounts!.lookup).toBeLessThan(
+        originalResult.length
+      );
+      expect(usage!.breakdown.toolMessageTokens).toBeGreaterThan(
+        toolMessageTokenCounts!.lookup
+      );
+      expect(usage!.breakdown.toolMessageTokens).toBe(
+        toolMessageTokenCounts!.lookup + countByChars(toolCall)
+      );
+      expect(usage!.breakdown.toolMessageTokens).toBeLessThan(
+        originalResult.length
       );
     });
 

@@ -15,6 +15,7 @@ import {
   requiresStreamLimitAccounting,
   StreamLimitExceededError,
   STREAM_LIMIT_EPOCH_KEY,
+  resolveGenerationKey,
 } from '@/llm/streamLimits';
 import {
   getStreamedToolCallSeal,
@@ -54,9 +55,17 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import {
+  createToolCallsDispatchedEvent,
+  safeDispatchCustomEvent,
+} from '@/utils/events';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
+import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
-import { safeDispatchCustomEvent } from '@/utils/events';
+import { formatToolErrorContent } from '@/tools/toolErrorContent';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
+import { isReasoningContentBlock } from '@/messages/core';
 import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
@@ -169,7 +178,8 @@ function hasToolOutputReference(value: unknown): boolean {
 
 function isEagerExecutionExcludedTool(
   name: string,
-  graph: StandardGraph
+  graph: StandardGraph,
+  agentContext?: AgentContext
 ): boolean {
   if (name === '') {
     return false;
@@ -200,9 +210,21 @@ function isEagerExecutionExcludedTool(
   // args, ToolNode discards the eager result but the mutation has already
   // landed in the session workspace, corrupting later runs. Stateless mode
   // uses a throwaway VM per call, so eager prestart stays safe there.
+  if (!CODE_EXECUTION_TOOLS.has(name)) {
+    return false;
+  }
+  if (graph.toolExecution?.sandbox?.statefulSessions === true) {
+    return true;
+  }
+  // A non-default code-session partition is the trusted per-agent signal that
+  // this call must remain isolated from the graph-wide stateless session. The
+  // actual tool factory may route it to a durable backend, which the stream
+  // layer cannot inspect in event-driven mode. Conservatively avoid speculative
+  // execution for these calls so discarded eager results cannot mutate that
+  // agent's workspace.
   return (
-    graph.toolExecution?.sandbox?.statefulSessions === true &&
-    CODE_EXECUTION_TOOLS.has(name)
+    agentContext?.codeSessionKey != null &&
+    agentContext.codeSessionKey !== Constants.EXECUTE_CODE
   );
 }
 
@@ -258,7 +280,8 @@ function toCodeEnvFile(file: t.FileRef, execSessionId: string): t.CodeEnvFile {
 
 function getCodeSessionContext(
   graph: StandardGraph,
-  name: string
+  name: string,
+  agentContext?: AgentContext
 ): t.ToolCallRequest['codeSessionContext'] | undefined {
   if (
     !CODE_EXECUTION_TOOLS.has(name) &&
@@ -269,9 +292,9 @@ function getCodeSessionContext(
     return undefined;
   }
 
-  const codeSession = graph.sessions.get(Constants.EXECUTE_CODE) as
-    | t.CodeSessionContext
-    | undefined;
+  const codeSession = graph.sessions.get(
+    agentContext?.codeSessionKey ?? Constants.EXECUTE_CODE
+  ) as t.CodeSessionContext | undefined;
   if (codeSession?.session_id == null || codeSession.session_id === '') {
     return undefined;
   }
@@ -440,15 +463,6 @@ function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
 
-function isReasoningContentPart(contentPart: t.MessageContentComplex): boolean {
-  return (
-    (contentPart.type?.startsWith(ContentTypes.THINKING) ?? false) ||
-    (contentPart.type?.startsWith(ContentTypes.REASONING) ?? false) ||
-    (contentPart.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
-    contentPart.type === 'redacted_thinking'
-  );
-}
-
 function getReasoningTextFromContentPart(
   contentPart: t.MessageContentComplex
 ): string {
@@ -518,7 +532,7 @@ function shouldStartFreshMessageStepAfterGoogleServerSideTool({
   }
   return (
     content.every((c) => isTextContentPart(c)) ||
-    content.every((c) => isReasoningContentPart(c))
+    content.every((c) => isReasoningContentBlock(c))
   );
 }
 
@@ -635,7 +649,7 @@ async function dispatchGoogleServerSideToolStreamContent({
   }
   reasoningContent.push(
     ...content
-      .filter((contentPart) => isReasoningContentPart(contentPart))
+      .filter((contentPart) => isReasoningContentBlock(contentPart))
       .map((contentPart) => ({
         type: ContentTypes.THINK,
         think: getReasoningTextFromContentPart(contentPart),
@@ -716,11 +730,18 @@ function createEagerToolExecutionPlan(args: {
   // tool from `hasDirectToolCallInBatch`. Excluded calls fall through to normal
   // ToolNode execution; siblings may still eager-execute.
   const candidateToolCalls = unstartedToolCalls.filter(
-    (toolCall) => !isEagerExecutionExcludedTool(toolCall.name, graph)
+    (toolCall) =>
+      !isEagerExecutionExcludedTool(toolCall.name, graph, agentContext)
   );
   if (candidateToolCalls.length === 0) {
     return [];
   }
+  const toolSchemas = new Map(
+    agentContext?.toolDefinitions?.map(({ name, parameters }) => [
+      name,
+      parameters,
+    ])
+  );
 
   // Eager execution must preserve ToolNode batch semantics exactly for every
   // unstarted call. If any candidate cannot be planned, fall back for that
@@ -731,6 +752,10 @@ function createEagerToolExecutionPlan(args: {
         toolCall.id == null ||
         toolCall.id === '' ||
         toolCall.name === '' ||
+        // A serialized parsed call is not a prepared executable object;
+        // parsing is permitted only on sealed raw tool_call_chunks.
+        typeof toolCall.args === 'string' ||
+        graph.clientDelegatedToolNames?.has(toolCall.name) === true ||
         (!skipExisting && graph.eagerEventToolExecutions.has(toolCall.id))
     )
   ) {
@@ -748,9 +773,14 @@ function createEagerToolExecutionPlan(args: {
       name: toolCall.name,
       args: toolCall.args,
       stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
-      codeSessionContext: getCodeSessionContext(graph, toolCall.name),
+      codeSessionContext: getCodeSessionContext(
+        graph,
+        toolCall.name,
+        agentContext
+      ),
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
+    getToolSchema: (toolName) => toolSchemas.get(toolName),
   });
   if (plan == null) {
     return undefined;
@@ -774,6 +804,9 @@ function startEagerToolExecutions(args: {
   skipExisting?: boolean;
 }): void {
   const { graph, metadata, agentContext, toolCalls, skipExisting } = args;
+  // A later call in the same model turn may be client-delegated. Do not
+  // pre-execute an earlier SDK call in a run that rejects mixed batches.
+  if ((graph.clientDelegatedToolNames?.size ?? 0) > 0) return;
   const entries = createEagerToolExecutionPlan({
     graph,
     metadata,
@@ -785,6 +818,21 @@ function startEagerToolExecutions(args: {
     return;
   }
 
+  const codeSessionBaselineById = new Map(
+    entries.map((entry) => [
+      entry.id,
+      new Map(
+        (entry.request.codeSessionContext?.files ?? []).map((file) => [
+          file.name,
+          `${file.storage_session_id}\0${file.id}`,
+        ])
+      ),
+    ])
+  );
+  for (const entry of entries) {
+    entry.request.codeSessionBaselineId =
+      entry.request.codeSessionContext?.session_id;
+  }
   const records: t.EagerEventToolExecution[] = [];
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]
@@ -798,13 +846,23 @@ function startEagerToolExecutions(args: {
       }
     };
     const batchRequest: t.ToolExecuteBatchRequest = {
+      executionContext: graph.subagentExecutionContext,
       toolCalls: entries.map((entry) => entry.request),
       userId: graph.config?.configurable?.user_id as string | undefined,
       agentId: agentContext?.agentId,
-      configurable: graph.config?.configurable as
-        | Record<string, unknown>
-        | undefined,
-      metadata,
+      callerCapabilityProjection: (
+        agentContext as
+          | Partial<Pick<AgentContext, 'getCallerCapabilityProjectionSnapshot'>>
+          | undefined
+      )?.getCallerCapabilityProjectionSnapshot?.(),
+      configurable: {
+        ...graph.config?.configurable,
+        executionContext: graph.subagentExecutionContext,
+      },
+      metadata: {
+        ...metadata,
+        executionContext: graph.subagentExecutionContext,
+      },
       signal: composeAbortSignals(
         graph.config?.signal,
         graph.breakerAbort.signal
@@ -817,6 +875,13 @@ function startEagerToolExecutions(args: {
       reject,
     };
 
+    if (graph.config != null) {
+      void safeDispatchCustomEvent(
+        GraphEvents.ON_TOOL_CALLS_DISPATCHED,
+        createToolCallsDispatchedEvent(graph.config, batchRequest.toolCalls),
+        graph.config
+      );
+    }
     void safeDispatchCustomEvent(
       GraphEvents.ON_TOOL_EXECUTE,
       batchRequest,
@@ -848,6 +913,7 @@ function startEagerToolExecutions(args: {
       toolName: entry.toolName,
       args: entry.coercedArgs,
       request: entry.request,
+      codeSessionBaselineByName: codeSessionBaselineById.get(entry.id),
       promise,
     };
     records.push(record);
@@ -886,9 +952,10 @@ async function dispatchEagerToolCompletions(args: {
     }
     let output: string;
     if (result.status === 'error') {
-      output = truncateToolResultContent(
-        `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
-        maxToolResultChars
+      output = formatToolErrorContent(
+        result.errorMessage,
+        maxToolResultChars,
+        graph.config?.signal
       );
     } else if (typeof result.content === 'string') {
       output = truncateToolResultContent(result.content, maxToolResultChars);
@@ -924,7 +991,7 @@ async function dispatchEagerToolCompletions(args: {
               progress: 1,
               ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
-            completed_at: Date.now(),
+            completed_at: result.received_at ?? Date.now(),
           },
         },
         graph.config
@@ -987,18 +1054,6 @@ function pruneEagerToolCallChunkStates(args: {
       graph.eagerEventToolCallChunks.delete(key);
     }
   }
-}
-
-function isEagerToolChunkStateComplete(
-  state: t.EagerEventToolCallChunkState
-): boolean {
-  return (
-    state.id != null &&
-    state.id !== '' &&
-    state.name != null &&
-    state.name !== '' &&
-    coerceRecordArgs(state.argsText) != null
-  );
 }
 
 function mergeToolCallArgsText(existing: string, incoming: string): string {
@@ -1155,6 +1210,7 @@ function getStreamedReadyToolCalls(args: {
     key: string;
     state: t.EagerEventToolCallChunkState;
     sealedByAdapter: boolean;
+    parsedArgs: ToolCall['args'];
   }> = [];
 
   for (const [key, state] of graph.eagerEventToolCallChunks) {
@@ -1165,7 +1221,12 @@ function getStreamedReadyToolCalls(args: {
       graph.eagerEventToolCallChunks.delete(key);
       continue;
     }
-    if (!isEagerToolChunkStateComplete(state)) {
+    if (
+      state.id == null ||
+      state.id === '' ||
+      state.name == null ||
+      state.name === ''
+    ) {
       continue;
     }
     const isSealedByLaterChunk =
@@ -1184,10 +1245,15 @@ function getStreamedReadyToolCalls(args: {
       isSealedByLaterChunk ||
       isSealedExplicitly
     ) {
+      const parsedArgs = coerceRecordArgs(state.argsText);
+      if (parsedArgs == null) {
+        continue;
+      }
       readyEntries.push({
         key,
         state,
         sealedByAdapter: isSealedExplicitly || seal?.kind === 'all',
+        parsedArgs,
       });
     }
   }
@@ -1207,11 +1273,7 @@ function getStreamedReadyToolCalls(args: {
 
   return readyEntries
     .sort((left, right) => (left.state.index ?? 0) - (right.state.index ?? 0))
-    .flatMap(({ state, sealedByAdapter }) => {
-      const args = coerceRecordArgs(state.argsText);
-      if (args == null) {
-        return [];
-      }
+    .flatMap(({ state, sealedByAdapter, parsedArgs }) => {
       // The final request's args come from LangChain's canonical verbatim
       // concatenation of fragments, while `argsText` reconciles provider
       // quirks with lossy heuristics that can also swallow legitimately
@@ -1242,7 +1304,7 @@ function getStreamedReadyToolCalls(args: {
         {
           id: state.id,
           name: state.name ?? '',
-          args,
+          args: parsedArgs,
         },
       ];
     });
@@ -1296,13 +1358,80 @@ function startReadyStreamedEagerToolExecutions(args: {
   });
 }
 
+/** Shares provider sealing/parsing with event tools, but never relaxes their batch guard. */
+function startPreparedSubagents(
+  graph: StandardGraph,
+  agentContext: AgentContext | undefined,
+  chunk: Partial<AIMessageChunk>,
+  metadata?: Record<string, unknown>
+): void {
+  const attempt = resolveGenerationKey(metadata);
+  if ((graph.clientDelegatedToolNames?.size ?? 0) > 0) return;
+  // A parsed string call is not executable even if the same event carries
+  // sealed raw fragments. Wait for a separately validated complete call.
+  if (chunk.tool_calls?.some((call) => typeof call.args === 'string') === true)
+    return;
+  if (
+    (graph as Partial<StandardGraph>).canPrestartSubagents?.(agentContext) !==
+      true ||
+    graph.preparedSubagents.isOpen(attempt) !== true ||
+    graph.hookRegistry?.hasResultAlteringHooks(
+      graph.preparedSubagents.getConfig(attempt)?.configurable?.run_id
+    ) === true
+  ) {
+    return;
+  }
+  let calls: ToolCall[];
+  if (hasOnArrivalToolCallSeal(chunk) && (chunk.tool_calls?.length ?? 0) > 0) {
+    calls = chunk.tool_calls!;
+  } else {
+    const seal = getStreamedToolCallSeal(chunk.response_metadata);
+    const allowSequentialSeal =
+      canPrestartSequentialStreamedToolChunks(agentContext) ||
+      streamedToolCallAdapterAllowsSequentialSeal(chunk.response_metadata);
+    if (!hasExplicitStreamedToolCallSeals(chunk) && !allowSequentialSeal) {
+      return;
+    }
+    const stepKey = `prepared:${attempt}`;
+    recordEagerToolCallChunks({
+      graph,
+      stepKey,
+      toolCallChunks: chunk.tool_call_chunks ?? [],
+      seal,
+    });
+    calls = getStreamedReadyToolCalls({
+      graph,
+      stepKey,
+      toolCallChunks: chunk.tool_call_chunks,
+      seal,
+      allowSequentialSeal,
+    });
+    pruneEagerToolCallChunkStates({
+      graph,
+      stepKey,
+      toolCallIds: new Set(calls.map((call) => call.id!)),
+    });
+  }
+  for (const call of calls) {
+    if (
+      call.name === Constants.SUBAGENT &&
+      graph.clientDelegatedToolNames?.has(call.name) !== true &&
+      typeof call.args === 'object' &&
+      !Array.isArray(call.args) &&
+      !hasToolOutputReference(call.args)
+    ) {
+      graph.prestartSubagent(call, attempt, agentContext);
+    }
+  }
+}
+
 export function getChunkContent({
   chunk,
   provider,
   reasoningKey,
 }: {
   chunk?: Partial<AIMessageChunk>;
-  provider?: Providers;
+  provider?: t.ProviderName;
   reasoningKey: 'reasoning_content' | 'reasoning';
 }): string | t.MessageContentComplex[] | undefined {
   if (
@@ -1543,7 +1672,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    const chunk = data.chunk as Partial<AIMessageChunk>;
+    let chunk = data.chunk as Partial<AIMessageChunk>;
 
     /** Attempts stamp their breaker epoch into event metadata; a mismatch
      * marks a straggling chunk from a failed run that outlived
@@ -1563,6 +1692,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
       graph.breakerAbort instanceof AbortController
         ? graph.breakerAbort
         : undefined;
+    const entrySignals = [
+      eventBreaker?.signal,
+      graph.signal,
+      graph.config.signal,
+    ];
     /** Immutable scope captured at handler entry. A reset while this
      * handler is suspended in an await replaces the object, so ONE
      * reference comparison proves the event still belongs to the live run
@@ -1571,14 +1705,25 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const runScopeInvalidated = (): boolean =>
       entryRunScope != null && graph.runScope !== entryRunScope;
     const throwIfRunBreakerTripped = (): void => {
-      if (
-        eventBreaker != null &&
-        eventBreaker.signal.aborted &&
-        eventBreaker.signal.reason instanceof StreamLimitExceededError
-      ) {
-        throw eventBreaker.signal.reason;
+      for (const signal of entrySignals) {
+        if (
+          signal?.aborted === true &&
+          (signal.reason instanceof StreamLimitExceededError ||
+            signal.reason instanceof PreparedSubagentError ||
+            signal.reason instanceof ProviderTextProtectionError)
+        ) {
+          throw signal.reason;
+        }
+        if (signal?.aborted === true && graph.providerTextProtection != null) {
+          throw new ProviderTextProtectionError('cancelled');
+        }
       }
     };
+
+    // Callback delivery can beat the producer's iterator. Validate before
+    // accounting, run steps, or eager dispatch reads raw tool descriptors.
+    chunk = snapshotValidatedModelChunk(chunk as AIMessageChunk);
+    const observedAt = Date.now();
 
     /**
      * Enforced before every content-specific early return below
@@ -1667,6 +1812,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
       metadata,
       agentContext,
     });
+    if (runScopeInvalidated()) return;
+    throwIfRunBreakerTripped();
     if (skipHandling) {
       return;
     }
@@ -1701,6 +1848,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
         metadata,
       });
+      if (runScopeInvalidated()) return;
+      throwIfRunBreakerTripped();
     }
 
     if (
@@ -1720,6 +1869,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
         return;
       }
       throwIfRunBreakerTripped();
+      if (hasOnArrivalToolCallSeal(chunk)) {
+        startPreparedSubagents(graph, agentContext, chunk, metadata);
+      }
       if (hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
           graph,
@@ -1781,6 +1933,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
           chunk.response_metadata as Record<string, unknown> | undefined
         );
       const canStreamEager =
+        chunk.tool_calls?.some((call) => typeof call.args === 'string') !==
+          true &&
         (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
         !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
         isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
@@ -1797,6 +1951,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
+        observedAt,
       });
       if (canStreamEager) {
         if (runScopeInvalidated()) {
@@ -1816,6 +1971,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
       }
     }
 
+    if (!hasOnArrivalToolCallSeal(chunk) && !runScopeInvalidated()) {
+      throwIfRunBreakerTripped();
+      startPreparedSubagents(graph, agentContext, chunk, metadata);
+    }
+
     if (isEmptyContent) {
       return;
     }
@@ -1826,7 +1986,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     if (Array.isArray(content) && content.every(isTextContentPart)) {
       const contentGroups = splitAssistantTextContentByPhase(content);
-      const currentStepId = graph.stepKeyIds?.get(stepKey)?.at(-1);
+      const currentStepId = graph.stepKeyIds.get(stepKey)?.at(-1);
       const currentStep =
         currentStepId == null ? undefined : graph.getRunStep(currentStepId);
       const currentPhase =
@@ -1891,6 +2051,23 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
         metadata,
       });
+      runStep = graph.getRunStep(stepId);
+    }
+    if (
+      graph.providerTextProtection != null &&
+      runStep?.type === StepTypes.TOOL_CALLS &&
+      agentContext.currentTokenType === ContentTypes.TEXT &&
+      (typeof content === 'string' || content.every(isTextContentPart))
+    ) {
+      stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        content,
+        contentType: ContentTypes.TEXT,
+        metadata,
+      });
+      if (runScopeInvalidated()) return;
+      throwIfRunBreakerTripped();
       runStep = graph.getRunStep(stepId);
     }
     if (!runStep) {
@@ -2003,7 +2180,7 @@ hasToolCallChunks: ${hasToolCallChunks}
         },
         metadata
       );
-    } else if (content.every((c) => isReasoningContentPart(c))) {
+    } else if (content.every((c) => isReasoningContentBlock(c))) {
       await graph.dispatchReasoningDelta(
         stepId,
         {

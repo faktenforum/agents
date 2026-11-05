@@ -11,6 +11,9 @@ const DEFAULT_MAX_LLM_OUTPUT_CHARS = 50000;
  *  this we drop it whole rather than emit a useless sliver. */
 const MIN_PARTIAL_HIGHLIGHT_CHARS = 200;
 
+export const MISSING_SEARCH_RESULT_DATA_ERROR =
+  'Search provider returned no result data';
+
 /** Resolves the per-search highlight budget from config, the
  *  `SEARCH_MAX_LLM_OUTPUT_CHARS` env var, or the default (50,000 chars). */
 export function resolveMaxLLMOutputChars(maxOutputChars?: number): number {
@@ -48,12 +51,21 @@ function visibleReferenceKeys(text: string): Set<string> {
  *  only the references whose markers survive in the kept prefix — markers in the
  *  cut tail would otherwise emit Core References for citations the model can no
  *  longer see, while a blanket drop would lose still-visible ones. */
-function truncateHighlight(highlight: t.Highlight, text: string, maxLen: number): t.Highlight {
+function truncateHighlight(
+  highlight: t.Highlight,
+  text: string,
+  maxLen: number
+): t.Highlight {
   const prefix = text.slice(0, maxLen);
-  const truncated: t.Highlight = { score: highlight.score, text: `${prefix}\n…[truncated]` };
+  const truncated: t.Highlight = {
+    score: highlight.score,
+    text: `${prefix}\n…[truncated]`,
+  };
   if (highlight.references != null && highlight.references.length > 0) {
     const keys = visibleReferenceKeys(prefix);
-    const visible = highlight.references.filter((ref) => keys.has(`${ref.type}#${ref.originalIndex}`));
+    const visible = highlight.references.filter((ref) =>
+      keys.has(`${ref.type}#${ref.originalIndex}`)
+    );
     if (visible.length > 0) {
       truncated.references = visible;
     }
@@ -71,10 +83,16 @@ function truncateHighlight(highlight: t.Highlight, text: string, maxLen: number)
  *  are left untouched (small, high-signal) and per-source `content` stays in the
  *  `WEB_SEARCH` artifact for citations. Mutates `results` in place; returns how
  *  many highlights were dropped or truncated (0 when everything fit). */
-function trimHighlightsToBudget(results: t.SearchResultData, maxChars: number): number {
+function trimHighlightsToBudget(
+  results: t.SearchResultData,
+  maxChars: number
+): number {
   let used = 0;
   let trimmed = 0;
-  const sections: (t.ValidSource[] | undefined)[] = [results.organic, results.topStories];
+  const sections: (t.ValidSource[] | undefined)[] = [
+    results.organic,
+    results.topStories,
+  ];
   for (const sources of sections) {
     if (sources == null) {
       continue;
@@ -219,9 +237,16 @@ function formatSource(
 
 export function formatResultsForLLM(
   turn: number,
-  results: t.SearchResultData,
+  results?: t.SearchResultData | null,
   maxOutputChars?: number
 ): { output: string; references: t.ResultReference[] } {
+  if (results == null) {
+    return {
+      output: `Search failed: ${MISSING_SEARCH_RESULT_DATA_ERROR}`,
+      references: [],
+    };
+  }
+
   /** Bound highlight content to the per-search budget before formatting */
   const trimmedHighlights = trimHighlightsToBudget(
     results,
@@ -238,6 +263,10 @@ export function formatResultsForLLM(
   };
 
   const references: t.ResultReference[] = [];
+
+  if (results.error != null && results.error !== '') {
+    outputLines.push(`Search failed: ${results.error}`);
+  }
 
   // Organic (web) results
   if (results.organic?.length != null && results.organic.length > 0) {

@@ -1,5 +1,6 @@
 // src/types/stream.ts
 import type {
+  AIMessageChunk,
   MessageContentImageUrl,
   MessageContentText,
   ToolMessage,
@@ -14,6 +15,24 @@ import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
+
+/** One accepted model result, detached from execution state before host dispatch.
+ * Provider chunks, failed attempts and UI run-step events are not this contract. */
+export interface ModelResponseEvent {
+  type: 'model_response';
+  /** Graph-generated acceptance ID, not a provider ID or run-step index. */
+  id: string;
+  agentId: string;
+  /** Graph-state message identity used to correlate ToolNode ownership. */
+  messageId?: string;
+  toolCalls: ReadonlyArray<ToolCall>;
+  /** Same index as toolCalls. Only a trusted graph decision of 'client'
+   * permits this call on the OpenAI client wire; absence fails closed. */
+  toolCallDispositions: ReadonlyArray<'sdk' | 'provider' | 'client'>;
+  invalidToolCalls: ReadonlyArray<
+    NonNullable<AIMessageChunk['invalid_tool_calls']>[number]
+  >;
+}
 
 export type HandleLLMEnd = (
   output: LLMResult,
@@ -103,6 +122,29 @@ export type RunStep = {
   // };
 };
 
+/** Minimal durable lifecycle state needed to continue open run steps. */
+export interface RunStepResumeEntry {
+  step: RunStep;
+  pendingToolCallIds: string[];
+  latestCompletionAt?: number;
+  openMessageStep: boolean;
+}
+
+/** SDK-private state persisted in LangGraph checkpoints for process-safe resume. */
+export interface RunStepResumeState {
+  version: 1;
+  revision: number;
+  nextIndex: number;
+  /** Warm terminal continuations already admitted for this execution. */
+  stopContinuationCount?: number;
+  /** Identifies the fresh execution that owns this continuation lifecycle. */
+  stopContinuationExecutionId?: string;
+  /** Distinguishes LangGraph event keys when a warm continuation restarts steps. */
+  streamSegment?: number;
+  toolCallSteps: Array<{ toolCallId: string; stepId: string }>;
+  steps: RunStepResumeEntry[];
+}
+
 /**
  * Represents a run step delta i.e. any changed fields on a run step during
  * streaming.
@@ -116,6 +158,8 @@ export interface RunStepDeltaEvent {
    * The delta containing the fields that have changed on the run step.
    */
   delta: ToolCallDelta;
+  /** Epoch ms when the SDK received this tool-call fragment, before step dispatch. */
+  observed_at?: number;
 }
 
 /**
@@ -220,6 +264,25 @@ export type ProcessedContent = {
 export type ToolCallCompleted = {
   type: 'tool_call';
   tool_call: ProcessedToolCall;
+};
+
+/**
+ * A tool call has crossed from model-authored argument preparation into SDK
+ * execution. Emitted immediately before host dispatch or direct invocation;
+ * it does not claim the host has begun its own work. Paired with the tool
+ * completion `completed_at`, the stamp measures SDK handoff-to-result time,
+ * not MCP or database execution time. The earliest `observed_at` tool-call
+ * delta for a call bounds its argument preparation time; consumers correlate
+ * deltas by step/index until an ID is known. For a call without streamed
+ * fragments, the preparation start is unknown. Never infer a missing start.
+ * An eager call may dispatch before it has a step ID, and this observational
+ * event may arrive after completion: correlate by tool call ID and timestamps,
+ * not arrival order.
+ */
+export type ToolCallsDispatchedEvent = {
+  dispatched_at: number;
+  runId?: string;
+  toolCalls: Array<{ id: string; name: string; stepId?: string }>;
 };
 
 export type ToolCompleteEvent = ToolCallCompleted & {
@@ -519,3 +582,10 @@ export type ContentAggregatorResult = {
   contentParts: Array<MessageContentComplex | undefined>;
   aggregateContent: ContentAggregator;
 };
+
+/** Ownership, not successful completion. Interrupted/failed batches remain graph-owned. */
+export interface ModelToolsClaimedEvent {
+  type: 'model_tools_claimed';
+  agentId: string;
+  messageId: string;
+}

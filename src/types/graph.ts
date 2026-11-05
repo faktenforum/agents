@@ -1,3 +1,4 @@
+import type { ProviderTextProtection } from '@/protection/providerText';
 // src/types/graph.ts
 import type {
   BaseMessage,
@@ -11,25 +12,31 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
 import type {
+  RunStep,
+  ModelResponseEvent,
+  ModelToolsClaimedEvent,
+  RunStepDeltaEvent,
+  RunStepResumeState,
+  RunStepClosedEvent,
+  ToolCallsDispatchedEvent,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+} from '@/types/stream';
+import type {
   SummarizationNodeInput,
   SummarizeCompleteEvent,
+  CompactionSemanticIndex,
   SummarizationConfig,
   SummarizeStartEvent,
   SummarizeDeltaEvent,
 } from '@/types/summarize';
-import type {
-  RunStep,
-  RunStepDeltaEvent,
-  RunStepClosedEvent,
-  MessageDeltaEvent,
-  ReasoningDeltaEvent,
-} from '@/types/stream';
 import type {
   ToolMap,
   ToolSessionMap,
   ToolEndEvent,
   GenericTool,
   LCTool,
+  ToolExecutionConfig,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
 import type {
@@ -38,9 +45,11 @@ import type {
   StreamPreemption,
   TokenBudgetBreakdown,
 } from '@/types/run';
-import type { Providers, Callback, GraphNodeKeys } from '@/common';
+import type { SubagentResolutionFailureHandler } from '@/tools/subagent/diagnostics';
+import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
-import type { ClientOptions } from '@/types/llm';
+import type { ProviderClientOptionsConfig } from '@/types/llm';
+import type { Callback, GraphNodeKeys } from '@/common';
 
 /** Interface for bound model with stream and invoke methods */
 export interface ChatModel {
@@ -74,8 +83,52 @@ export type SystemCallbacks = {
     : never;
 };
 
+/** An executed, SDK-generated handoff, identified independently of stream events. */
+export interface HandoffTransition {
+  id: string;
+  sourceAgentId: string;
+  targetAgentId: string;
+  toolCallId: string;
+  scope: 'turn' | 'conversation';
+  /** Causal order: number of handoffs visible at this batch's input. */
+  depth: number;
+}
+
+/** Versioned graph checkpoint payload, scoped to one logical user turn. */
+export interface HandoffState {
+  version: 1;
+  executionId: string;
+  entryAgentId: string;
+  maxHandoffs?: number;
+  transitions: HandoffTransition[];
+  parallel: boolean;
+  /** False when resuming an older checkpoint without complete routing provenance. */
+  historyComplete?: boolean;
+}
+
+/** Only a candidate from a completed top-level run may be promoted by a host. */
+export type HandoffOutcome = {
+  executionId: string;
+  entryAgentId: string;
+  transitions: readonly HandoffTransition[];
+} & (
+  | { status: 'candidate'; agentId: string; transitionId: string }
+  | { status: 'unchanged' | 'ambiguous' }
+  | { status: 'incomplete'; reason: string }
+);
+
 export type BaseGraphState = {
   messages: BaseMessage[];
+  runStepState?: RunStepResumeState;
+  /** SDK-owned routing state; hosts must not synthesize it from messages. */
+  handoffState?: HandoffState;
+  /**
+   * The summary a summarize-only run produced. Kept in state because such a
+   * run has no assistant reply: trace roots report it as the run's output
+   * instead of the retained tail or the raw state. Empty once any later run
+   * on the same checkpointed thread starts, so it never outlives its run.
+   */
+  manualSummary?: string;
 };
 
 export type AgentSubgraphState = BaseGraphState & {
@@ -127,15 +180,39 @@ export interface ContextUsageEvent {
   calibrationRatio?: number;
 }
 
+/**
+ * Latched context-fading tier. Caps for historical tool results derive from
+ * `(budgetTokens, masked)` only, so carrying the tier across runs keeps their
+ * truncated bytes stable for prefix-based provider prompt caches. Hosts
+ * persist it beside `calibrationRatio` and pass it back via
+ * `RunConfig.fadingTiers[agentId]`.
+ */
+export interface FadingTier {
+  v: 2;
+  /** Token budget the caps derive from, in raw token space. Never grows;
+   *  clamped to the current context window when seeded. */
+  budgetTokens: number;
+  /** Whether observation masking has activated. Never deactivates. */
+  masked: boolean;
+  /** Whether this tier was reduced, masked, or restored from host state. */
+  latched?: true;
+}
+
+/** Latched fading tiers keyed by agent ID. */
+export type FadingTiers = Record<string, FadingTier>;
+
 export interface EventHandler {
   handle(
     event: string,
     data:
       | StreamEventData
       | ModelEndData
+      | ModelResponseEvent
+      | ModelToolsClaimedEvent
       | RunStep
       | RunStepDeltaEvent
       | RunStepClosedEvent
+      | ToolCallsDispatchedEvent
       | MessageDeltaEvent
       | ReasoningDeltaEvent
       | SummarizeStartEvent
@@ -332,13 +409,22 @@ export type ModelEndData =
   | undefined;
 export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
 export type StandardGraphInput = {
+  providerTextProtection?: ProviderTextProtection;
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
+  /** Execution backend used to resolve the effective tool registry. */
+  toolExecution?: ToolExecutionConfig;
+  /** Trusted single-agent client delegation policy; mixed batches fail closed. */
+  clientDelegatedToolNames?: readonly string[];
   langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
+  /** Persisted default-agent tier retained for single-agent compatibility. */
+  fadingTier?: FadingTier | null;
+  /** Persisted fading tiers keyed by agent ID. */
+  fadingTiers?: FadingTiers | null;
   /**
    * Receives a {@link SubagentUsageEvent} for every model call that reports
    * usage metadata inside a subagent child run spawned from this graph
@@ -351,6 +437,16 @@ export type StandardGraphInput = {
    */
   subagentUsageSink?: SubagentUsageSink;
   /**
+   * Optional host-owned process-local task namespace for detached subagents.
+   * Presence enables `run_in_background` on the subagent tool. Child graphs
+   * do not inherit it, keeping background nesting disabled for the MVP.
+   */
+  subagentTasks?: SubagentTaskConfig;
+  /** Host-owned context and result projection for each isolated child execution. */
+  subagentContext?: SubagentContextAdapter;
+  /** Receives private startup errors; returns only an SDK-owned public cause. */
+  onSubagentResolutionFailure?: SubagentResolutionFailureHandler;
+  /**
    * True when this graph IS a subagent child run (set by `SubagentExecutor`
    * when it constructs the child graph). Drives the hook-input `agentId`
    * subagent-scope marker: hook dispatches from this graph's tool nodes
@@ -361,10 +457,10 @@ export type StandardGraphInput = {
    */
   subagentScope?: boolean;
   /**
-   * Cooperative preemption, forwarded from `RunConfig.preemption`. Only ever
-   * set on the top-level graph: a steer targets the conversation, so subagent
-   * children must run to completion and `buildChildInputs` does not propagate
-   * this field.
+   * Cooperative preemption, forwarded from `RunConfig.preemption`. Ordinary
+   * child graphs do not inherit it. Detached subagent tasks may receive their
+   * own internal parent-control source so an interrupt can reuse the same
+   * provider-safe sealing path without targeting the top-level conversation.
    */
   preemption?: StreamPreemption;
   /**
@@ -387,6 +483,8 @@ export type GraphEdge = {
   condition?: (state: BaseGraphState) => boolean | string | string[];
   /** 'handoff' creates tools for dynamic routing, 'direct' creates direct edges, which also allow parallel execution */
   edgeType?: 'handoff' | 'direct';
+  /** Host may promote the destination after successful top-level completion. */
+  handoffScope?: 'turn' | 'conversation';
   /**
    * For direct edges: Optional prompt to add when transitioning through this edge.
    * String prompts can include variables like {results} which will be replaced with
@@ -416,15 +514,20 @@ export type GraphEdge = {
 
 export type GraphSubagentEdge = Omit<
   GraphEdge,
-  'edgeType' | 'condition' | 'promptKey'
+  'edgeType' | 'condition' | 'promptKey' | 'handoffScope'
 > & {
   edgeType: 'direct';
   condition?: never;
   promptKey?: never;
+  handoffScope?: never;
 };
 
 export type MultiAgentGraphInput = StandardGraphInput & {
   edges: GraphEdge[];
+  /** Explicit fresh-turn entry; absent preserves topology-inferred entry points. */
+  entryAgentId?: string;
+  /** Shared logical-turn handoff cap. Zero forbids handoffs; absent uses only recursion limits. */
+  maxHandoffs?: number;
   /** Captures the designated member's final AI turn in graph state. */
   resultAgentId?: string;
   /** Optional per-member Pregel budget when the outer graph has its own topology budget. */
@@ -473,6 +576,31 @@ export interface SubagentResolveConfigurable {
   user_id?: string;
 }
 
+/**
+ * Optional string argument a host lets the parent model pass on a subagent
+ * call, such as where the child should run. The SDK checks the declared shape
+ * before resolution; the host still authorizes the value in its resolver.
+ */
+export interface SubagentHostArgSpec {
+  /** Model-facing explanation of the argument and when to pass it. */
+  description: string;
+  /**
+   * Values this subagent accepts. Omit to accept a bounded free-form string,
+   * whose format the resolver must check.
+   */
+  enum?: readonly string[];
+  /** Maximum length of a free-form value (at most 256). */
+  maxLength?: number;
+}
+
+/** Host argument declarations keyed by tool-call property name. */
+export type SubagentHostArgSpecs = Readonly<
+  Record<string, SubagentHostArgSpec>
+>;
+
+/** Validated host argument values from one subagent call. */
+export type SubagentHostArgs = Readonly<Record<string, string>>;
+
 /** Runtime context supplied when a host lazily resolves a selected subagent. */
 export interface SubagentResolveContext {
   /** Stable subagent identity selected by the model. */
@@ -491,6 +619,13 @@ export interface SubagentResolveContext {
   signal: AbortSignal;
   /** Stable, sanitized host context from the parent tool invocation. */
   configurable?: Readonly<SubagentResolveConfigurable>;
+  /**
+   * Values the parent passed for this subagent's declared `hostArgs`, already
+   * checked against the declaration. Omitted when the call passed none. Bound
+   * to the execution: a reconstruction with different values is rejected
+   * before the resolver runs.
+   */
+  hostArgs?: SubagentHostArgs;
 }
 
 /** Host contract for resolving a selected subagent's full graph inputs. */
@@ -522,6 +657,12 @@ export interface SubagentConfig extends SubagentConfigBase {
    * `(context.executionId, context.descriptor.configId)`.
    */
   resolveAgentInputs?: SubagentAgentInputsResolver;
+  /**
+   * Optional per-call arguments the parent model may pass for this subagent,
+   * delivered to `resolveAgentInputs` as `context.hostArgs`. Only lazy
+   * configs accept them. Declaring none leaves the tool schema unchanged.
+   */
+  hostArgs?: SubagentHostArgSpecs;
   /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
   self?: boolean;
 }
@@ -538,6 +679,7 @@ export interface GraphSubagentConfig extends SubagentConfigBase {
   kind: 'graph';
   configId?: never;
   resolveAgentInputs?: never;
+  hostArgs?: never;
   allowNested?: false;
   agents: AgentInputs[];
   /**
@@ -598,10 +740,12 @@ export type SubagentUpdatePhase =
   | 'start'
   | 'run_step'
   | 'run_step_delta'
+  | 'tool_calls_dispatched'
   | 'run_step_completed'
   | 'run_step_closed'
   | 'message_delta'
   | 'reasoning_delta'
+  | 'control'
   | 'stop'
   | 'error';
 
@@ -621,6 +765,41 @@ export interface SubagentExecutionContext {
   readonly hookSessionId: string;
   readonly depth: number;
   readonly ancestry: readonly SubagentAncestryEntry[];
+}
+
+/** Trusted identity supplied before a child can access host-owned resources. */
+export interface SubagentContextInput {
+  executionContext: SubagentExecutionContext;
+  parentThreadId?: string;
+  memberAgentIds: readonly string[];
+  signal: AbortSignal;
+  resumed: boolean;
+}
+
+export interface PreparedSubagentContext {
+  /** Added to the initial child input; checkpoint recovery does not add them again. */
+  messages?: BaseMessage[];
+  /** Host configuration; SDK execution and checkpoint identities remain authoritative. */
+  configurable?: RunnableConfig['configurable'];
+  /** Each entry replaces that member's inherited code partition and initial sessions. */
+  agentSessions?: Readonly<
+    Record<string, Pick<AgentInputs, 'codeSessionKey' | 'initialSessions'>>
+  >;
+}
+
+export interface SubagentContextResult {
+  content: string;
+  messages: BaseMessage[];
+}
+
+export interface SubagentContextAdapter {
+  /** Reauthorizes reconstructed executions; durable work must be idempotent by child run ID. */
+  prepare(input: SubagentContextInput): Promise<PreparedSubagentContext>;
+  /** Projects durable references into the result returned to the parent. */
+  complete?(
+    input: SubagentContextInput,
+    result: SubagentContextResult
+  ): Promise<Pick<SubagentContextResult, 'content'>>;
 }
 
 /**
@@ -778,7 +957,26 @@ export interface LangfuseConfig {
    * payloads. Defaults to the Langfuse SDK behavior.
    */
   mediaUploadEnabled?: boolean;
+  /**
+   * Extra HTTP headers sent on every Langfuse export request (OTLP trace
+   * export and media uploads), for self-hosted instances behind an
+   * authenticating proxy or gateway.
+   *
+   * Deployment-level only: one exporter is shared by every span routed to a
+   * destination, so these cannot carry per-request or per-user identity.
+   * Headers participate in destination identity — see
+   * `getLangfuseDestinationKey`.
+   */
+  additionalHeaders?: Record<string, string>;
   metadata?: Record<string, string | number | boolean | null | undefined>;
+  /**
+   * User identity stamped on every trace this run emits — the agent stream,
+   * titles, activity and reasoning labels, and phases. Hosts set it when the
+   * observability identity differs from `configurable.user_id` (an email or
+   * IdP subject instead of an internal database id); that id remains the
+   * fallback when unset or blank.
+   */
+  userId?: string;
   /**
    * Internal OTLP span attributes to attach to Langfuse observations before
    * export. Intended for collector-side routing/filtering; strip these in the
@@ -801,19 +999,27 @@ export interface LangfuseConfig {
   deterministicTraceId?: boolean;
 }
 
-export interface AgentInputs {
+interface AgentInputFields {
   agentId: string;
+  /** Logical endpoint selected by the host before provider resolution. */
+  endpoint?: string;
+  /**
+   * Partition key for transient code-session ids and file refs. Agents with
+   * the same key share those refs; different execution profiles/scopes must
+   * use different keys. Defaults to the legacy shared `execute_code` slot.
+   * Non-default partitions also disable speculative eager execution of code
+   * tools because their factory may target a durable backend.
+   */
+  codeSessionKey?: string;
   /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
   name?: string;
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
-  provider: Providers;
   /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;
   maxContextTokens?: number;
-  clientOptions?: ClientOptions;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
   /** Dynamic system tail appended after stable instructions without provider cache markers. */
@@ -842,7 +1048,28 @@ export interface AgentInputs {
    */
   discoveredTools?: string[];
   summarizationEnabled?: boolean;
+  /**
+   * Runs this agent as a summarize-only pass: the first model step requests
+   * summarization outright instead of consulting the trigger, and the step
+   * after the summary emits its context snapshot and ends the run without a
+   * model call. Hosts use it for user-initiated compaction, where the summary
+   * is the whole response. Requires `summarizationEnabled`: a run that cannot
+   * attempt the summary rejects with `ManualSummarizationSkippedError`
+   * rather than ending with nothing, and one whose provider calls all fail
+   * keeps the history and reports the failure on the summary step. A
+   * multi-agent workflow compiles to the agent that opted in alone; no other
+   * agent runs.
+   */
+  summarizeOnly?: boolean;
   summarizationConfig?: SummarizationConfig;
+  /**
+   * Optional host-supplied, user-visible guidance for compaction. The SDK
+   * validates, bounds, and scopes entries to the messages being compacted;
+   * raw conversation messages remain authoritative. Captured when the
+   * AgentContext is constructed; labels committed later in the same run are
+   * outside this construction-time interface.
+   */
+  compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
    *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
@@ -884,6 +1111,8 @@ export interface AgentInputs {
    */
   graphTools?: GenericTool[];
 }
+
+export type AgentInputs = AgentInputFields & ProviderClientOptionsConfig;
 
 export interface ContextPruningConfig {
   enabled?: boolean;

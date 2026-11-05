@@ -9,10 +9,17 @@ import {
 } from '@langchain/core/messages';
 import type { ContentBlock as LangChainContentBlock } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type {
+  ResponsesReplayPosition,
+  ToolHistoryPreparation,
+  OrderedToolHistoryProjection,
+} from './toolHistoryProjection';
+import type { ProviderMessageProvenancePart } from './provenance';
 import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
+  getToolContentCharLength,
   getBoundedCacheControlledTextToolContent,
   getBoundedSingleTextToolContent,
   getComputerCallOutputScreenshot,
@@ -20,7 +27,22 @@ import {
   isComputerCallOutputMessage,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
+import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  createToolHistoryPreparation,
+  getGeneratedImageMimeType,
+  getResponsesHistorySource,
+  isResponsesReplayPosition,
+} from './toolHistoryProjection';
+import {
+  getProviderMessageProvenance,
+  getProviderSourceMessageIds,
+  hasBijectiveProviderContentPartMapping,
+  setProviderMessageProvenance,
+  stampSyntheticProviderMessage,
+} from './provenance';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { stripAnthropicCacheControl } from './cache';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
@@ -81,7 +103,7 @@ const modifyContent = ({
   messageType,
   content,
 }: {
-  provider: Providers;
+  provider: t.ProviderName;
   messageType: string;
   content: t.ExtendedMessageContent[];
 }): (t.ExtendedMessageContent | null)[] => {
@@ -215,26 +237,33 @@ function getAdditionalReasoningContent(
   return getReasoningDetailsText(additionalKwargs.reasoning_details);
 }
 
+/**
+ * True when a content block is a provider reasoning block: Anthropic
+ * `thinking` / `redacted_thinking`, Google `reasoning`, Bedrock
+ * `reasoning_content`, LibreChat `think`, and their known streamed variants.
+ *
+ * Shared rather than re-derived because two very different readers must agree
+ * on the same answer: the stream classifier, which decides what the host has
+ * been shown, and the preempt gate, which decides whether an accumulated turn
+ * holds anything worth keeping. A turn the host renders as thinking-only must
+ * never look like a visible answer to the gate.
+ *
+ * Exact matching prevents unrelated custom block types that happen to share a
+ * prefix from being silently classified as hidden reasoning.
+ */
+export { isReasoningContentBlock } from './reasoningTypes';
+
 function hasReasoningContent(content: BaseMessage['content']): boolean {
   if (!Array.isArray(content)) {
     return false;
   }
-  return content.some((item) => {
-    if (typeof item !== 'object' || !('type' in item)) {
-      return false;
-    }
-    return (
-      item.type === ContentTypes.THINK ||
-      item.type === ContentTypes.THINKING ||
-      item.type === ContentTypes.REASONING ||
-      item.type === ContentTypes.REASONING_CONTENT ||
-      item.type === 'redacted_thinking'
-    );
-  });
+  return content.some(
+    (item) => typeof item === 'object' && isReasoningContentBlock(item)
+  );
 }
 
 export function modifyDeltaProperties(
-  provider: Providers,
+  provider: t.ProviderName,
   obj?: AIMessageChunk
 ): AIMessageChunk | undefined {
   if (!obj || typeof obj !== 'object') return obj;
@@ -496,26 +525,177 @@ function appendContentBlocks(
   }
 }
 
-/**
- * Appends one artifact/tool-content segment without retaining an unbounded
- * intermediate block array. Both operands are compacted before they are
- * combined, and the combined result is compacted again under the aggregate
- * cap.
- */
-function appendBoundedContent(
-  current: BaseMessage['content'] | undefined,
-  next: unknown,
-  maxChars: number
-): BaseMessage['content'] {
-  const boundedNext = compactToolContent(next, maxChars).content;
-  if (current == null) {
-    return boundedNext;
-  }
+interface BoundedContentAccumulator {
+  readonly blocks: t.MessageContentComplex[];
+  hasContent: boolean;
+  remainingChars: number;
+}
 
-  const combined: t.MessageContentComplex[] = [];
-  appendContentBlocks(combined, current);
-  appendContentBlocks(combined, boundedNext);
-  return compactToolContent(toLangChainContent(combined), maxChars).content;
+function createBoundedContentAccumulator(
+  maxChars: number
+): BoundedContentAccumulator {
+  return {
+    blocks: [],
+    hasContent: false,
+    remainingChars: Number.isFinite(maxChars)
+      ? Math.max(0, Math.floor(maxChars))
+      : Number.MAX_SAFE_INTEGER,
+  };
+}
+
+/** Appends a segment only when at least one of its provider-visible bytes fits.
+ * Each segment is compacted against the remaining budget before combination,
+ * so a later segment cannot be credited merely because recompression replaced
+ * earlier bytes with a truncation notice. */
+function appendBoundedContentSegment(
+  accumulator: BoundedContentAccumulator,
+  next: unknown
+): { contributed: boolean; complete: boolean } {
+  const separatorChars = accumulator.hasContent ? 1 : 0;
+  const availableChars = accumulator.remainingChars - separatorChars;
+  const originalChars = getToolContentCharLength(next);
+  if (originalChars <= 0) {
+    return { contributed: false, complete: true };
+  }
+  if (availableChars <= 0) {
+    return { contributed: false, complete: false };
+  }
+  const compactedNext = compactToolContent(next, availableChars);
+  const boundedNext = compactedNext.content;
+  const appendedChars = Math.min(
+    availableChars,
+    getToolContentCharLength(boundedNext)
+  );
+  if (appendedChars <= 0) {
+    return { contributed: false, complete: false };
+  }
+  appendContentBlocks(accumulator.blocks, boundedNext);
+  accumulator.hasContent = true;
+  accumulator.remainingChars -= separatorChars + appendedChars;
+  return {
+    contributed: true,
+    complete: !compactedNext.changed && originalChars <= availableChars,
+  };
+}
+
+function appendBoundedContentContribution(
+  accumulator: BoundedContentAccumulator,
+  next: unknown
+): {
+  contributed: boolean;
+  complete: boolean;
+  retainedContentPartIndices?: ReadonlySet<number>;
+} {
+  if (!Array.isArray(next)) {
+    return appendBoundedContentSegment(accumulator, next);
+  }
+  const retainedContentPartIndices = new Set<number>();
+  let complete = true;
+  for (let index = 0; index < next.length; index++) {
+    const projection = appendBoundedContentSegment(accumulator, [next[index]]);
+    if (!projection.complete) {
+      complete = false;
+    }
+    if (!projection.contributed) {
+      const separatorChars = accumulator.hasContent ? 1 : 0;
+      if (accumulator.remainingChars <= separatorChars) {
+        if (index < next.length - 1) {
+          complete = false;
+        }
+        break;
+      }
+      continue;
+    }
+    retainedContentPartIndices.add(index);
+  }
+  return {
+    contributed: retainedContentPartIndices.size > 0,
+    complete,
+    retainedContentPartIndices,
+  };
+}
+
+function retainProjectedContentPartProvenance(
+  message: BaseMessage,
+  parts: readonly ProviderMessageProvenancePart[],
+  retainedContentPartIndices: ReadonlySet<number> | undefined,
+  complete: boolean
+): ProviderMessageProvenancePart[] {
+  if (
+    complete &&
+    (retainedContentPartIndices == null ||
+      !Array.isArray(message.content) ||
+      retainedContentPartIndices.size === message.content.length)
+  ) {
+    return [...parts];
+  }
+  const mapsOneToOne = hasBijectiveProviderContentPartMapping(
+    parts,
+    message.content.length
+  );
+  const distinctSourceMessageIds = new Set<string>();
+  for (const part of parts) {
+    if (part.sourceMessageId != null) {
+      distinctSourceMessageIds.add(part.sourceMessageId);
+    }
+  }
+  if (!Array.isArray(message.content)) {
+    const soleSourceMessageId =
+      distinctSourceMessageIds.size === 1
+        ? distinctSourceMessageIds.values().next().value
+        : undefined;
+    return [
+      {
+        attribution: parts[0]?.attribution ?? 'tool',
+        ...(soleSourceMessageId != null && {
+          sourceMessageId: soleSourceMessageId,
+        }),
+      },
+    ];
+  }
+  const retained: ProviderMessageProvenancePart[] = [];
+  const appendUnindexedAttribution = (
+    part: ProviderMessageProvenancePart
+  ): void => {
+    const sourceMessageId =
+      distinctSourceMessageIds.size <= 1 ? part.sourceMessageId : undefined;
+    if (retained.length > 0) {
+      const previous = retained[retained.length - 1];
+      if (
+        previous.attribution === part.attribution &&
+        previous.sourceMessageId === sourceMessageId &&
+        previous.sourceContentPartIndices == null
+      ) {
+        return;
+      }
+    }
+    retained.push({
+      attribution: part.attribution,
+      ...(sourceMessageId != null && { sourceMessageId }),
+    });
+  };
+  for (const part of parts) {
+    if (part.sourceContentPartIndices == null) {
+      appendUnindexedAttribution(part);
+      continue;
+    }
+    if (!mapsOneToOne || retainedContentPartIndices == null) {
+      appendUnindexedAttribution(part);
+      continue;
+    }
+    const sourceContentPartIndices: number[] = [];
+    for (const sourceContentPartIndex of part.sourceContentPartIndices) {
+      if (retainedContentPartIndices.has(sourceContentPartIndex)) {
+        sourceContentPartIndices.push(sourceContentPartIndex);
+      }
+    }
+    if (sourceContentPartIndices.length > 0) {
+      retained.push({ ...part, sourceContentPartIndices });
+    }
+  }
+  return retained.length > 0
+    ? retained
+    : [{ attribution: parts[0]?.attribution ?? 'tool' }];
 }
 
 function cloneAIMessageWithToolCalls(
@@ -668,15 +848,13 @@ function hasReplayableEncryptedReasoning(reasoning: unknown): boolean {
 
 type ResponsesReplayProjection = 'fallback' | 'native';
 
-export const OPENAI_RESPONSES_REPLAY_POSITIONS_KEY =
-  '__openai_responses_replay_positions__';
+export { OPENAI_RESPONSES_REPLAY_POSITIONS_KEY } from './toolHistoryProjection';
 
-export type ResponsesReplayPosition = {
-  contentIndex?: number;
-  itemId: string;
-  kind: 'message' | 'output' | 'reasoning' | 'text';
-  outputIndex: number;
-};
+/** Reasoning item currently streaming, so a terminal ciphertext seals against its own id. */
+export const OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY =
+  '__openai_responses_active_reasoning_id__';
+
+export type { ResponsesReplayPosition } from './toolHistoryProjection';
 
 type CompletedGeneratedImages = {
   blocks: PositionedResponsesReplayBlock[];
@@ -814,6 +992,19 @@ function isCompleteToolStreamContentBlock(block: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+/** Drops incomplete streamed text blocks before provider-facing tool shaping. */
+export function dropIncompleteToolStreamContent(
+  content: AIMessage['content']
+): AIMessage['content'] {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const completeContent = content.filter(isCompleteToolStreamContentBlock);
+  return completeContent.length === content.length
+    ? content
+    : toLangChainContent(completeContent);
 }
 
 function projectPreemptedResponsesV1Content(
@@ -1092,56 +1283,7 @@ function projectPreemptedResponsesV1Content(
 }
 
 function getAuthoritativeResponsesOutput(message: AIMessage): unknown[] {
-  const responseOutput = message.response_metadata.output;
-  const toolOutputs = message.additional_kwargs.tool_outputs;
-  if (Array.isArray(responseOutput) && responseOutput.length > 0) {
-    return responseOutput;
-  }
-  return Array.isArray(toolOutputs) ? toolOutputs : [];
-}
-
-function isResponsesReplayPosition(
-  value: unknown
-): value is ResponsesReplayPosition {
-  if (value == null || typeof value !== 'object') {
-    return false;
-  }
-  const position = value as Partial<ResponsesReplayPosition>;
-  return (
-    (position.kind === 'message' ||
-      position.kind === 'output' ||
-      position.kind === 'reasoning' ||
-      position.kind === 'text') &&
-    typeof position.itemId === 'string' &&
-    position.itemId.length > 0 &&
-    typeof position.outputIndex === 'number' &&
-    Number.isSafeInteger(position.outputIndex) &&
-    position.outputIndex >= 0 &&
-    (position.contentIndex == null ||
-      (typeof position.contentIndex === 'number' &&
-        Number.isSafeInteger(position.contentIndex) &&
-        position.contentIndex >= 0))
-  );
-}
-
-function getGeneratedImageMimeType(data: string): string {
-  const bytes = Buffer.from(data.slice(0, 16), 'base64');
-  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  if (
-    bytes[0] === 0x52 &&
-    bytes[1] === 0x49 &&
-    bytes[2] === 0x46 &&
-    bytes[3] === 0x46 &&
-    bytes[8] === 0x57 &&
-    bytes[9] === 0x45 &&
-    bytes[10] === 0x42 &&
-    bytes[11] === 0x50
-  ) {
-    return 'image/webp';
-  }
-  return 'image/png';
+  return getResponsesHistorySource(message)?.items ?? [];
 }
 
 function getResponsesReplayItemKey(
@@ -1177,7 +1319,8 @@ function getResponsesReplayArtifacts(
   output: readonly unknown[],
   maxChars: number,
   replayProjection: ResponsesReplayProjection,
-  replayPositionValue?: unknown
+  replayPositionValue?: unknown,
+  history?: OrderedToolHistoryProjection
 ): ResponsesReplayArtifacts {
   const blocks: PositionedResponsesReplayBlock[] = [];
   const data = new Set<string>();
@@ -1236,7 +1379,11 @@ function getResponsesReplayArtifacts(
       kind: 'message',
       outputIndex,
     });
-    if (!('content' in item) || !Array.isArray(item.content)) {
+    if (
+      history != null ||
+      !('content' in item) ||
+      !Array.isArray(item.content)
+    ) {
       continue;
     }
     for (
@@ -1266,6 +1413,24 @@ function getResponsesReplayArtifacts(
         kind: 'text',
         outputIndex,
       });
+    }
+  }
+  if (history?.source.coverage === 'complete-output') {
+    for (const contribution of history.contributions) {
+      if (contribution.kind !== 'text') {
+        continue;
+      }
+      const itemId =
+        contribution.itemId ?? `message-${contribution.outputIndex}`;
+      textPositionsByKey.set(
+        `${itemId}:${contribution.outputIndex}:${contribution.contentIndex ?? 0}`,
+        {
+          itemId,
+          kind: 'text',
+          outputIndex: contribution.outputIndex,
+          contentIndex: contribution.contentIndex,
+        }
+      );
     }
   }
   if (hasAuthoritativeMessage) {
@@ -1713,7 +1878,8 @@ function isPreemptedOpenAIResponsesMessage(message: AIMessage): boolean {
 function projectPreemptedOpenAIResponsesMessage(
   message: AIMessage,
   maxChars: number,
-  replayProjection: ResponsesReplayProjection
+  replayProjection: ResponsesReplayProjection,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): AIMessage {
   if (!isPreemptedOpenAIResponsesMessage(message)) {
     return message;
@@ -1724,7 +1890,9 @@ function projectPreemptedOpenAIResponsesMessage(
   const retainsEncryptedReasoning =
     replayProjection === 'native' &&
     hasReplayableEncryptedReasoning(additionalKwargs.reasoning);
-  const authoritativeOutput = getAuthoritativeResponsesOutput(message);
+  const history = preparation.get(message);
+  const authoritativeOutput =
+    history?.source.items ?? getAuthoritativeResponsesOutput(message);
   const {
     generatedImages,
     messagePositions,
@@ -1736,7 +1904,8 @@ function projectPreemptedOpenAIResponsesMessage(
     authoritativeOutput,
     maxChars,
     replayProjection,
-    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY]
+    additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY],
+    history
   );
   const reasoningItemId =
     retainsEncryptedReasoning &&
@@ -1813,6 +1982,7 @@ function projectPreemptedOpenAIResponsesMessage(
   }
   delete additionalKwargs.tool_outputs;
   delete additionalKwargs[OPENAI_RESPONSES_REPLAY_POSITIONS_KEY];
+  delete additionalKwargs[OPENAI_RESPONSES_ACTIVE_REASONING_ID_KEY];
   delete additionalKwargs.__openai_function_call_ids__;
   delete additionalKwargs.__openai_custom_tool_call_ids__;
 
@@ -1837,7 +2007,8 @@ function projectPreemptedOpenAIResponsesMessage(
 export function projectToolStreamContentForProvider(
   messages: BaseMessage[],
   responsesReplayProjection?: ResponsesReplayProjection,
-  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS,
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
 ): BaseMessage[] {
   let projected: BaseMessage[] | undefined;
   for (let i = 0; i < messages.length; i++) {
@@ -1853,7 +2024,8 @@ export function projectToolStreamContentForProvider(
       const replaySafeMessage = projectPreemptedOpenAIResponsesMessage(
         assistantMessage,
         maxChars,
-        responsesReplayProjection
+        responsesReplayProjection,
+        preparation
       );
       if (replaySafeMessage !== assistantMessage) {
         projected ??= [...messages];
@@ -1861,20 +2033,12 @@ export function projectToolStreamContentForProvider(
       }
       continue;
     }
-    if (!Array.isArray(assistantMessage.content)) {
-      continue;
-    }
-    const content = assistantMessage.content.filter(
-      isCompleteToolStreamContentBlock
-    );
-    if (content.length === assistantMessage.content.length) {
+    const content = dropIncompleteToolStreamContent(assistantMessage.content);
+    if (content === assistantMessage.content) {
       continue;
     }
     projected ??= [...messages];
-    projected[i] = cloneAIMessageWithContent(
-      assistantMessage,
-      toLangChainContent(content)
-    );
+    projected[i] = cloneAIMessageWithContent(assistantMessage, content);
   }
   return projected ?? messages;
 }
@@ -2240,9 +2404,11 @@ export function projectComputerCallOutputsToText(
       continue;
     }
     projected ??= [...messages];
-    projected[i] = cloneToolMessageWithContent(
-      message,
-      '[Computer screenshot omitted for this provider]'
+    projected[i] = stampSyntheticProviderMessage(
+      cloneToolMessageWithContent(
+        message,
+        '[Computer screenshot omitted for this provider]'
+      )
     );
   }
   return projected ?? messages;
@@ -2303,19 +2469,128 @@ export function projectAnthropicArtifactContent(
       const baseContent = Array.isArray(msg.content)
         ? msg.content
         : stringifyToolMessageContent(msg.content);
-      const content = appendBoundedContent(
-        compactToolContent(baseContent, maxChars).content,
-        artifactContent,
-        maxChars
+      const aggregate = createBoundedContentAccumulator(maxChars);
+      let contentProjection: ReturnType<
+        typeof appendBoundedContentContribution
+      > = { contributed: false, complete: true };
+      /** Preserve the established empty-result text block shape without
+       * crediting it as a provider-visible source contribution. */
+      if (baseContent === '') {
+        aggregate.blocks.push({ type: ContentTypes.TEXT, text: '' });
+        aggregate.hasContent = true;
+      } else {
+        contentProjection = appendBoundedContentContribution(
+          aggregate,
+          baseContent
+        );
+      }
+      const artifactProjection = appendBoundedContentContribution(
+        aggregate,
+        artifactContent
       );
+      const content = toLangChainContent(aggregate.blocks);
       formattedMessages ??= [...messages];
-      formattedMessages[j] = cloneToolMessageWithContent(msg, content, {
+      const projectedMessage = cloneToolMessageWithContent(msg, content, {
         ...msg.artifact,
         content: [],
       });
+      const toolProvenanceParts = projectProviderMessageAttribution(
+        msg,
+        'tool'
+      );
+      const projectedProvenanceParts: ProviderMessageProvenancePart[] = [];
+      if (contentProjection.contributed) {
+        const retainedParts = retainProjectedContentPartProvenance(
+          msg,
+          toolProvenanceParts,
+          contentProjection.retainedContentPartIndices,
+          contentProjection.complete
+        );
+        for (const part of retainedParts) {
+          projectedProvenanceParts.push(part);
+        }
+      }
+      if (artifactProjection.contributed) {
+        const artifactPart = projectUnindexedProviderMessageAttribution(
+          msg,
+          'tool'
+        );
+        const previousPart =
+          projectedProvenanceParts[projectedProvenanceParts.length - 1];
+        if (
+          projectedProvenanceParts.length === 0 ||
+          previousPart.attribution !== artifactPart.attribution ||
+          previousPart.sourceMessageId !== artifactPart.sourceMessageId ||
+          previousPart.sourceContentPartIndices != null
+        ) {
+          projectedProvenanceParts.push(artifactPart);
+        }
+      }
+      if (projectedProvenanceParts.length > 0) {
+        setProviderMessageProvenance(
+          projectedMessage,
+          projectedProvenanceParts
+        );
+      }
+      formattedMessages[j] = projectedMessage;
     }
   }
   return formattedMessages ?? messages;
+}
+
+function projectProviderMessageAttribution(
+  message: BaseMessage,
+  attribution: ProviderMessageProvenancePart['attribution']
+): ProviderMessageProvenancePart[] {
+  const explicit = getProviderMessageProvenance(message);
+  const sourceMessageIds = getProviderSourceMessageIds(message);
+  const explicitSourceIds = new Set<string>();
+  for (const part of explicit?.parts ?? []) {
+    if (part.sourceMessageId != null) {
+      explicitSourceIds.add(part.sourceMessageId);
+    }
+  }
+  const soleSourceFallback =
+    explicitSourceIds.size === 0 && sourceMessageIds.length === 1
+      ? sourceMessageIds[0]
+      : undefined;
+  const parts: ProviderMessageProvenancePart[] = [];
+  const representedSourceIds = new Set<string>();
+  for (const part of explicit?.parts ?? []) {
+    const sourceMessageId = part.sourceMessageId ?? soleSourceFallback;
+    if (sourceMessageId != null) {
+      representedSourceIds.add(sourceMessageId);
+    }
+    parts.push({
+      attribution,
+      ...(sourceMessageId != null && { sourceMessageId }),
+      ...(part.sourceContentPartIndices != null && {
+        sourceContentPartIndices: part.sourceContentPartIndices,
+      }),
+    });
+  }
+  for (const sourceMessageId of sourceMessageIds) {
+    if (!representedSourceIds.has(sourceMessageId)) {
+      parts.push({ attribution, sourceMessageId });
+    }
+  }
+  return parts.length > 0 ? parts : [{ attribution }];
+}
+
+/** Artifacts are attached to a tool message rather than one of its content
+ * positions. Retain the source row only when it is unambiguous, but never
+ * claim a raw content-part index for artifact-only bytes. */
+function projectUnindexedProviderMessageAttribution(
+  message: BaseMessage,
+  attribution: ProviderMessageProvenancePart['attribution']
+): ProviderMessageProvenancePart {
+  const sourceMessageIds = getProviderSourceMessageIds(message);
+  return {
+    attribution,
+    ...(sourceMessageIds.length === 1 && {
+      sourceMessageId: sourceMessageIds[0],
+    }),
+  };
 }
 
 /**
@@ -2334,6 +2609,10 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
       projected[i] !== messages[i]
     ) {
       messages[i].content = projected[i].content;
+      const provenance = getProviderMessageProvenance(projected[i]);
+      if (provenance != null) {
+        setProviderMessageProvenance(messages[i], provenance.parts);
+      }
     }
   }
 }
@@ -2374,8 +2653,9 @@ export function projectArtifactPayload(
   if (latestAIParentIndex === -1) return messages;
 
   // Single pass: collect relevant tool messages with artifacts and aggregate
-  let aggregatedContent: BaseMessage['content'] | undefined;
+  const aggregate = createBoundedContentAccumulator(maxChars);
   let formattedMessages: BaseMessage[] | undefined;
+  const artifactProvenanceParts: ProviderMessageProvenancePart[] = [];
 
   for (let i = latestAIParentIndex + 1; i < messages.length; i++) {
     const msg = messages[i];
@@ -2391,13 +2671,12 @@ export function projectArtifactPayload(
     ) {
       continue;
     }
-    aggregatedContent = appendBoundedContent(
-      aggregatedContent,
-      msg.content,
-      maxChars
+    const contentProjection = appendBoundedContentContribution(
+      aggregate,
+      msg.content
     );
     formattedMessages ??= [...messages];
-    formattedMessages[i] = cloneToolMessageWithContent(
+    const placeholder = cloneToolMessageWithContent(
       msg,
       'Tool response is included in the next message as a Human message',
       {
@@ -2405,18 +2684,61 @@ export function projectArtifactPayload(
         content: [],
       }
     );
-    aggregatedContent = appendBoundedContent(
-      aggregatedContent,
-      msg.artifact.content,
-      maxChars
+    const toolProvenanceParts = projectProviderMessageAttribution(msg, 'tool');
+    setProviderMessageProvenance(
+      placeholder,
+      toolProvenanceParts.map((part) => ({
+        ...part,
+        attribution: 'synthetic',
+      }))
     );
+    formattedMessages[i] = placeholder;
+    const artifactProjection = appendBoundedContentContribution(
+      aggregate,
+      msg.artifact.content
+    );
+    if (contentProjection.contributed) {
+      const retainedParts = retainProjectedContentPartProvenance(
+        msg,
+        toolProvenanceParts,
+        contentProjection.retainedContentPartIndices,
+        contentProjection.complete
+      );
+      for (const part of retainedParts) {
+        artifactProvenanceParts.push(part);
+      }
+    }
+    if (artifactProjection.contributed) {
+      const artifactPart = projectUnindexedProviderMessageAttribution(
+        msg,
+        'tool'
+      );
+      const previousPart =
+        artifactProvenanceParts[artifactProvenanceParts.length - 1];
+      if (
+        artifactProvenanceParts.length === 0 ||
+        previousPart.attribution !== artifactPart.attribution ||
+        previousPart.sourceMessageId !== artifactPart.sourceMessageId ||
+        previousPart.sourceContentPartIndices != null
+      ) {
+        artifactProvenanceParts.push(artifactPart);
+      }
+    }
   }
 
-  if (aggregatedContent != null) {
+  if (aggregate.hasContent && artifactProvenanceParts.length > 0) {
     if (options?.bridgeUserAfterTool === true) {
-      formattedMessages?.push(new AIMessage({ content: ARTIFACT_BRIDGE_TEXT }));
+      formattedMessages?.push(
+        stampSyntheticProviderMessage(
+          new AIMessage({ content: ARTIFACT_BRIDGE_TEXT })
+        )
+      );
     }
-    formattedMessages?.push(new HumanMessage({ content: aggregatedContent }));
+    const artifactPayload = new HumanMessage({
+      content: toLangChainContent(aggregate.blocks),
+    });
+    setProviderMessageProvenance(artifactPayload, artifactProvenanceParts);
+    formattedMessages?.push(artifactPayload);
   }
   return formattedMessages ?? messages;
 }
@@ -2438,9 +2760,15 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
       projected[i] !== messages[i]
     ) {
       messages[i].content = projected[i].content;
+      const provenance = getProviderMessageProvenance(projected[i]);
+      if (provenance != null) {
+        setProviderMessageProvenance(messages[i], provenance.parts);
+      }
     }
   }
-  messages.push(...projected.slice(originalLength));
+  for (let i = originalLength; i < projected.length; i++) {
+    messages.push(projected[i]);
+  }
 }
 
 export function findLastIndex<T>(
@@ -2453,4 +2781,60 @@ export function findLastIndex<T>(
     }
   }
   return -1;
+}
+
+/** Reads an own data property without invoking accessors; `undefined` otherwise. */
+function readOwnDataProperty(target: object, key: PropertyKey): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    return descriptor != null && 'value' in descriptor
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether message content carries non-whitespace text in any text block. */
+export function hasNonEmptyTextContent(
+  content: BaseMessage['content']
+): boolean {
+  if (typeof content === 'string') {
+    return content.trim() !== '';
+  }
+  if (!Array.isArray(content) || isProxy(content)) {
+    return false;
+  }
+  /** Index reads through own data descriptors: `for...of` would invoke a
+   * hostile `Symbol.iterator` or an accessor-backed element before any guard. */
+  const length = readOwnDataProperty(content, 'length');
+  const blockCount = typeof length === 'number' ? length : 0;
+  for (let i = 0; i < blockCount; i++) {
+    const block = readOwnDataProperty(content, i);
+    if (typeof block !== 'object' || block == null || isProxy(block)) {
+      continue;
+    }
+    try {
+      const type = Object.getOwnPropertyDescriptor(block, 'type');
+      if (
+        type == null ||
+        !('value' in type) ||
+        (type.value !== ContentTypes.TEXT && type.value !== 'output_text')
+      ) {
+        continue;
+      }
+      const text = Object.getOwnPropertyDescriptor(block, ContentTypes.TEXT);
+      if (
+        text != null &&
+        'value' in text &&
+        typeof text.value === 'string' &&
+        text.value.trim() !== ''
+      ) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
 }

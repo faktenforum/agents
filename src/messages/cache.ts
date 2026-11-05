@@ -3,6 +3,7 @@ import { BaseMessage, MessageContentComplex } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessage } from '@/types/messages';
 import { hasComputerCallOutputMarker } from '@/utils/toolContent';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
 
@@ -411,28 +412,24 @@ function isCachePoint(block: unknown): boolean {
  * Anchoring the only breakpoint on a block that is about to disappear silently
  * loses tail caching, so all of these are excluded.
  */
-const NON_ANCHORABLE_BLOCK_TYPES = new Set([
-  'thinking',
-  'redacted_thinking',
-  'reasoning_content',
-  'reasoning',
-  'think',
-  'input_json_delta',
-]);
+const NON_ANCHORABLE_BLOCK_TYPES = new Set(['input_json_delta']);
 
 /**
  * A block can anchor the tail cache breakpoint when it is a real content block
  * that the Anthropic API accepts `cache_control` on and that survives provider
- * conversion. Reasoning / dropped-delta blocks are excluded (see
- * {@link NON_ANCHORABLE_BLOCK_TYPES}), and empty text blocks are not cacheable,
- * so both are skipped.
+ * conversion. Reasoning and dropped-delta blocks are excluded, and empty text
+ * blocks are not cacheable, so all are skipped.
  */
 function isTailCacheableBlock(block: MessageContentComplex): boolean {
   if (isCachePoint(block)) {
     return false;
   }
   const type = (block as { type?: string }).type;
-  if (type == null || NON_ANCHORABLE_BLOCK_TYPES.has(type)) {
+  if (
+    type == null ||
+    isReasoningContentBlock(block) ||
+    NON_ANCHORABLE_BLOCK_TYPES.has(type)
+  ) {
     return false;
   }
   if (type === 'text') {

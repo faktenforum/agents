@@ -509,6 +509,58 @@ describe('ToolNode per-call onResult completion emission', () => {
     expect(completionAttempts[1].result.tool_call.id).toBe('call_weather');
   });
 
+  it.each([true, false])(
+    'emits a stop instruction for aborted host results (early completion: %s)',
+    async (early) => {
+      const controller = new AbortController();
+      const completions: CompletionEvent[] = [];
+      const abortedResult: t.ToolExecuteResult = {
+        toolCallId: 'call_edit',
+        status: 'error',
+        content: '',
+        errorMessage: 'This operation was aborted',
+      };
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data): Promise<void> => {
+          if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+            completions.push(data as CompletionEvent);
+            return;
+          }
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          controller.abort();
+          if (early) {
+            batch.onResult?.(abortedResult);
+          }
+          batch.resolve([abortedResult]);
+        });
+
+      const node = new ToolNode({
+        tools: [createDummyTool('edit_file')],
+        eventDrivenMode: true,
+        getBreakerSignal: () => controller.signal,
+        toolCallStepIds: new Map([['call_edit', 'step_edit']]),
+      });
+      const result = (await node.invoke({
+        messages: [
+          createAIMessageWithToolCalls([
+            { id: 'call_edit', name: 'edit_file', args: {} },
+          ]),
+        ],
+      })) as { messages: ToolMessage[] };
+
+      const content = String(result.messages[0].content);
+      expect(result.messages[0].status).toBe('error');
+      expect(content).toContain('STOP what you are doing');
+      expect(content).not.toContain('Please fix your mistakes');
+      expect(completions).toHaveLength(1);
+      expect(completions[0].result.tool_call.output).toBe(content);
+    }
+  );
+
   it('emits error-status results with the standard error formatting', async () => {
     const completions: CompletionEvent[] = [];
 
@@ -605,7 +657,8 @@ describe('ToolNode returned-error completions', () => {
     const toolNode = new ToolNode({
       tools: [returnsError],
       toolCallStepIds: new Map([['call_fail', 'step_fail']]),
-      errorHandler: errorHandler as unknown as t.ToolNodeConstructorParams['errorHandler'],
+      errorHandler:
+        errorHandler as unknown as t.ToolNodeConstructorParams['errorHandler'],
     });
 
     await toolNode.invoke({
@@ -626,7 +679,9 @@ describe('ToolNode returned-error completions', () => {
       (c) => c.result.tool_call.id === 'call_fail'
     );
     expect(completion).toBeDefined();
-    expect(completion?.result.tool_call.outcome).toBe('Search failed for OAuth');
+    expect(completion?.result.tool_call.outcome).toBe(
+      'Search failed for OAuth'
+    );
   });
 });
 
@@ -647,90 +702,108 @@ describe('ToolNode error-ownership scoping', () => {
    * instance-scoped markers, invocation 2's output loop consumes the
    * marker invocation 1 set and drops its only completion.
    */
-  it('does not let a pending invocation\'s marker suppress a concurrent call reusing the id', async () => {
-    const completions: string[] = [];
-    jest
-      .spyOn(events, 'safeDispatchCustomEvent')
-      .mockImplementation(async (event, data): Promise<void> => {
-        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
-          completions.push(
-            (data as { result: { tool_call: { id: string } } }).result.tool_call
-              .id
-          );
-        }
+  it.each([undefined, ''])(
+    'isolates concurrent calls reusing an id with missing scope %j',
+    async (threadId) => {
+      const config = { configurable: { thread_id: threadId } };
+      const completions: string[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data): Promise<void> => {
+          if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+            completions.push(
+              (data as { result: { tool_call: { id: string } } }).result
+                .tool_call.id
+            );
+          }
+        });
+
+      const shared = 'call_shared';
+      let releaseSlow: (() => void) | undefined;
+      const slowGate = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
       });
 
-    const shared = 'call_shared';
-    let releaseSlow: (() => void) | undefined;
-    const slowGate = new Promise<void>((resolve) => {
-      releaseSlow = resolve;
-    });
+      const thrower = tool(
+        async () => {
+          throw new Error('boom');
+        },
+        {
+          name: 'thrower',
+          description: 'throws',
+          schema: z.object({}).passthrough(),
+        }
+      ) as unknown as StructuredToolInterface;
+      const slow = tool(
+        async () => {
+          await slowGate;
+          return 'done';
+        },
+        {
+          name: 'slow',
+          description: 'parks the batch',
+          schema: z.object({}).passthrough(),
+        }
+      ) as unknown as StructuredToolInterface;
+      const returner = tool(
+        async () =>
+          new ToolMessage({
+            content: 'failed',
+            tool_call_id: shared,
+            status: 'error',
+          }),
+        {
+          name: 'returner',
+          description: 'returns an error message',
+          schema: z.object({}).passthrough(),
+        }
+      ) as unknown as StructuredToolInterface;
 
-    const thrower = tool(
-      async () => {
-        throw new Error('boom');
-      },
-      { name: 'thrower', description: 'throws', schema: z.object({}).passthrough() }
-    ) as unknown as StructuredToolInterface;
-    const slow = tool(
-      async () => {
-        await slowGate;
-        return 'done';
-      },
-      { name: 'slow', description: 'parks the batch', schema: z.object({}).passthrough() }
-    ) as unknown as StructuredToolInterface;
-    const returner = tool(
-      async () =>
-        new ToolMessage({
-          content: 'failed',
-          tool_call_id: shared,
-          status: 'error',
-        }),
-      {
-        name: 'returner',
-        description: 'returns an error message',
-        schema: z.object({}).passthrough(),
-      }
-    ) as unknown as StructuredToolInterface;
-
-    /** ONE instance — the shared state the finding is about. */
-    const node = new ToolNode({
-      tools: [thrower, slow, returner],
-      toolCallStepIds: new Map([
-        [shared, 'step_shared'],
-        ['call_slow', 'step_slow'],
-      ]),
-      errorHandler: (async () =>
-        true) as unknown as t.ToolNodeConstructorParams['errorHandler'],
-    });
-
-    // Invocation 1: throws (claiming ownership of `shared`) and parks.
-    const pending = node.invoke({
-      messages: [
-        createAIMessageWithToolCalls([
-          { id: shared, name: 'thrower', args: {} },
-          { id: 'call_slow', name: 'slow', args: {} },
+      /** ONE instance — the shared state the finding is about. */
+      const node = new ToolNode({
+        tools: [thrower, slow, returner],
+        toolCallStepIds: new Map([
+          [shared, 'step_shared'],
+          ['call_slow', 'step_slow'],
         ]),
-      ],
-    }) as Promise<unknown>;
-    await flushAsync();
+        errorHandler: (async () =>
+          true) as unknown as t.ToolNodeConstructorParams['errorHandler'],
+      });
 
-    // Invocation 2, while invocation 1 is still parked.
-    const before = completions.length;
-    await node.invoke({
-      messages: [
-        createAIMessageWithToolCalls([
-          { id: shared, name: 'returner', args: {} },
-        ]),
-      ],
-    });
-    await flushAsync();
-    const emittedBySecond = completions.slice(before);
+      // Invocation 1: throws (claiming ownership of `shared`) and parks.
+      const pending = node.invoke(
+        {
+          messages: [
+            createAIMessageWithToolCalls([
+              { id: shared, name: 'thrower', args: {} },
+              { id: 'call_slow', name: 'slow', args: {} },
+            ]),
+          ],
+        },
+        config
+      ) as Promise<unknown>;
+      await flushAsync();
 
-    releaseSlow?.();
-    await pending;
-    await flushAsync();
+      // Invocation 2, while invocation 1 is still parked.
+      const before = completions.length;
+      await node.invoke(
+        {
+          messages: [
+            createAIMessageWithToolCalls([
+              { id: shared, name: 'returner', args: {} },
+            ]),
+          ],
+        },
+        config
+      );
+      await flushAsync();
+      const emittedBySecond = completions.slice(before);
 
-    expect(emittedBySecond).toContain(shared);
-  });
+      releaseSlow?.();
+      await pending;
+      await flushAsync();
+
+      expect(emittedBySecond).toContain(shared);
+    }
+  );
 });

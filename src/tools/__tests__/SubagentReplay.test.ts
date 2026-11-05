@@ -1,9 +1,23 @@
+import { ToolMessage } from '@langchain/core/messages';
+import type { RunStepResumeState } from '@/types';
+import {
+  attachToolBatchReplayState,
+  getPublicToolInterruptPayload,
+  restoreToolBatchReplayState,
+  restoreToolReplayConfig,
+  TOOL_BATCH_REPLAY_KEY,
+} from '@/tools/toolBatchReplay';
 import {
   getSubagentResumeManifest,
   attachSubagentResumeManifest,
   requireValidSubagentResumeManifest,
   stripSubagentResumeManifest,
 } from '@/tools/subagent/SubagentReplay';
+import {
+  attachRunStepResumeState,
+  getRunStepResumeState,
+  stripRunStepResumeState,
+} from '@/tools/runStepResume';
 
 describe('SubagentReplay manifest', () => {
   const execution = {
@@ -70,6 +84,62 @@ describe('SubagentReplay manifest', () => {
     ],
   };
 
+  it.each([null, 'confirm', ['a', 'b']])(
+    'preserves nested custom payload %j with parent replay state',
+    async (payload) => {
+      const nested = attachSubagentResumeManifest(payload, {
+        version: 1,
+        executions: [execution],
+      });
+      const wrapped = await attachToolBatchReplayState(
+        nested,
+        'parent',
+        new Map([['batch', new Map()]])
+      );
+      const persisted = JSON.parse(JSON.stringify(wrapped));
+      expect(getPublicToolInterruptPayload(persisted)).toEqual(payload);
+      const config: Record<string, unknown> = {};
+      restoreToolReplayConfig(config, 'interrupt', persisted);
+      expect(config[TOOL_BATCH_REPLAY_KEY]).toMatchObject({
+        records: [{ owner: 'parent' }],
+      });
+    }
+  );
+
+  it('round-trips code-session baselines with settled direct results', async () => {
+    const result = {
+      proposal: { name: 'execute_code', args: { code: 'remove()' } },
+      output: new ToolMessage({
+        content: 'removed data.csv',
+        tool_call_id: 'call_delete',
+      }),
+      additionalContexts: [],
+      codeSessionBaseline: [['data.csv', 'storage\0file']] as Array<
+        [string, string]
+      >,
+    };
+    const payload = await attachToolBatchReplayState(
+      null,
+      'parent',
+      new Map([['batch', new Map([['call_delete', result]])]])
+    );
+    const config: Record<string, unknown> = {};
+    restoreToolReplayConfig(
+      config,
+      'interrupt',
+      JSON.parse(JSON.stringify(payload))
+    );
+
+    const restored = await restoreToolBatchReplayState(
+      { configurable: config },
+      'parent'
+    );
+
+    expect(restored[0]?.results[0]?.[1].codeSessionBaseline).toEqual(
+      result.codeSessionBaseline
+    );
+  });
+
   it('round-trips a private manifest without exposing it publicly', () => {
     const manifest = { version: 1 as const, executions: [execution] };
     const payload = attachSubagentResumeManifest(
@@ -82,6 +152,32 @@ describe('SubagentReplay manifest', () => {
       type: 'tool_approval',
       visible: true,
     });
+  });
+
+  it('composes with private run-step state without changing the public payload', () => {
+    const manifest = { version: 1 as const, executions: [execution] };
+    const runStepState: RunStepResumeState = {
+      version: 1,
+      revision: 1,
+      nextIndex: 0,
+      toolCallSteps: [],
+      steps: [],
+    };
+    const visiblePayload = {
+      type: 'tool_approval',
+      subagent: { parent_tool_call_id: 'call_parent' },
+    };
+    const payload = attachSubagentResumeManifest(
+      attachRunStepResumeState(visiblePayload, runStepState),
+      manifest
+    );
+    const manifestPayload = stripRunStepResumeState(payload);
+
+    expect(getRunStepResumeState(payload)).toEqual(runStepState);
+    expect(getSubagentResumeManifest(manifestPayload)).toEqual(manifest);
+    expect(stripSubagentResumeManifest(manifestPayload)).toEqual(
+      visiblePayload
+    );
   });
 
   it('accepts legacy executions without a bound subagent type', () => {
@@ -253,6 +349,49 @@ describe('SubagentReplay manifest', () => {
           { version: 1, executions: [duplicateToolCall] }
         )
       )
+    ).toBeUndefined();
+  });
+
+  it('keeps a manifest carrying a pre-v2 fading tier resumable', () => {
+    const legacyTier = {
+      v: 1,
+      budgetTokens: 6_250,
+      masked: false,
+      latched: true,
+    };
+    const manifest = {
+      __librechat_subagent_resume_manifest: {
+        version: 1,
+        executions: [
+          {
+            ...execution,
+            graphState: {
+              ...execution.graphState,
+              fadingTier: legacyTier,
+              fadingTiers: { 'child-agent': legacyTier },
+            },
+          },
+        ],
+      },
+    };
+
+    expect(() => requireValidSubagentResumeManifest(manifest)).not.toThrow();
+    expect(getSubagentResumeManifest(manifest)).toBeDefined();
+    expect(
+      getSubagentResumeManifest({
+        __librechat_subagent_resume_manifest: {
+          version: 1,
+          executions: [
+            {
+              ...execution,
+              graphState: {
+                ...execution.graphState,
+                fadingTier: { v: 1, budgetTokens: 0, masked: false },
+              },
+            },
+          ],
+        },
+      })
     ).toBeUndefined();
   });
 

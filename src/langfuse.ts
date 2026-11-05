@@ -1,8 +1,13 @@
+import { tool } from '@langchain/core/tools';
 import { CallbackHandler } from '@langfuse/langchain';
 import { LangfuseOtelContextKeys } from '@langfuse/core';
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
+import {
+  AIMessage,
+  HumanMessage,
+  AIMessageChunk,
+} from '@langchain/core/messages';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
@@ -18,7 +23,8 @@ import type {
   LLMResult,
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
-import type { Context } from '@opentelemetry/api';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import type { Context, SpanContext } from '@opentelemetry/api';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
@@ -36,8 +42,18 @@ import {
 } from '@/langfuseConfig';
 import {
   getLangfuseManagedSpanDestination,
+  registerLangfuseManagedSpan,
   resolveLangfuseDestinationKey,
 } from '@/langfuseSpanRegistry';
+import {
+  getToolObservationMetadata,
+  LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+} from '@/langfuseToolOutputTracing';
+import {
+  readPreemptRestartedRun,
+  PREEMPT_RESTART_CONTROL_FLOW,
+} from '@/llm/preempt';
+import { filterCallbacks, findCallback } from '@/utils/callbacks';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 export {
@@ -55,6 +71,13 @@ const GRAPH_INTERRUPT_TOOL_OUTPUT = JSON.stringify(
 
 export type LangfuseTraceMetadata = Record<string, string>;
 export type LangfuseTraceAttributes = Record<string, string | number | boolean>;
+
+/**
+ * What a label call's Langfuse generation records in place of the prompt the
+ * model received and the text it returned, when the model saw evidence the
+ * tool-output redaction policy keeps out of traces.
+ */
+export type LangfuseGenerationMask = { input: string; output: string };
 type LangfuseMetadata = NonNullable<t.LangfuseConfig['metadata']>;
 type LangfuseConfigTraceAttributes = NonNullable<
   t.LangfuseConfig['librechatTraceAttributes']
@@ -66,10 +89,20 @@ type LangfuseHandlerParams = {
   traceMetadata?: LangfuseTraceMetadata;
   tags?: string[];
   traceIdSeed?: string;
+  /** Opaque key used by the span processor to capture this run's parents. */
+  traceAnchor?: object;
+  /** Agent lane this handler owns when ambient callback scope is unavailable. */
+  agentId?: string;
+  /** Exported observation that auxiliary work should be nested beneath. */
+  parentSpanContext?: SpanContext;
+  /** Keep an existing parent trace's user, session, name, and metadata. */
+  inheritTraceIdentity?: boolean;
   /** Identity of the run this handler traces; ambient runtime scopes are
    *  only adopted when stamped with the same run (see
    *  `LangfuseRuntimeContext.runId`). */
   runId?: string;
+  /** Keep this root open while one processStream call executes graph segments. */
+  deferRootRunId?: string;
   /** The run's resolved tool-output policy — for multi-agent streams the
    *  conservative aggregate across agents, which `this.langfuse` (the
    *  primary agent's config) cannot reproduce. Applied when a foreign
@@ -251,7 +284,7 @@ function callbackNodeMatchesAgent(node: string, agentId: string): boolean {
  * Hosts often execute agent code inside their own OpenTelemetry spans (HTTP
  * server auto-instrumentation on the global provider). Root observations must
  * not inherit that ambient identity: the foreign parent is never exported to
- * Langfuse, which orphans the trace root (root/trace input-output shaping is
+ * Langfuse, which orphans the trace root (root-observation input/output shaping is
  * skipped because the span no longer looks like a root), collapses concurrent
  * runs inside one request context — an agent run and the previous turn's
  * title run — into a single merged trace with racing names and unioned tags,
@@ -280,31 +313,68 @@ function detachForeignAmbientSpan(
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
+  private readonly traceAnchor?: object;
+  private readonly agentId?: string;
+  private readonly parentSpanContext?: SpanContext;
   private readonly runId?: string;
+  private readonly deferredRootRunId?: string;
   private readonly identity: HandlerIdentity;
   private readonly toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
   private readonly trackedRunIds = new Set<string>();
+  private generationMask?: LangfuseGenerationMask;
+  private deferredRootStarted = false;
+  private deferredRootOutcome:
+    | {
+        type: 'end';
+        output: Parameters<CallbackHandler['handleChainEnd']>[0];
+        parentRunId?: string;
+      }
+    | { type: 'error'; error: Error; parentRunId?: string }
+    | undefined;
 
   constructor(params?: AgentLangfuseHandlerParams) {
     const {
       langfuse,
       traceIdSeed,
+      traceAnchor,
+      agentId,
+      parentSpanContext,
+      inheritTraceIdentity,
       runId,
+      deferRootRunId,
       toolOutputTracing,
       traceName,
       ...handlerParams
     } = params ?? {};
-    super(handlerParams);
+    super({
+      ...handlerParams,
+      ...(inheritTraceIdentity === true
+        ? {
+          userId: undefined,
+          sessionId: undefined,
+          traceMetadata: undefined,
+        }
+        : {}),
+    });
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
+    this.traceAnchor = traceAnchor;
+    this.agentId = agentId;
+    this.parentSpanContext = parentSpanContext;
     this.runId = runId;
+    this.deferredRootRunId = deferRootRunId;
+    if (deferRootRunId != null) {
+      this.awaitHandlers = true;
+    }
     this.toolOutputTracing = toolOutputTracing;
     this.identity = {
-      userId: handlerParams.userId,
-      sessionId: handlerParams.sessionId,
+      userId: inheritTraceIdentity === true ? undefined : handlerParams.userId,
+      sessionId:
+        inheritTraceIdentity === true ? undefined : handlerParams.sessionId,
       tags: handlerParams.tags,
-      metadata: handlerParams.traceMetadata,
-      traceName,
+      metadata:
+        inheritTraceIdentity === true ? undefined : handlerParams.traceMetadata,
+      traceName: inheritTraceIdentity === true ? undefined : traceName,
     };
   }
 
@@ -312,6 +382,22 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     return this.langfuse?.deterministicTraceId === true
       ? this.traceIdSeed
       : undefined;
+  }
+
+  private applyExplicitParent(
+    activeContext: Context,
+    langfuse?: t.LangfuseConfig
+  ): Context {
+    if (this.parentSpanContext == null) {
+      return activeContext;
+    }
+    const destinationKey = resolveLangfuseDestinationKey(langfuse);
+    if (destinationKey == null) {
+      return activeContext;
+    }
+    const parentSpan = otelTrace.wrapSpanContext(this.parentSpanContext);
+    registerLangfuseManagedSpan(parentSpan, destinationKey);
+    return otelTrace.setSpan(activeContext, parentSpan);
   }
 
   /**
@@ -401,12 +487,15 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     }
     const langfuse =
       resolveLangfuseConfigForSpan(currentContext) ?? this.langfuse;
+    const parentedContext = isDetachedRun
+      ? this.applyExplicitParent(currentContext, langfuse)
+      : currentContext;
     const activeContext = isDetachedRun
       ? detachForeignAmbientSpan(
-        currentContext,
+        parentedContext,
         resolveLangfuseDestinationKey(langfuse)
       )
-      : currentContext;
+      : parentedContext;
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
@@ -414,7 +503,9 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
           traceIdSeed:
             resolveTraceIdSeedForSpan(activeContext) ??
             this.getDeterministicTraceSeed(),
+          traceAnchor: this.traceAnchor,
           runId: scopeRunId ?? this.runId,
+          agentId: scopeAgentId ?? this.agentId,
         },
         action
       );
@@ -438,12 +529,15 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     for (const key of Object.values(LangfuseOtelContextKeys)) {
       cleanContext = cleanContext.deleteValue(key);
     }
+    cleanContext = this.applyExplicitParent(cleanContext, this.langfuse);
     const scoped = (): T =>
       withLangfuseRuntimeScope(
         {
           langfuse: this.langfuse,
           traceIdSeed: this.getDeterministicTraceSeed(),
+          traceAnchor: this.traceAnchor,
           runId: this.runId,
+          agentId: this.agentId,
           toolOutputTracing:
             this.toolOutputTracing ??
             resolveToolOutputTracingConfig(this.langfuse),
@@ -474,6 +568,17 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleChainStart(
     ...args: Parameters<CallbackHandler['handleChainStart']>
   ): ReturnType<CallbackHandler['handleChainStart']> {
+    const [, , runId, parentRunId] = args;
+    if (
+      runId === this.deferredRootRunId &&
+      parentRunId == null &&
+      this.deferredRootStarted
+    ) {
+      return Promise.resolve();
+    }
+    if (runId === this.deferredRootRunId && parentRunId == null) {
+      this.deferredRootStarted = true;
+    }
     return this.withRuntimeContext(
       () => super.handleChainStart(...args),
       this.startsDetachedRun(args[2], args[3]),
@@ -485,6 +590,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleChainError']>
   ): ReturnType<CallbackHandler['handleChainError']> {
     const [error, runId, parentRunId] = args;
+    if (runId === this.deferredRootRunId && parentRunId == null) {
+      this.deferredRootOutcome = {
+        type: 'error',
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+      return Promise.resolve();
+    }
     if (error != null && parentRunId != null && isGraphInterrupt(error)) {
       return super.handleChainEnd(
         GRAPH_INTERRUPT_CONTROL_FLOW,
@@ -500,6 +612,76 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       );
     }
     return super.handleChainError(...args);
+  }
+
+  override handleChainEnd(
+    ...args: Parameters<CallbackHandler['handleChainEnd']>
+  ): ReturnType<CallbackHandler['handleChainEnd']> {
+    const [output, runId, parentRunId] = args;
+    if (runId === this.deferredRootRunId && parentRunId == null) {
+      this.deferredRootOutcome = {
+        type: 'end',
+        output: this.maskOutputs(output),
+      };
+      return Promise.resolve();
+    }
+    args[0] = this.maskOutputs(output);
+    return super.handleChainEnd(...args);
+  }
+
+  /** Keeps usage and response metadata so cost tracking survives the mask. */
+  private maskGenerations(output: LLMResult): LLMResult {
+    const mask = this.generationMask;
+    if (mask == null) {
+      return output;
+    }
+    return {
+      ...output,
+      generations: output.generations.map((generations) =>
+        generations.map((generation) => {
+          if (!('message' in generation) || generation.message == null) {
+            return { ...generation, text: mask.output };
+          }
+          const message = generation.message as AIMessage;
+          return {
+            ...generation,
+            text: mask.output,
+            message: new AIMessage({
+              content: mask.output,
+              usage_metadata: message.usage_metadata,
+              response_metadata: message.response_metadata,
+            }),
+          };
+        })
+      ),
+    };
+  }
+
+  private maskOutputs(
+    output: Parameters<CallbackHandler['handleChainEnd']>[0]
+  ): Parameters<CallbackHandler['handleChainEnd']>[0] {
+    const mask = this.generationMask;
+    return mask == null ? output : { output: mask.output };
+  }
+
+  /** Records `mask` for every model call and chain result this handler traces. */
+  maskGeneration(mask: LangfuseGenerationMask): void {
+    this.generationMask = mask;
+  }
+
+  async finishDeferredRoot(): Promise<void> {
+    const runId = this.deferredRootRunId;
+    const outcome = this.deferredRootOutcome;
+    if (!this.deferredRootStarted || runId == null || outcome == null) {
+      return;
+    }
+    this.deferredRootStarted = false;
+    this.deferredRootOutcome = undefined;
+    if (outcome.type === 'error') {
+      await super.handleChainError(outcome.error, runId, outcome.parentRunId);
+      return;
+    }
+    await super.handleChainEnd(outcome.output, runId, outcome.parentRunId);
   }
 
   override handleAgentAction(
@@ -524,6 +706,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleChatModelStart(
     ...args: Parameters<CallbackHandler['handleChatModelStart']>
   ): ReturnType<CallbackHandler['handleChatModelStart']> {
+    const mask = this.generationMask;
+    if (mask != null) {
+      args[1] = args[1].map((messages) => [
+        ...messages.filter((message) => message.getType() === 'system'),
+        new HumanMessage(mask.input),
+      ]);
+    }
     return this.withRuntimeContext(
       () => super.handleChatModelStart(...args),
       this.startsDetachedRun(args[2], args[3]),
@@ -534,6 +723,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleLLMStart(
     ...args: Parameters<CallbackHandler['handleLLMStart']>
   ): ReturnType<CallbackHandler['handleLLMStart']> {
+    const mask = this.generationMask;
+    if (mask != null) {
+      args[1] = args[1].map(() => mask.input);
+    }
     return this.withRuntimeContext(
       () => super.handleLLMStart(...args),
       this.startsDetachedRun(args[2], args[3]),
@@ -547,10 +740,59 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     parentRunId?: string
   ): Promise<void> {
     return super.handleLLMEnd(
-      normalizeBedrockUsageForLangfuse(output),
+      this.maskGenerations(normalizeBedrockUsageForLangfuse(output)),
       runId,
       parentRunId
     );
+  }
+
+  /**
+   * A cooperative restart tears the provider stream down mid-flight, so the
+   * adapter reports cancellation and LangChain closes the generation through
+   * this path. That is control flow, not a failure — the graph catches it,
+   * injects, and calls the model again — so it closes as a successful
+   * generation rather than polluting an otherwise healthy trace with a failed
+   * one.
+   *
+   * Keyed on the run id the tear-down recorded, not on the error's shape:
+   * every provider adapter raises its own cancellation error, and matching on
+   * those would make the invariant depend on which provider served the call.
+   */
+  override handleLLMError(
+    ...args: Parameters<CallbackHandler['handleLLMError']>
+  ): ReturnType<CallbackHandler['handleLLMError']> {
+    const [, runId, parentRunId] = args;
+    const restarted = readPreemptRestartedRun(runId);
+    if (restarted != null) {
+      /**
+       * Closed WITH the discarded turn, not as an empty end. The provider
+       * consumed the whole prompt and may have billed reasoning tokens before
+       * the tear-down, and this is the only close the generation will get —
+       * the synthetic `CHAT_MODEL_END` that follows is a host stream event and
+       * cannot reopen it. Routed through the override so Bedrock usage is
+       * normalized exactly as it is for an ordinary end.
+       *
+       * The generation text stays empty on purpose: a discarded turn produced
+       * no answer, and replaying its reasoning as output would read as one.
+       *
+       * The lookup does not consume the record: a run can be closed through
+       * several handlers at once, and each must reach this branch rather than
+       * the first one leaving the others to export an error.
+       */
+      const generation: ChatGeneration = {
+        text: '',
+        message: restarted.message,
+      };
+      return this.handleLLMEnd(
+        {
+          generations: [[generation]],
+          llmOutput: PREEMPT_RESTART_CONTROL_FLOW,
+        },
+        runId,
+        parentRunId
+      );
+    }
+    return super.handleLLMError(...args);
   }
 
   override handleToolStart(
@@ -664,17 +906,41 @@ export function createLangfuseTraceMetadata({
   parentMessageId,
   agentId,
   agentName,
+  rootAgentId,
+  rootAgentName,
+  activeAgentId,
+  activeAgentName,
+  endpoint,
+  model,
+  provider,
+  resolvedProvider,
 }: {
   messageId?: unknown;
   parentMessageId?: unknown;
   agentId?: unknown;
   agentName?: unknown;
+  rootAgentId?: unknown;
+  rootAgentName?: unknown;
+  activeAgentId?: unknown;
+  activeAgentName?: unknown;
+  endpoint?: unknown;
+  model?: unknown;
+  provider?: unknown;
+  resolvedProvider?: unknown;
 }): LangfuseTraceMetadata {
   return createTraceMetadata({
     messageId,
     parentMessageId,
     agentId,
     agentName,
+    rootAgentId,
+    rootAgentName,
+    activeAgentId,
+    activeAgentName,
+    endpoint,
+    model,
+    provider,
+    resolvedProvider,
   });
 }
 
@@ -697,6 +963,18 @@ function mergeLangfuseTags(
     (tag) => tag.trim() !== ''
   );
   return merged.length > 0 ? [...new Set(merged)] : undefined;
+}
+
+/**
+ * The trace's user identity: the host-configured `langfuse.userId` when
+ * present, else the caller's (normally `configurable.user_id`).
+ */
+export function resolveLangfuseTraceUserId(
+  langfuse: t.LangfuseConfig | undefined,
+  userId: string | undefined
+): string | undefined {
+  const configured = langfuse?.userId?.trim();
+  return isPresent(configured) ? configured : userId;
 }
 
 export function getLangfuseTraceName(
@@ -726,6 +1004,36 @@ export function createLegacyLangfuseHandler(
   return new ScopedLangfuseCallbackHandler(params);
 }
 
+/**
+ * Label calls send the model every piece of evidence. When the redacted copy
+ * differs, the trace records that copy and hides the reply, which may restate
+ * what was redacted. A no-op for any callback other than a label handler.
+ */
+export function maskRedactedLabelGeneration(
+  handler: unknown,
+  {
+    modelPrompt,
+    tracedPrompt,
+    redaction,
+  }: {
+    modelPrompt: string;
+    tracedPrompt: string;
+    redaction?: ResolvedLangfuseToolOutputTracingConfig;
+  }
+): void {
+  if (
+    !(handler instanceof ScopedLangfuseCallbackHandler) ||
+    redaction == null ||
+    tracedPrompt === modelPrompt
+  ) {
+    return;
+  }
+  handler.maskGeneration({
+    input: tracedPrompt === '' ? redaction.redactionText : tracedPrompt,
+    output: redaction.redactionText,
+  });
+}
+
 export function createLangfuseHandler({
   langfuse,
   userId,
@@ -733,7 +1041,12 @@ export function createLangfuseHandler({
   traceMetadata,
   tags,
   traceIdSeed,
+  traceAnchor,
+  agentId,
+  parentSpanContext,
+  inheritTraceIdentity,
   runId,
+  deferRootRunId,
   toolOutputTracing,
   traceName,
 }: AgentLangfuseHandlerParams): CallbackHandler | undefined {
@@ -741,16 +1054,21 @@ export function createLangfuseHandler({
     return undefined;
   }
   return new ScopedLangfuseCallbackHandler({
-    userId,
+    userId: resolveLangfuseTraceUserId(langfuse, userId),
     sessionId,
-    traceMetadata: mergeLangfuseTraceMetadata(
-      traceMetadata,
-      langfuse?.metadata
-    ),
+    traceMetadata:
+      inheritTraceIdentity === true
+        ? undefined
+        : mergeLangfuseTraceMetadata(traceMetadata, langfuse?.metadata),
     tags: mergeLangfuseTags(tags, langfuse?.tags),
     langfuse,
     traceIdSeed,
+    traceAnchor,
+    agentId,
+    parentSpanContext,
+    inheritTraceIdentity,
     runId,
+    deferRootRunId,
     toolOutputTracing,
     traceName,
   });
@@ -763,13 +1081,20 @@ function createPropagateAttributeParams({
   traceMetadata,
   traceName,
   tags,
+  inheritTraceIdentity,
 }: LangfuseAttributeParams): PropagateAttributesParams {
   return {
-    userId,
-    sessionId,
-    traceName,
+    userId:
+      inheritTraceIdentity === true
+        ? undefined
+        : resolveLangfuseTraceUserId(langfuse, userId),
+    sessionId: inheritTraceIdentity === true ? undefined : sessionId,
+    traceName: inheritTraceIdentity === true ? undefined : traceName,
     tags: mergeLangfuseTags(tags, langfuse?.tags),
-    metadata: mergeLangfuseTraceMetadata(traceMetadata, langfuse?.metadata),
+    metadata:
+      inheritTraceIdentity === true
+        ? undefined
+        : mergeLangfuseTraceMetadata(traceMetadata, langfuse?.metadata),
   };
 }
 
@@ -798,7 +1123,65 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
   return value instanceof CallbackHandler;
 }
 
+/** Host results have passed host output filters. Record only reserved metadata,
+ * not arguments, rows, errors, or attachments. These completion observations
+ * do not measure tool latency; execution timing belongs in the metadata. */
+export async function traceHostToolResults(
+  request: t.ToolExecuteBatchRequest,
+  results: t.ToolExecuteResult[],
+  config?: RunnableConfig
+): Promise<void> {
+  if (findCallback(config?.callbacks, isLangfuseCallbackHandler) == null) {
+    return;
+  }
+  const callbacks = filterCallbacks(
+    config?.callbacks,
+    isLangfuseCallbackHandler
+  );
+  const callsById = new Map(request.toolCalls.map((call) => [call.id, call]));
+  for (const result of results) {
+    const metadata = getToolObservationMetadata(result.artifact);
+    const call = callsById.get(result.toolCallId);
+    if (call == null || Object.keys(metadata).length === 0) {
+      continue;
+    }
+    const failure =
+      result.status === 'error'
+        ? new Error('Host tool execution failed')
+        : undefined;
+    const observation = tool(
+      async () => {
+        if (failure != null) {
+          throw failure;
+        }
+        return LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT;
+      },
+      {
+        name: call.name,
+        description: 'Host tool execution metadata',
+        schema: { type: 'object', properties: {} },
+      }
+    );
+    try {
+      await observation.invoke(
+        { type: 'tool_call', id: call.id, name: call.name, args: {} },
+        {
+          callbacks,
+          metadata: { ...metadata, ...request.metadata },
+        }
+      );
+    } catch (error) {
+      if (failure == null || error !== failure) {
+        throw error;
+      }
+    }
+  }
+}
+
 export async function disposeLangfuseHandler(value: unknown): Promise<void> {
+  if (value instanceof ScopedLangfuseCallbackHandler) {
+    await value.finishDeferredRoot();
+  }
   if (
     value == null ||
     parseBooleanEnv(process.env[LANGFUSE_FORCE_FLUSH_ON_DISPOSE]) !== true

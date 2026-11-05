@@ -1,0 +1,234 @@
+/** Typed decisions over content, independent of the model that makes them. */
+
+export type DecisionJson =
+  | string
+  | number
+  | boolean
+  | null
+  | DecisionJson[]
+  | { [key: string]: DecisionJson };
+
+export type DecisionText =
+  | string
+  | DecisionJson[]
+  | { [key: string]: DecisionJson };
+
+export type DecisionState = DecisionText;
+
+export interface BooleanCriteria {
+  true?: DecisionText;
+  false?: DecisionText;
+}
+
+/** A string criterion describes the yes side of a yes/no question. */
+export interface BooleanQuestion {
+  type: 'boolean';
+  instructions: DecisionText;
+  criteria?: BooleanCriteria | string;
+}
+
+export interface ChoiceQuestion {
+  type: 'choice';
+  instructions: DecisionText;
+  criteria: Record<string, DecisionText | null>;
+}
+
+/** The measured answer is an expected level, which may fall between two rubric levels. */
+export interface ScoreQuestion {
+  type: 'score';
+  instructions: DecisionText;
+  criteria: DecisionText[];
+}
+
+export type DecisionQuestion = BooleanQuestion | ChoiceQuestion | ScoreQuestion;
+
+/** `null` is an unmeasured decision, not a probability of zero. */
+export type BooleanAnswer =
+  | { type: 'boolean'; probability: number; decision?: never }
+  | { type: 'boolean'; probability: null; decision: boolean };
+
+export interface ChoiceAnswer {
+  type: 'choice';
+  choice: string;
+  /** Backend-specific concentration measure; Jev and Laya use different definitions. */
+  confidence: number | null;
+  /** `null` when no distribution was measured; never substitute an empty distribution. */
+  probabilities: Record<string, number> | null;
+}
+
+export interface ScoreAnswer {
+  type: 'score';
+  /** Expected value over rubric levels, not an LLM's selection of one level. */
+  score: number;
+  /** Backend-specific concentration measure; do not transfer thresholds between checkpoints. */
+  confidence: number | null;
+  probabilities: Record<string, number> | null;
+}
+
+export type DecisionAnswer = BooleanAnswer | ChoiceAnswer | ScoreAnswer;
+
+/** Unknown counts are omitted, never inferred from an answer or replaced by zero. */
+export interface DecisionUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+export interface DecisionRequest {
+  state: DecisionState;
+  questions: Record<string, DecisionQuestion>;
+  signal?: AbortSignal;
+  label?: string;
+  /** Overrides the provider's timeout for this request alone. */
+  timeoutMs?: number;
+  /**
+   * Called once per request the model sends, just before it goes out, so a
+   * caller can count retries and every re-send after a 401. The HTTP
+   * decision model calls it; a model that does not report requests leaves the
+   * caller to count one per `decide()`. Not awaited; a throw is ignored.
+   */
+  onRequest?: () => void;
+  /**
+   * Called once per request `onRequest` announced that ended before the
+   * deadline or the caller's abort: with the HTTP status once the host
+   * replied (a successful reply's body read in full), or `null` when the
+   * request failed without a reply or a successful reply's body could not be
+   * read, and for a reply that was not OK its
+   * `Retry-After` in milliseconds when it sent one. A request still in
+   * flight when the call is interrupted gets none, so the announced requests
+   * without one are the ones the host may still be working on. Not awaited;
+   * a throw is ignored.
+   */
+  onResponse?: (status: number | null, retryAfterMs?: number) => void;
+}
+
+export interface DecisionResult {
+  model: string;
+  /** A requested answer can be omitted; callers must handle `undefined` explicitly. */
+  answers: Record<string, DecisionAnswer | undefined>;
+  usage: DecisionUsage | null;
+}
+
+export interface DecisionModel {
+  readonly id: string;
+  readonly model: string;
+  /**
+   * True when `decide` reports every request it sends through `onRequest`
+   * and every one that ends through `onResponse`, as the HTTP decision model
+   * does, so a caller can count what was really sent: a `decide` that fails
+   * before its first `onRequest` sent nothing.
+   */
+  readonly reportsRequests?: boolean;
+  decide(request: DecisionRequest): Promise<DecisionResult>;
+}
+
+export type DecisionDialect = 'port' | 'systemone';
+
+/**
+ * Mints a bearer token; `refresh` asks for a new one after a 401. On a
+ * refresh, `refused` is the token the 401 refused (as sent, trimmed), so a
+ * caching minter can hand out a token minted since then instead of
+ * discarding it.
+ */
+export type DecisionTokenMinter = (options: {
+  refresh: boolean;
+  refused?: string;
+  signal?: AbortSignal;
+}) => Promise<string>;
+
+/** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call, and a second 401 one recheck (`refresh: false`) for a token minted since. */
+export type DecisionCredential = string | DecisionTokenMinter;
+
+export interface DecisionProviderSettings {
+  /** Full URL of the decision endpoint, not a base path. */
+  baseURL?: string;
+  model?: string;
+  dialect?: DecisionDialect;
+  requestKey?: string;
+  responseKey?: string;
+  timeoutMs?: number;
+  maxRetries?: number;
+  /** Auth is required by default; self-hosted Laya can be unauthenticated. */
+  requiresAuth?: boolean;
+  apiKeyEnv?: string;
+}
+
+export type DecisionFailure =
+  | 'timeout'
+  | 'aborted'
+  | 'rate_limited'
+  | 'unauthorized'
+  /** HTTP 402: the credential is out of credits; never retried. */
+  | 'quota'
+  | 'bad_request'
+  | 'server_error'
+  | 'network'
+  | 'unsupported_question'
+  | 'unsupported_mode'
+  | 'malformed_response';
+
+export class DecisionError extends Error {
+  readonly failure: DecisionFailure;
+  readonly provider: string;
+  readonly status?: number;
+  retryAfterMs?: number;
+  /** True when a breaker refused the call without a request; see `withBreaker`. */
+  readonly circuitOpen: boolean;
+
+  constructor(
+    failure: DecisionFailure,
+    message: string,
+    options?: { provider?: string; status?: number; circuitOpen?: boolean }
+  ) {
+    super(message);
+    this.name = 'DecisionError';
+    this.failure = failure;
+    this.provider = options?.provider ?? 'unknown';
+    this.status = options?.status;
+    this.circuitOpen = options?.circuitOpen ?? false;
+  }
+}
+
+/** A JSON boundary guard; never trust a parsed response's declared TypeScript type. */
+export function isDecisionObject(
+  value: unknown
+): value is { [key: string]: unknown } {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function readDecisionUsage(raw: unknown): DecisionUsage | null {
+  if (!isDecisionObject(raw)) {
+    return null;
+  }
+  const input = raw.input_tokens;
+  const output = raw.output_tokens;
+  const usage: DecisionUsage = {};
+  if (typeof input === 'number' && Number.isSafeInteger(input) && input >= 0) {
+    usage.inputTokens = input;
+  }
+  if (
+    typeof output === 'number' &&
+    Number.isSafeInteger(output) &&
+    output >= 0
+  ) {
+    usage.outputTokens = output;
+  }
+  return Object.keys(usage).length > 0 ? usage : null;
+}
+
+export function isBooleanAnswer(
+  answer: DecisionAnswer | undefined
+): answer is BooleanAnswer {
+  return answer?.type === 'boolean';
+}
+
+export function isChoiceAnswer(
+  answer: DecisionAnswer | undefined
+): answer is ChoiceAnswer {
+  return answer?.type === 'choice';
+}
+
+export function isScoreAnswer(
+  answer: DecisionAnswer | undefined
+): answer is ScoreAnswer {
+  return answer?.type === 'score';
+}

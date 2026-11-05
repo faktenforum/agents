@@ -26,6 +26,7 @@ import type {
   SessionRunEventEntry,
   SessionSummaryEntry,
   SessionStateEntry,
+  SessionFadingState,
   SessionTreeNode,
 } from './types';
 import {
@@ -34,6 +35,10 @@ import {
   serializeMessage,
   toJsonValue,
 } from './messageSerialization';
+import {
+  initializeSessionProjection,
+  shareSessionProjectionOwnership,
+} from './sessionProjection';
 import { createEntryId, createSessionId, createTimestamp } from './ids';
 
 const SESSION_VERSION = 1;
@@ -82,6 +87,16 @@ function parseLine(line: string): SessionHeader | SessionEntry | undefined {
   }
 }
 
+/** A `session_state` line may carry `data: null`; only an object can hold fading state. */
+function hasFadingStateField(entry: SessionStateEntry): boolean {
+  const data: unknown = entry.data;
+  return (
+    data != null &&
+    typeof data === 'object' &&
+    Object.prototype.hasOwnProperty.call(data, 'fadingState')
+  );
+}
+
 function createHeader(options: CreateSessionFileOptions): SessionHeader {
   return {
     type: 'session',
@@ -115,6 +130,7 @@ export class JsonlSessionStore {
     this.path = params.path;
     this.header = params.header;
     this.entries = sortEntries(params.entries);
+    initializeSessionProjection(this, this.entries);
   }
 
   static getDefaultRoot(): string {
@@ -374,6 +390,66 @@ export class JsonlSessionStore {
     });
   }
 
+  getFadingStates(
+    mainThreadId?: string,
+    maxAlternateStates = Number.POSITIVE_INFINITY
+  ): SessionFadingState[] {
+    const states = new Map<string, SessionFadingState>();
+    const alternateLimit = Number.isFinite(maxAlternateStates)
+      ? Math.max(0, Math.floor(maxAlternateStates))
+      : Number.POSITIVE_INFINITY;
+    let alternateCount = 0;
+    let mainFound = mainThreadId == null;
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const entry = this.entries[i];
+      if (entry.type !== 'session_state' || !hasFadingStateField(entry)) {
+        continue;
+      }
+      if (entry.data.fadingState == null) {
+        break;
+      }
+      const state = entry.data.fadingState;
+      const scopeKey = JSON.stringify([
+        state.threadId,
+        state.checkpointNs ?? '',
+      ]);
+      if (states.has(scopeKey)) {
+        continue;
+      }
+      if (
+        state.threadId === mainThreadId &&
+        (state.checkpointNs ?? '') === ''
+      ) {
+        states.set(scopeKey, state);
+        mainFound = true;
+      } else if (alternateCount < alternateLimit) {
+        states.set(scopeKey, state);
+        alternateCount += 1;
+      }
+      if (mainFound && alternateCount >= alternateLimit) {
+        break;
+      }
+    }
+    return [...states.values()];
+  }
+
+  hasFadingState(): boolean {
+    return this.entries.some(
+      (entry) => entry.type === 'session_state' && hasFadingStateField(entry)
+    );
+  }
+
+  async appendFadingState(
+    fadingState: SessionStateEntry['data']['fadingState']
+  ): Promise<SessionStateEntry> {
+    const leafId = this.getLeafEntry()?.id ?? null;
+    return this.appendEntry<SessionStateEntry>({
+      type: 'session_state',
+      parentId: leafId,
+      data: { leafId, fadingState },
+    });
+  }
+
   async appendEntryForCompaction(params: {
     text: string;
     tokenCount?: number;
@@ -502,6 +578,7 @@ export class JsonlSessionStore {
       name: options.name ?? this.header.name,
       parentSession: this.path,
     });
+    shareSessionProjectionOwnership(this, newStore);
     const pathEntries = target ? this.getPath(target.id) : [];
     for (const entry of pathEntries) {
       await newStore.appendExistingEntry(entry);

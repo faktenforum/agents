@@ -26,6 +26,7 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import { resolveContextPruningSettings } from './contextPruningSettings';
+import { sliceWithoutSplittingSurrogates } from '@/utils/truncation';
 
 /**
  * Applies head+tail soft-trim to tool result content.
@@ -36,7 +37,11 @@ function softTrimContent(
 ): string {
   const { headChars, tailChars } = settings;
   const indicator = `\n\n… [soft-trimmed: ${content.length} chars → ${headChars + tailChars} chars, middle removed] …\n\n`;
-  return content.slice(0, headChars) + indicator + content.slice(-tailChars);
+  return (
+    sliceWithoutSplittingSurrogates(content, 0, headChars) +
+    indicator +
+    sliceWithoutSplittingSurrogates(content, -tailChars)
+  );
 }
 
 export interface ContextPruningResult {
@@ -60,6 +65,8 @@ export interface ContextPruningResult {
  */
 export function applyContextPruning(params: {
   messages: BaseMessage[];
+  /** Full graph history used only to decide whether a projected result is eligible. */
+  canonicalMessages?: BaseMessage[];
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
   config?: ContextPruningConfig;
@@ -138,7 +145,12 @@ export function applyContextPruning(params: {
     }
     const content = message.content;
     const contentLength = getToolContentCharLength(content);
-    if (contentLength < settings.minPrunableToolChars) {
+    const eligibilityContent =
+      params.canonicalMessages?.[i]?.content ?? content;
+    if (
+      getToolContentCharLength(eligibilityContent) <
+      settings.minPrunableToolChars
+    ) {
       continue;
     }
 

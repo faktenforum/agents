@@ -1,7 +1,7 @@
 export * from './core';
 export * from './ids';
 export * from './prune';
-export * from './budget';
+export { syncBudgetDerivedFields } from './budget';
 export * from './format';
 export * from './cache';
 export * from './anthropicToolCache';
@@ -15,3 +15,6 @@ export * from './contextPruningSettings';
 export * from './reducer';
 export * from './recency';
 export * from './assistantPhase';
+export * from './provenance';
+export * from './projectionInvariant';
+export * from './fading';

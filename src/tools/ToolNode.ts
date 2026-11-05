@@ -1,5 +1,7 @@
 import { nanoid } from 'nanoid';
+import { createHash } from 'crypto';
 import { ToolCall } from '@langchain/core/messages/tool';
+import { RunnableLambda } from '@langchain/core/runnables';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   AIMessage,
@@ -30,6 +32,7 @@ import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   ToolOutputResolveView,
+  ToolOutputReferenceState,
   PreResolvedArgsMap,
   ResolvedArgsByCallId,
   ResolveResult,
@@ -46,8 +49,29 @@ import type {
   PostToolBatchEntry,
   ToolApprovalReplayKey,
 } from '@/hooks';
+import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
+import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
+import {
+  TOOL_BATCH_REPLAY_KEY,
+  getToolBatchReplayOwner,
+  getToolBatchReplayScope,
+  attachToolBatchReplayState,
+  restoreToolBatchReplayState,
+  getToolBatchReplayState,
+  clearStaleToolApprovalConfig,
+  isChildToolReplayOwner,
+  getToolReplayResumeStatus,
+} from '@/tools/toolBatchReplay';
+import {
+  type CallerCapabilityProjection,
+  createCallerCapabilityProjectionSnapshot,
+  isToolDefinitionActive,
+  isProgrammaticControlTool,
+  mergeCallerCapabilityDefinitions,
+  resolveCallerCapabilityProjection,
+} from '@/tools/CallerCapabilities';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -57,6 +81,21 @@ import {
   serializeStructuredValueBounded,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
+import {
+  getReviewedToolApproval,
+  getToolApprovalReviewEvidence,
+  toolApprovalPayloadMatches,
+  toolApprovalProposalMatches,
+  TOOL_APPROVAL_REVIEW_CONFIG_KEY,
+} from '@/hitl/approvalReview';
+import {
+  buildToolExecutionRequestPlan,
+  coerceArgsForSchema,
+  coerceRecordArgs,
+  resolveRuntimeSessionHint,
+  recordArgsEqual,
+  stableStringify,
+} from '@/tools/eagerEventExecution';
 import {
   attachSubagentResumeManifest,
   SUBAGENT_PARENT_BATCH_CONFIG_KEY,
@@ -69,11 +108,6 @@ import {
   isIntentLabelProperty,
   outcomeFieldsFromResult,
 } from '@/tools/intentArg';
-import {
-  buildToolExecutionRequestPlan,
-  resolveRuntimeSessionHint,
-  recordArgsEqual,
-} from '@/tools/eagerEventExecution';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -96,20 +130,51 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { ProviderTextProtectionError } from '@/protection/providerText';
+import { formatToolErrorContent } from '@/tools/toolErrorContent';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
+import { isBackgroundDenyMode } from '@/types/hitl';
 
-/** Host-facing batch requests must not carry the batch's breaker scope —
- * hosts spread `configurable` into their own run configs. */
-function stripRunBreakerScope(
+function stripToolApprovalReviewConfig(
   configurable: Record<string, unknown> | undefined
 ): Record<string, unknown> | undefined {
-  if (configurable == null || !(RUN_BREAKER_SCOPE_CONFIG_KEY in configurable)) {
+  if (
+    configurable == null ||
+    (!(TOOL_APPROVAL_REVIEW_CONFIG_KEY in configurable) &&
+      !(TOOL_BATCH_REPLAY_KEY in configurable))
+  ) {
     return configurable;
   }
-  const { [RUN_BREAKER_SCOPE_CONFIG_KEY]: _scope, ...rest } = configurable;
+  const {
+    [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: _review,
+    [TOOL_BATCH_REPLAY_KEY]: _replay,
+    ...rest
+  } = configurable;
+  return rest;
+}
+
+/** Host-facing requests must not carry SDK-private execution state — hosts
+ * spread `configurable` into their own run configs. */
+function stripHostExecutionConfig(
+  configurable: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  const withoutReview = stripToolApprovalReviewConfig(configurable);
+  if (
+    withoutReview == null ||
+    !(RUN_BREAKER_SCOPE_CONFIG_KEY in withoutReview)
+  ) {
+    return withoutReview;
+  }
+  const { [RUN_BREAKER_SCOPE_CONFIG_KEY]: _scope, ...rest } = withoutReview;
   return rest;
 }
 import { convertInjectedMessages } from '@/messages/injected';
-import { safeDispatchCustomEvent } from '@/utils/events';
+import { stampSyntheticProviderMessage } from '@/messages/provenance';
+import {
+  createToolCallsDispatchedEvent,
+  safeDispatchCustomEvent,
+} from '@/utils/events';
 import { RunnableCallable, composeAbortSignals } from '@/utils';
 import {
   executeHooks,
@@ -162,6 +227,8 @@ type RunToolBatchContext<T = unknown> = {
   batchScopeId?: string;
   /** Batch-local sink for post-substitution args. */
   resolvedArgsByCallId?: ResolvedArgsByCallId;
+  /** File identities actually injected into each direct code call. */
+  codeSessionBaselineByCallId?: Map<string, ReadonlyMap<string, string>>;
   /**
    * Frozen pre-batch view of the tool-output registry. When supplied,
    * `runTool` resolves `{{tool…turn…}}` placeholders against this
@@ -194,6 +261,10 @@ type RunToolBatchContext<T = unknown> = {
   additionalContextsSink?: string[];
   /** Stable identity of the assistant tool-call batch across HITL replay. */
   replayBatchKey?: string;
+  /** Positions in the original proposal, before completed calls are filtered. */
+  replayCallPositions?: ReadonlyMap<ToolCall, number>;
+  /** Tool-call identities owned by this ToolNode invocation. */
+  approvalScopeCallIds?: ReadonlySet<string>;
   /**
    * Graph state the ToolNode was invoked with, threaded from `run()`
    * so `tool.invoke` can forward it as langgraph 1.4's `runtime.state`
@@ -221,11 +292,14 @@ function withSubagentReplayBatch(
   };
 }
 
-type SettledDirectToolResult = {
-  output: BaseMessage | Command;
-  additionalContexts: string[];
-  resolvedArgs?: Record<string, unknown>;
-};
+type SettledDirectToolResult = SettledToolBatchResult;
+
+/** Positional identity is safe within the immutable full-proposal batch key. */
+function directReplayKey(call: ToolCall, batchIndex: number): string {
+  return call.id == null || call.id === ''
+    ? JSON.stringify(['position', batchIndex])
+    : JSON.stringify(['id', call.id]);
+}
 
 /**
  * Batch-local record of who owns each failed call's completion event.
@@ -388,8 +462,6 @@ function describeOfferedShape(value: unknown): string {
 
 type AssistantBatch = {
   message: AIMessage;
-  index: number;
-  messageCount: number;
 };
 
 function findAssistantBatch(
@@ -398,7 +470,7 @@ function findAssistantBatch(
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
     if (isAIMessage(message)) {
-      return { message, index: i, messageCount: messages.length };
+      return { message };
     }
   }
   return undefined;
@@ -406,15 +478,16 @@ function findAssistantBatch(
 
 function getAssistantBatchReplayKey(
   batch: AssistantBatch,
-  runId: string | undefined,
   threadId: string | undefined
 ): string {
   return JSON.stringify([
-    runId ?? null,
     threadId ?? null,
-    batch.message.id ?? null,
-    batch.index,
-    batch.messageCount,
+    batch.message.id == null || batch.message.id === ''
+      ? null
+      : batch.message.id,
+    createHash('sha256')
+      .update(stableStringify(batch.message.tool_calls ?? []))
+      .digest('hex'),
   ]);
 }
 
@@ -586,28 +659,78 @@ function toInjectedFileRef(
 
 /* Stable file identity = `(storage_session_id, id)`. Same name in
  * different storage sessions are distinct files. */
-function fileIdentityKey(file: {
-  storage_session_id?: string;
-  id: string;
-}): string {
-  return `${file.storage_session_id ?? ''}\0${file.id}`;
+function fileIdentityKey(
+  file: {
+    storage_session_id?: string;
+    id: string;
+  },
+  fallbackSessionId = ''
+): string {
+  return `${file.storage_session_id ?? fallbackSessionId}\0${file.id}`;
+}
+
+function codeSessionIdentityByName(
+  context:
+    | t.ToolCallRequest['codeSessionContext']
+    | t.CodeSessionContext
+    | undefined
+): ReadonlyMap<string, string> {
+  return new Map(
+    (context?.files ?? []).map((file) => [
+      file.name,
+      fileIdentityKey(file, context?.session_id),
+    ])
+  );
+}
+
+function storageSessionIdFromIdentity(
+  identity: string | undefined,
+  fileId: string
+): string | undefined {
+  const suffix = `\0${fileId}`;
+  return identity != null && identity.endsWith(suffix)
+    ? identity.slice(0, identity.length - suffix.length)
+    : undefined;
 }
 
 function updateCodeSession(
   sessions: t.ToolSessionMap,
+  sessionKey: string,
   execSessionId: string,
-  files: t.FileRefs | undefined
+  files: t.FileRefs | undefined,
+  deletedFiles: readonly string[] | undefined,
+  baselineIdentityByName: ReadonlyMap<string, string> | undefined
 ): void {
   const newFiles = files ?? [];
-  const existingSession = sessions.get(Constants.EXECUTE_CODE) as
+  const existingSession = sessions.get(sessionKey) as
     | t.CodeSessionContext
     | undefined;
-  const existingFiles = existingSession?.files ?? [];
+  const existingSessionId = existingSession?.session_id ?? '';
+  const existingFiles = (existingSession?.files ?? []).map((file) =>
+    file.storage_session_id == null
+      ? { ...file, storage_session_id: existingSessionId }
+      : file
+  );
+  const deletedIdentityByName = new Map<string, string>();
+  for (const name of deletedFiles ?? []) {
+    const identity = baselineIdentityByName?.get(name);
+    if (identity != null) {
+      deletedIdentityByName.set(name, identity);
+    }
+  }
 
+  /* Absence from `files` is not a deletion signal: older Code API versions
+   * and truncated responses can omit otherwise-live refs. Remove only paths
+   * explicitly attested by `deleted_files`, and only while the current ref
+   * still has the identity injected into that request. */
   if (newFiles.length === 0) {
-    sessions.set(Constants.EXECUTE_CODE, {
+    sessions.set(sessionKey, {
       session_id: execSessionId,
-      files: existingFiles,
+      files: existingFiles.filter(
+        (file) =>
+          deletedIdentityByName.get(file.name) !==
+          fileIdentityKey(file, existingSessionId)
+      ),
       lastUpdated: Date.now(),
     });
     return;
@@ -619,33 +742,100 @@ function updateCodeSession(
   const filesWithSession: t.FileRefs = [];
   const newFileNames = new Set<string>();
   const incomingByIdentity = new Map<string, number>();
+  const existingIdentities = new Set(
+    existingFiles.map((file) => fileIdentityKey(file, existingSessionId))
+  );
   for (const file of newFiles) {
+    const baselineIdentity = baselineIdentityByName?.get(file.name);
     const withSession = {
       ...file,
-      storage_session_id: file.storage_session_id ?? execSessionId,
+      storage_session_id:
+        file.storage_session_id ??
+        storageSessionIdFromIdentity(baselineIdentity, file.id) ??
+        execSessionId,
     };
-    incomingByIdentity.set(
-      fileIdentityKey(withSession),
-      filesWithSession.length
-    );
+    const identity = fileIdentityKey(withSession);
+    const wasTrackedByRequest = baselineIdentity === identity;
+    /* An inherited echo is evidence that a request observed an existing ref,
+     * not authority to resurrect one removed by a concurrent sibling. Fresh
+     * and modified outputs remain eligible to replace by path below. */
+    if (
+      file.inherited === true &&
+      wasTrackedByRequest &&
+      (!existingIdentities.has(identity) ||
+        deletedIdentityByName.get(file.name) === identity)
+    ) {
+      continue;
+    }
+    incomingByIdentity.set(identity, filesWithSession.length);
     newFileNames.add(withSession.name);
     filesWithSession.push(withSession);
   }
 
   const filteredExisting: t.FileRefs = [];
   for (const e of existingFiles) {
-    const idx = incomingByIdentity.get(fileIdentityKey(e));
+    const idx = incomingByIdentity.get(fileIdentityKey(e, existingSessionId));
     if (idx !== undefined) {
       filesWithSession[idx] = { ...e, ...filesWithSession[idx] };
     }
-    if (!newFileNames.has(e.name)) {
+    const explicitlyDeleted =
+      deletedIdentityByName.get(e.name) ===
+      fileIdentityKey(e, existingSessionId);
+    if (!newFileNames.has(e.name) && !explicitlyDeleted) {
       filteredExisting.push(e);
     }
   }
 
-  sessions.set(Constants.EXECUTE_CODE, {
+  sessions.set(sessionKey, {
     session_id: execSessionId,
     files: [...filteredExisting, ...filesWithSession],
+    lastUpdated: Date.now(),
+  });
+}
+
+/** Retains host-provisioned inputs even when execution returns no usable artifact. */
+function retainCodeSessionInputs(
+  sessions: t.ToolSessionMap,
+  sessionKey: string,
+  context: t.ToolCallRequest['codeSessionContext']
+): void {
+  if (
+    context?.session_id == null ||
+    context.session_id === '' ||
+    context.files == null
+  )
+    return;
+  const existing = sessions.get(sessionKey) as t.CodeSessionContext | undefined;
+  const existingFiles = existing?.files ?? [];
+  const files = [...existingFiles];
+  const indexByIdentity = new Map<string, number>();
+  const indexByName = new Map<string, number>();
+  for (let i = 0; i < files.length; i++) {
+    indexByIdentity.set(fileIdentityKey(files[i]), i);
+    indexByName.set(files[i].name, i);
+  }
+  let changed = existing?.session_id !== context.session_id;
+  for (const file of context.files) {
+    if (!file.id || !file.name || !file.storage_session_id) continue;
+    const identity = fileIdentityKey(file);
+    if (indexByIdentity.has(identity)) continue;
+    const replacementIndex = indexByName.get(file.name);
+    if (replacementIndex !== undefined) {
+      indexByIdentity.delete(fileIdentityKey(files[replacementIndex]));
+      files[replacementIndex] = { ...file };
+      indexByIdentity.set(identity, replacementIndex);
+      changed = true;
+      continue;
+    }
+    indexByIdentity.set(identity, files.length);
+    indexByName.set(file.name, files.length);
+    files.push({ ...file });
+    changed = true;
+  }
+  if (!changed) return;
+  sessions.set(sessionKey, {
+    session_id: context.session_id,
+    files,
     lastUpdated: Date.now(),
   });
 }
@@ -681,19 +871,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * the Run ends.
    */
   private directPathTurns: Map<string, number> = new Map();
-  /** Terminal results from interrupting siblings that must survive a
-   * LangGraph replay of the containing ToolNode. Includes the sidecar data
-   * the fresh batch needs for hook-context injection and completion events. */
-  private settledInterruptingResults = new Map<
+  /** Terminal direct results that must survive a LangGraph replay of the
+   * containing ToolNode. Includes the sidecar data the fresh batch needs for
+   * hook-context injection and completion-event deduplication. */
+  private settledDirectResultsByBatch = new Map<
     string,
     Map<string, SettledDirectToolResult>
   >();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
-  /** Cached programmatic tools (computed once on first PTC call) */
-  private programmaticCache?: t.ProgrammaticCache;
+  /** Schema-only definitions used when event mode has no runtime registry. */
+  private toolDefinitions?: t.LCToolRegistry;
+  /** Tool-map entries created or replaced by the local execution resolver. */
+  private localImplementationNames = new Set<string>();
+  /** Reads deferred-tool discovery state from the owning agent context. */
+  private getDiscoveredToolNames?: () => readonly string[];
   /** Reference to Graph's sessions map for automatic session injection */
   private sessions?: t.ToolSessionMap;
+  /** Partition within `sessions` owned by this agent's execution profile. */
+  private codeSessionKey: string;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   private eventDrivenMode: boolean = false;
   /** Opt-in stream-layer prestart config for event-driven tools. */
@@ -719,6 +915,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * even where `agentId` (the subagent-scope marker) is undefined.
    */
   private executingAgentId?: string;
+  private readonly executionContext?: t.ToolNodeOptions['executionContext'];
+  private executingAgentName?: string;
+  private rootAgentId?: string;
+  private rootAgentName?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
   /**
@@ -771,6 +971,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private getBreakerSignal?: () => AbortSignal | undefined;
   /** Owning graph's immutable run scope; captured once per batch. */
   private getRunScope?: () => RunBreakerScope;
+  private preparedSubagents?: PreparedSubagents;
   /**
    * Monotonic counter used to mint a unique scope id for anonymous
    * batches (ones invoked without a `run_id` in
@@ -779,8 +980,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * other's in-flight state.
    */
   private anonBatchCounter: number = 0;
+  private handoffRouting?: t.ToolNodeOptions['handoffRouting'];
 
   constructor({
+    handoffRouting,
     tools,
     toolMap,
     name,
@@ -793,7 +996,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     handleToolErrors,
     loadRuntimeTools,
     toolRegistry,
+    toolDefinitions,
+    getDiscoveredToolNames,
     sessions,
+    codeSessionKey,
     eventDrivenMode,
     eagerEventToolExecution,
     eagerEventToolExecutions,
@@ -801,6 +1007,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     eagerEventToolSuppressions,
     agentId,
     executingAgentId,
+    executionContext,
+    executingAgentName,
+    rootAgentId,
+    rootAgentName,
     directToolNames,
     interruptingToolNames,
     codeSessionToolNames,
@@ -814,16 +1024,215 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     fileCheckpointer,
     getBreakerSignal,
     getRunScope,
+    preparedSubagents,
+    restoreRunStepResumeState,
+    createRunStepResumeState,
+    onToolCallsClaimed,
   }: t.ToolNodeConstructorParams) {
     super({
       name: name ?? TOOL_NODE_RUN_NAME,
       tags,
-      func: (input, config) => this.run(input, config),
+      func: async (input, config) => {
+        const messages = Array.isArray(input)
+          ? (input as BaseMessage[])
+          : (input as { messages?: BaseMessage[] }).messages;
+        const assistantBatch =
+          messages == null ? undefined : findAssistantBatch(messages);
+        const activeReplayKey =
+          assistantBatch == null || getToolBatchReplayScope(config) == null
+            ? undefined
+            : getAssistantBatchReplayKey(
+              assistantBatch,
+              getToolBatchReplayScope(config)
+            );
+        const replayOwner = getToolBatchReplayOwner(
+          config,
+          this.executingAgentId ?? this.agentId ?? ''
+        );
+        let reviewEvidence = getToolApprovalReviewEvidence(config);
+        const replayState = getToolBatchReplayState(config.configurable);
+        const ownsParentBatch =
+          replayState?.records.some(
+            (record) =>
+              record.owner === replayOwner && record.batch === activeReplayKey
+          ) === true;
+        let isChildReplay = false;
+        if (ownsParentBatch) {
+          const calls = this.isSendInput(input)
+            ? [input.lg_tool_call]
+            : (assistantBatch?.message.tool_calls ?? []);
+          const trustedParentCallIds = new Set(
+            calls
+              .filter(
+                (call) =>
+                  call.name === Constants.SUBAGENT &&
+                  (
+                    this.toolMap.get(call.name) as
+                      | ReplayableSubagentTool
+                      | undefined
+                  )?.[SUBAGENT_REPLAY_CONTROLLER] != null
+              )
+              .map((call) => call.id ?? '')
+          );
+          isChildReplay =
+            reviewEvidence?.owner != null
+              ? isChildToolReplayOwner(
+                config,
+                reviewEvidence.owner,
+                trustedParentCallIds
+              )
+              : replayState.records.some((record) =>
+                isChildToolReplayOwner(
+                  config,
+                  record.owner,
+                  trustedParentCallIds
+                )
+              );
+        }
+        const hasApprovalAuthorization =
+          reviewEvidence?.owner != null || replayState?.approvalOwner != null;
+        const replayResumeStatus =
+          hasApprovalAuthorization || replayState != null
+            ? getToolReplayResumeStatus(
+              config,
+              reviewEvidence?.interruptId ?? replayState?.interruptId,
+              isChildReplay
+            )
+            : undefined;
+        if (replayResumeStatus === 'unverifiable' && hasApprovalAuthorization) {
+          throw new Error(
+            'Cannot verify the active tool approval resume — failing closed'
+          );
+        }
+        if (replayResumeStatus === 'stale') {
+          const configurable = { ...config.configurable };
+          clearStaleToolApprovalConfig(
+            configurable,
+            replayOwner,
+            activeReplayKey
+          );
+          config = {
+            ...config,
+            configurable,
+          };
+          reviewEvidence = undefined;
+        }
+        if (
+          reviewEvidence?.owner != null &&
+          reviewEvidence.owner !== replayOwner &&
+          !isChildReplay
+        ) {
+          throw new Error(
+            'Tool approval execution owner changed before resume — failing closed'
+          );
+        }
+        const referenceReplay: { state?: ToolOutputReferenceState } = {};
+        const restoredBatches = await restoreToolBatchReplayState(
+          config,
+          replayOwner
+        );
+        if (
+          restoredBatches.length > 0 &&
+          !restoredBatches.some(({ batch }) => batch === activeReplayKey)
+        ) {
+          throw new Error(
+            'Tool batch proposal changed before approval replay — failing closed'
+          );
+        }
+        if (
+          activeReplayKey != null &&
+          getToolBatchReplayState(config.configurable) != null
+        ) {
+          this.settledDirectResultsByBatch.delete(activeReplayKey);
+        }
+        for (const {
+          batch,
+          results,
+          turnState,
+          referenceState,
+        } of restoredBatches) {
+          if (batch !== activeReplayKey) {
+            continue;
+          }
+          this.settledDirectResultsByBatch.set(batch, new Map(results));
+          if (turnState != null) {
+            this.restoreSubagentResumeState(turnState);
+          }
+          referenceReplay.state = referenceState;
+        }
+        const state = input as T & Pick<t.BaseGraphState, 'runStepState'>;
+        restoreRunStepResumeState?.(state.runStepState, config);
+        // Freeze replay authority before observers can yield to sibling tasks.
+        if (onToolCallsClaimed != null && assistantBatch?.message.id != null) {
+          await onToolCallsClaimed(assistantBatch.message.id, config);
+        }
+        let result: T;
+        try {
+          result = await this.run(input, config, referenceReplay);
+        } catch (error) {
+          if (!isGraphInterrupt(error)) {
+            throw error;
+          }
+          const resumeState = createRunStepResumeState?.();
+          const activeResults =
+            activeReplayKey == null
+              ? undefined
+              : this.settledDirectResultsByBatch.get(activeReplayKey);
+          const activeBatches =
+            activeReplayKey == null
+              ? new Map<string, Map<string, SettledDirectToolResult>>()
+              : new Map([
+                [
+                  activeReplayKey,
+                  activeResults ?? new Map<string, SettledDirectToolResult>(),
+                ],
+              ]);
+          const turnState = this.createSubagentResumeState();
+          const activeCallIds = new Set(
+            assistantBatch?.message.tool_calls?.map((call) => call.id)
+          );
+          turnState.directPathTurns = turnState.directPathTurns.filter(
+            ({ toolCallId }) => activeCallIds.has(toolCallId)
+          );
+          throw new GraphInterrupt(
+            await Promise.all(
+              error.interrupts.map(async (pendingInterrupt) => {
+                const value = await attachToolBatchReplayState(
+                  pendingInterrupt.value,
+                  replayOwner,
+                  activeBatches,
+                  turnState,
+                  referenceReplay.state
+                );
+                return {
+                  ...pendingInterrupt,
+                  value:
+                    resumeState == null
+                      ? value
+                      : attachRunStepResumeState(value, resumeState),
+                };
+              })
+            )
+          );
+        }
+        if (createRunStepResumeState == null) {
+          return result;
+        }
+        const runStepState = createRunStepResumeState();
+        if (Array.isArray(result)) {
+          return [...result, { runStepState }] as T;
+        }
+        return {
+          ...result,
+          runStepState,
+        };
+      },
     });
     this.trace = trace ?? this.trace;
     this.runLangfuse = runLangfuse;
     this.agentLangfuse = agentLangfuse;
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+    this.handoffRouting = handoffRouting;
     this.toolCallStepIds = toolCallStepIds;
     this.handleToolErrors = handleToolErrors ?? this.handleToolErrors;
     this.loadRuntimeTools = loadRuntimeTools;
@@ -833,7 +1242,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolRegistry,
       toolExecution,
     });
+    this.toolDefinitions = toolDefinitions;
+    this.getDiscoveredToolNames = getDiscoveredToolNames;
     this.sessions = sessions;
+    this.codeSessionKey = codeSessionKey ?? Constants.EXECUTE_CODE;
     this.eventDrivenMode = eventDrivenMode ?? false;
     this.eagerEventToolExecution = eagerEventToolExecution;
     this.eagerEventToolExecutions = eagerEventToolExecutions;
@@ -843,6 +1255,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // Default to agentId so callers constructing ToolNode directly (who pass the
     // existing agentId option) still get attribution without knowing the new option.
     this.executingAgentId = executingAgentId ?? agentId;
+    this.executionContext = executionContext;
+    this.executingAgentName = executingAgentName;
+    this.rootAgentId = rootAgentId;
+    this.rootAgentName = rootAgentName;
     this.directToolNames = directToolNames;
     this.interruptingToolNames =
       interruptingToolNames != null && interruptingToolNames.size > 0
@@ -859,6 +1275,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.toolExecution = toolExecution;
     this.getBreakerSignal = getBreakerSignal;
     this.getRunScope = getRunScope;
+    this.preparedSubagents = preparedSubagents;
     // Caller-provided checkpointer wins. Graphs use this to share a
     // single per-Run instance across every ToolNode they compile so
     // `Run.rewindFiles()` reaches the same snapshot store regardless
@@ -893,6 +1310,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     options?: Partial<RunnableConfig>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Promise<any> {
+    return this.withToolScope(options, (scoped) => super.invoke(input, scoped));
+  }
+
+  private withToolScope<R>(
+    options: Partial<RunnableConfig> | undefined,
+    invoke: (config: Partial<RunnableConfig> | undefined) => Promise<R>
+  ): Promise<R> {
     // Explicit agent identity for tool callbacks: node-name parsing is
     // ambiguous when agent ids themselves embed node prefixes, so the
     // handler prefers this metadata (see `isForeignScope`).
@@ -901,9 +1325,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ? options
         : {
           ...options,
+          configurable: {
+            ...options?.configurable,
+            executionContext: this.executionContext,
+          },
           metadata: {
             ...options?.metadata,
+            executionContext: this.executionContext,
             agentId: this.executingAgentId,
+            activeAgentId: this.executingAgentId,
+            ...(this.executingAgentName == null
+              ? {}
+              : { activeAgentName: this.executingAgentName }),
+            ...(this.rootAgentId == null
+              ? {}
+              : { rootAgentId: this.rootAgentId }),
+            ...(this.rootAgentName == null
+              ? {}
+              : { rootAgentName: this.rootAgentName }),
           },
         };
     return withLangfuseRuntimeScope(
@@ -917,7 +1356,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // `LangfuseRuntimeContext.agentId`).
         agentId: this.executingAgentId,
       }),
-      () => super.invoke(input, scopedOptions)
+      () => invoke(scopedOptions)
     );
   }
 
@@ -946,10 +1385,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const resolved = resolveLocalExecutionTools({
       toolMap: this.toolMap,
       toolExecution: this.toolExecution,
+      toolRegistry: this.toolRegistry,
       fileCheckpointer: this.fileCheckpointer,
     });
 
     this.toolMap = resolved.toolMap;
+    this.localImplementationNames = resolved.localImplementationNames;
     if (resolved.fileCheckpointer != null) {
       this.fileCheckpointer = resolved.fileCheckpointer;
     }
@@ -961,7 +1402,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ...(this.directToolNames ?? new Set<string>()),
       ...resolved.directToolNames,
     ]);
-    this.programmaticCache = undefined;
   }
 
   /**
@@ -1054,33 +1494,80 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   clearDirectPathTurns(): void {
     this.directPathTurns.clear();
-    this.settledInterruptingResults.clear();
+    this.settledDirectResultsByBatch.clear();
   }
 
-  /**
-   * Returns cached programmatic tools, computing once on first access.
-   * Single iteration builds both toolMap and toolDefs simultaneously.
-   */
-  private getProgrammaticTools(): { toolMap: t.ToolMap; toolDefs: t.LCTool[] } {
-    if (this.programmaticCache) return this.programmaticCache;
+  /** Returns the live caller projection used by direct and event execution. */
+  private getCallerCapabilityProjection(): CallerCapabilityProjection {
+    const discoveredToolNames = new Set(this.getDiscoveredToolNames?.() ?? []);
+    return resolveCallerCapabilityProjection(
+      mergeCallerCapabilityDefinitions(
+        this.toolDefinitions?.values(),
+        this.toolRegistry?.values()
+      ),
+      (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
+    );
+  }
 
+  private getToolParameterSchema(
+    toolName: string
+  ): t.JsonSchemaType | undefined {
+    return (
+      this.toolDefinitions?.get(toolName)?.parameters ??
+      this.toolRegistry?.get(toolName)?.parameters
+    );
+  }
+
+  private coerceEventToolArgs(
+    toolName: string,
+    args: unknown
+  ): Record<string, unknown> {
+    const recordArgs = coerceRecordArgs(args);
+    return coerceArgsForSchema(
+      recordArgs ?? (args as Record<string, unknown>),
+      this.getToolParameterSchema(toolName)
+    );
+  }
+
+  /** Serializes the live caller projection for event-driven hosts. */
+  private getCallerCapabilityProjectionSnapshot(): t.CallerCapabilityProjectionSnapshot {
+    return createCallerCapabilityProjectionSnapshot(
+      this.getCallerCapabilityProjection()
+    );
+  }
+
+  /** Returns active tools projected by their effective caller capabilities. */
+  private getProgrammaticTools(): t.ProgrammaticCache {
     const toolMap: t.ToolMap = new Map();
     const toolDefs: t.LCTool[] = [];
-
-    if (this.toolRegistry) {
-      for (const [name, toolDef] of this.toolRegistry) {
-        if (
-          (toolDef.allowed_callers ?? ['direct']).includes('code_execution')
-        ) {
-          toolDefs.push(toolDef);
-          const tool = this.toolMap.get(name);
-          if (tool) toolMap.set(name, tool);
-        }
+    const discoveredToolNames = new Set(this.getDiscoveredToolNames?.() ?? []);
+    const executableCapabilities = resolveCallerCapabilityProjection(
+      this.toolRegistry?.values() ?? [],
+      (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
+    );
+    for (const toolDef of executableCapabilities.codeExecutionTools) {
+      if (
+        this.eventDrivenMode &&
+        this.directToolNames?.has(toolDef.name) !== true &&
+        !this.localImplementationNames.has(toolDef.name)
+      ) {
+        continue;
+      }
+      const tool = this.toolMap.get(toolDef.name);
+      if (tool != null) {
+        toolMap.set(toolDef.name, tool);
+        toolDefs.push(toolDef);
       }
     }
+    const activeCapabilities = this.getCallerCapabilityProjection();
 
-    this.programmaticCache = { toolMap, toolDefs };
-    return this.programmaticCache;
+    return {
+      toolMap,
+      toolDefs,
+      disallowedToolDefs: activeCapabilities.directOnlyTools
+        .filter((toolDef) => !isProgrammaticControlTool(toolDef.name))
+        .map((toolDef) => ({ name: toolDef.name })),
+    };
   }
 
   /**
@@ -1196,6 +1683,171 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Forward the graph state as langgraph 1.4's `runtime.state` so
+   * tools can read it off their second argument instead of the
+   * deprecated `getCurrentTaskInput()` (which relies on
+   * `node:async_hooks` and is browser-incompatible). Shape mirrors
+   * langgraph's prebuilt ToolNode runtime exactly.
+   */
+  private invokeWithRuntime(
+    tool: t.GenericTool,
+    invokeParams: Record<string, unknown>,
+    call: ToolCall,
+    config: RunnableConfig,
+    runInput?: RunToolBatchContext<T>['runInput']
+  ): Promise<unknown> {
+    const lgConfig = config as LangGraphRunnableConfig;
+    const isTrustedSubagentHop =
+      call.name === Constants.SUBAGENT &&
+      (tool as ReplayableSubagentTool)[SUBAGENT_REPLAY_CONTROLLER] != null;
+    const toolConfig: RunnableConfig = {
+      ...config,
+      configurable: isTrustedSubagentHop
+        ? config.configurable
+        : stripToolApprovalReviewConfig(
+            config.configurable as Record<string, unknown> | undefined
+        ),
+    };
+    const runtime: ToolRuntime<T> = {
+      ...toolConfig,
+      state: runInput as ToolRuntime<T>['state'],
+      toolCallId: call.id ?? '',
+      config: toolConfig,
+      context: lgConfig.context as ToolRuntime<T>['context'],
+      store: (lgConfig.store ?? null) as ToolRuntime<T>['store'],
+      writer:
+        lgConfig.writer ??
+        (config.configurable?.writer as ToolRuntime<T>['writer']) ??
+        null,
+    };
+    this.throwIfBreakerTripped(config);
+    config.signal?.throwIfAborted();
+    if (call.id != null && call.id !== '') {
+      void safeDispatchCustomEvent(
+        GraphEvents.ON_TOOL_CALLS_DISPATCHED,
+        createToolCallsDispatchedEvent(config, [
+          {
+            id: call.id,
+            name: call.name,
+            stepId: this.toolCallStepIds?.get(call.id),
+          },
+        ]),
+        config
+      );
+    }
+    return tool.invoke(invokeParams, runtime);
+  }
+
+  /** Only Graph's built-in subagent binding is allowed to call this seam. */
+  prestartSubagent(
+    call: ToolCall,
+    attempt: string,
+    config: RunnableConfig,
+    capacity: number
+  ): void {
+    const runId = (config.configurable?.run_id as string | undefined) ?? '';
+    if (
+      call.name !== Constants.SUBAGENT ||
+      call.id == null ||
+      call.args.run_in_background === true ||
+      call.args.subagent_thread_id != null ||
+      this.humanInTheLoop?.enabled === true ||
+      this.hookRegistry?.hasResultAlteringHooks(runId) === true ||
+      this.eagerEventToolExecution?.excludeToolNames?.includes(call.name) ===
+        true
+    ) {
+      return;
+    }
+    const tool = this.toolMap.get(call.name);
+    if (tool == null || this.preparedSubagents == null) {
+      return;
+    }
+    const scope = this.getRunScope?.();
+    const capturedConfig = {
+      ...config,
+      configurable: {
+        ...config.configurable,
+        [RUN_BREAKER_SCOPE_CONFIG_KEY]: scope,
+        [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: attempt,
+      },
+    };
+    const args = JSON.parse(JSON.stringify(call.args)) as ToolCall['args'];
+    const preparedCall = { ...call, args };
+    this.preparedSubagents.start(
+      attempt,
+      this.executingAgentId ?? '',
+      preparedCall,
+      capacity,
+      (signal) => {
+        const turn = this.toolUsageCount.get(call.name) ?? 0;
+        this.toolUsageCount.set(call.name, turn + 1);
+        this.directPathTurns.set(call.id!, turn);
+        // An early call is its own dispatch, before the completed batch exists.
+        // Give it a real chain parent instead of borrowing the model's callback
+        // parent or attempting to reparent already-exported observations later.
+        return this.withToolScope(capturedConfig, async (scopedConfig) => {
+          let output: unknown;
+          let failure: { error: unknown } | undefined;
+          const dispatchOptions = {
+            ...scopedConfig,
+            runName: `tools=${this.executingAgentId ?? ''}`,
+          };
+          delete dispatchOptions.runId;
+          delete dispatchOptions.signal;
+          delete dispatchOptions.timeout;
+          // Isolate ambient cancellation too: RunnableLambda races its signal,
+          // but capacity must remain owned until the actual tool settles.
+          await AsyncLocalStorageProviderSingleton.runWithConfig(
+            dispatchOptions,
+            () =>
+              RunnableLambda.from(async (_input, dispatchConfig) => {
+                try {
+                  output = await this.invokeWithRuntime(
+                    tool,
+                    {
+                      ...preparedCall,
+                      type: 'tool_call',
+                      turn,
+                      stepId: this.toolCallStepIds?.get(call.id!),
+                    },
+                    preparedCall,
+                    {
+                      ...dispatchConfig,
+                      signal: composeAbortSignals(
+                        signal,
+                        composeAbortSignals(
+                          config.signal,
+                          scope?.controller.signal
+                        )
+                      ),
+                    }
+                  );
+                  // Raw output belongs to the tool observation, whose redaction policy
+                  // knows the tool name. A chain's scalar output has no such identity.
+                  return { status: 'completed' };
+                } catch (error) {
+                  failure = { error };
+                  return { status: 'failed' };
+                }
+              }).invoke(
+                {
+                  messages: [
+                    new AIMessage({ content: '', tool_calls: [preparedCall] }),
+                  ],
+                },
+                dispatchOptions
+              )
+          );
+          if (failure != null) {
+            throw failure.error;
+          }
+          return output;
+        });
+      }
+    );
+  }
+
+  /**
    * Runs a single tool call with error handling.
    *
    * `batchIndex` is the tool's position within the current ToolNode
@@ -1300,6 +1952,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        */
       const usageCount =
         batchContext.usageCount ??
+        this.directPathTurns.get(call.id ?? '') ??
         ((): number => {
           const next = this.toolUsageCount.get(call.name) ?? 0;
           this.toolUsageCount.set(call.name, next + 1);
@@ -1308,6 +1961,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
           return next;
         })();
+      this.recordToolUsageTurn(call.name, usageCount, call.id);
+      if (
+        batchContext.replayBatchKey != null &&
+        call.id != null &&
+        call.id !== ''
+      ) {
+        this.directPathTurns.set(call.id, usageCount);
+      }
       let args = call.args;
       if (resolveFn != null) {
         const { resolved, unresolved } = resolveFn(runId, args);
@@ -1350,11 +2011,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
         call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
-        const { toolMap, toolDefs } = this.getProgrammaticTools();
+        const { toolMap, toolDefs, disallowedToolDefs } =
+          this.getProgrammaticTools();
         invokeParams = {
           ...invokeParams,
           toolMap,
           toolDefs,
+          disallowedToolDefs,
+          programmaticToolName: call.name,
           // Plumb the hook context into the programmatic-tool path so
           // inner tool calls made via the in-process bridge can run
           // through `PreToolUse` (deny / updatedInput) before reaching
@@ -1363,9 +2027,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // they dispatch — including HITL gates on `write_file` / `edit_file`.
           hookContext: {
             registry: this.hookRegistry,
+            failClosedOnHookError: isBackgroundDenyMode(this.humanInTheLoop),
             runId: (config.configurable?.run_id as string | undefined) ?? '',
             threadId: config.configurable?.thread_id as string | undefined,
             agentId: this.agentId,
+            executionContext: this.executionContext,
             executingAgentId: this.executingAgentId,
           },
         };
@@ -1387,10 +2053,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * `/files/<session_id>` fallback was removed from the executors.
        */
       if (this.participatesInCodeSession(call.name)) {
-        const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
+        const codeSession = this.sessions?.get(this.codeSessionKey) as
           | t.CodeSessionContext
           | undefined;
         const execSessionId = codeSession?.session_id;
+        if (batchContext.codeSessionBaselineByCallId != null) {
+          batchContext.codeSessionBaselineByCallId.set(
+            call.id ?? '',
+            codeSessionIdentityByName(codeSession)
+          );
+        }
         if (execSessionId != null && execSessionId !== '') {
           invokeParams = {
             ...invokeParams,
@@ -1419,31 +2091,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
 
-      /**
-       * Forward the graph state as langgraph 1.4's `runtime.state` so
-       * tools can read it off their second argument instead of the
-       * deprecated `getCurrentTaskInput()` (which relies on
-       * `node:async_hooks` and is browser-incompatible). Shape mirrors
-       * langgraph's prebuilt ToolNode runtime exactly.
-       */
-      const lgConfig = config as LangGraphRunnableConfig;
-      const runtime: ToolRuntime<T> = {
-        ...config,
-        state: runInput as ToolRuntime<T>['state'],
-        toolCallId: call.id ?? '',
-        config,
-        context: lgConfig.context as ToolRuntime<T>['context'],
-        store: (lgConfig.store ?? null) as ToolRuntime<T>['store'],
-        writer:
-          lgConfig.writer ??
-          (config.configurable?.writer as ToolRuntime<T>['writer']) ??
-          null,
-      };
-      /** A sibling can trip the breaker while the PreToolUse hooks above
-       * are awaited; a tool that never inspects its runtime signal would
-       * still run. Recheck at the last moment before execution. */
       this.throwIfBreakerTripped(config);
-      const output = await tool.invoke(invokeParams, runtime);
+      const output = await (this.preparedSubagents?.take(
+        this.executingAgentId ?? '',
+        { ...call, args }
+      ) ?? this.invokeWithRuntime(tool, invokeParams, call, config, runInput));
 
       // Handle MCP tuple [content, artifact] (content_and_artifact
       // tuple form). Normalize the MCP image artifact and stash it in
@@ -1489,7 +2141,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // If a ToolMessage carries an artifact (tools with
         // responseFormat: 'content_and_artifact'), ensure it is in
         // additional_kwargs for the artifact projection downstream.
-        if (toolMsg.artifact != null && toolMsg.additional_kwargs.artifact == null) {
+        if (
+          toolMsg.artifact != null &&
+          toolMsg.additional_kwargs.artifact == null
+        ) {
           toolMsg.additional_kwargs.artifact = toolMsg.artifact;
         }
 
@@ -1603,7 +2258,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * safety abort, not a tool failure to report back to the model. It
        * passes through like an interrupt so the whole run rejects.
        */
-      if (e instanceof StreamLimitExceededError) {
+      if (
+        e instanceof StreamLimitExceededError ||
+        e instanceof PreparedSubagentError ||
+        e instanceof ProviderTextProtectionError
+      ) {
         throw e;
       }
       if (this.errorHandler) {
@@ -1670,9 +2329,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
       }
-      const errorContent = truncateToolResultContent(
-        `Error: ${e.message}\n Please fix your mistakes.`,
-        this.maxToolResultChars
+      const errorContent = formatToolErrorContent(
+        e.message,
+        this.maxToolResultChars,
+        config.signal,
+        e
       );
       const refMeta =
         unresolvedRefs.length > 0
@@ -1747,9 +2408,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
+    if (
+      this.preparedSubagents?.owns(this.executingAgentId ?? '', call) ===
+        true &&
+      this.hookRegistry?.hasResultAlteringHooks(
+        (config.configurable?.run_id as string | undefined) ?? ''
+      ) === true
+    ) {
+      this.preparedSubagents.clear();
+      throw new PreparedSubagentError(
+        'Tool hooks changed after a subagent started.'
+      );
+    }
     const replayController = (
       this.toolMap.get(call.name) as ReplayableSubagentTool | undefined
     )?.[SUBAGENT_REPLAY_CONTROLLER];
+    const isTrustedSubagentReviewHop =
+      call.name === Constants.SUBAGENT && replayController != null;
     const replayConfig =
       replayController == null
         ? config
@@ -1848,16 +2523,34 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           approvalReplaySessionId,
           approvalReplayKey
         );
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(
+      config,
+      getToolBatchReplayOwner(
+        config,
+        this.executingAgentId ?? this.agentId ?? ''
+      )
+    );
+    const reviewedApproval = getReviewedToolApproval(
+      approvalReviewEvidence?.payload,
+      call.id
+    );
+    const approvalEvidenceAppliesToBatch =
+      approvalReviewEvidence?.payload.action_requests.some((request) =>
+        batchContext.approvalScopeCallIds == null
+          ? request.tool_call_id === call.id
+          : batchContext.approvalScopeCallIds.has(request.tool_call_id)
+      ) === true;
     const hasPostHook = hookRegistry?.hasHookFor('PostToolUse', runId) === true;
     const hasFailureHook =
       hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
 
     if (
-      hookRegistry == null ||
-      (!hasPreHook &&
-        pendingApproval == null &&
-        !hasPostHook &&
-        !hasFailureHook)
+      !hasPreHook &&
+      pendingApproval == null &&
+      reviewedApproval == null &&
+      approvalReviewEvidence == null &&
+      !hasPostHook &&
+      !hasFailureHook
     ) {
       const output = await this.runTool(call, replayConfig, batchContext);
       return output instanceof ToolMessage ? persistOutput(output) : output;
@@ -1910,46 +2603,87 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // value the PreToolUse hook observes matches the value the
     // (later-awaited) `runTool` will actually run with — both are
     // anchored to the pre-batch registry state.
-    let resolvedArgs = call.args as Record<string, unknown>;
     const hookResolveOptions = {
       substituteIntentKey: this.toolDeclaresBusinessIntent(call.name),
     };
-    if (batchContext.preBatchSnapshot != null) {
-      const { resolved } = batchContext.preBatchSnapshot.resolve(
-        call.args,
-        hookResolveOptions
-      );
-      resolvedArgs = resolved as Record<string, unknown>;
-    } else if (this.toolOutputRegistry != null) {
-      const { resolved } = this.toolOutputRegistry.resolve(
-        registryRunId,
-        call.args,
-        hookResolveOptions
-      );
-      resolvedArgs = resolved as Record<string, unknown>;
-    }
+    const resolveDirectArgs = (
+      args: Record<string, unknown>
+    ): Record<string, unknown> => {
+      if (batchContext.preBatchSnapshot != null) {
+        return batchContext.preBatchSnapshot.resolve(args, hookResolveOptions)
+          .resolved as Record<string, unknown>;
+      }
+      if (this.toolOutputRegistry != null) {
+        return this.toolOutputRegistry.resolve(
+          registryRunId,
+          args,
+          hookResolveOptions
+        ).resolved as Record<string, unknown>;
+      }
+      return args;
+    };
+    const originalResolvedArgs = resolveDirectArgs(
+      call.args as Record<string, unknown>
+    );
+    /** Reusable and pending hooks must replay from the original proposal so
+     * non-idempotent rewrites are applied exactly once. A rebuilt runtime
+     * without that policy instead falls back to the resolved arguments the
+     * user actually reviewed. */
+    let resolvedArgs =
+      hasPreHook || pendingApproval != null
+        ? originalResolvedArgs
+        : (reviewedApproval?.request.arguments ?? originalResolvedArgs);
 
     let effectiveCall = call;
-    if (hasPreHook || pendingApproval != null) {
-      const preResult = await executeHooks({
-        registry: hookRegistry,
-        input: {
-          hook_event_name: 'PreToolUse',
-          runId,
-          threadId,
-          agentId: this.agentId,
-          executingAgentId: this.executingAgentId,
-          toolName: call.name,
-          toolInput: resolvedArgs,
-          toolUseId: call.id ?? '',
-          stepId,
-          turn,
-        },
-        sessionId: runId,
-        matchQuery: call.name,
-        onceReplayKey: approvalReplayKey,
-        onceReplaySessionId: approvalReplaySessionId,
-      }).catch(() => undefined);
+    if (
+      hasPreHook ||
+      pendingApproval != null ||
+      reviewedApproval != null ||
+      approvalReviewEvidence != null
+    ) {
+      const preResult: AggregatedHookResult | undefined =
+        hookRegistry == null
+          ? {
+            additionalContexts: [],
+            injectedMessages: [],
+            errors: [],
+          }
+          : await executeHooks({
+            registry: hookRegistry,
+            input: {
+              hook_event_name: 'PreToolUse',
+              runId,
+              threadId,
+              agentId: this.agentId,
+              executionContext: this.executionContext,
+              executingAgentId: this.executingAgentId,
+              toolName: call.name,
+              toolInput: resolvedArgs,
+              toolUseId: call.id ?? '',
+              stepId,
+              turn,
+            },
+            sessionId: runId,
+            matchQuery: call.name,
+            onceReplayKey: approvalReplayKey,
+            onceReplaySessionId: approvalReplaySessionId,
+          }).catch((): AggregatedHookResult | undefined =>
+            approvalReviewEvidence == null &&
+              !isBackgroundDenyMode(this.humanInTheLoop)
+              ? undefined
+              : {
+                decision: 'deny',
+                reason: isBackgroundDenyMode(this.humanInTheLoop)
+                  ? 'Approval policy could not be evaluated'
+                  : 'Approval policy could not be evaluated on resume',
+                ...(isBackgroundDenyMode(this.humanInTheLoop)
+                  ? { hasHookFailures: true }
+                  : {}),
+                additionalContexts: [],
+                injectedMessages: [],
+                errors: [],
+              }
+          );
 
       if (preResult != null) {
         // Forward any additionalContext strings hooks returned into
@@ -1966,10 +2700,39 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // a valid combination (one matcher sanitises args, another asks
         // for approval); the reviewer should see the sanitised args.
         if (preResult.updatedInput != null) {
+          resolvedArgs = resolveDirectArgs(
+            preResult.updatedInput as Record<string, unknown>
+          );
           effectiveCall = {
             ...call,
-            args: preResult.updatedInput as Record<string, unknown>,
+            args: resolvedArgs,
           };
+        } else if (reviewedApproval != null) {
+          resolvedArgs = reviewedApproval.request.arguments;
+          effectiveCall = {
+            ...call,
+            args: resolvedArgs,
+          };
+        }
+
+        if (
+          preResult.hasHookFailures === true &&
+          isBackgroundDenyMode(this.humanInTheLoop)
+        ) {
+          return persistOutput(
+            this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason: this.backgroundApprovalReason(
+                call.name,
+                'Approval policy could not be evaluated'
+              ),
+              hookRegistry,
+              runId,
+              threadId,
+            }),
+            effectiveCall.args as Record<string, unknown>
+          );
         }
 
         if (preResult.decision === 'deny') {
@@ -1986,14 +2749,38 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }
 
-        if (preResult.decision === 'ask') {
+        /** A sibling absent from restored evidence may have raised a parallel
+         * approval that LangGraph did not preserve. A current hook can ask
+         * again; otherwise never let that unreviewed sibling execute. */
+        if (
+          approvalEvidenceAppliesToBatch &&
+          reviewedApproval == null &&
+          !isTrustedSubagentReviewHop &&
+          preResult.decision !== 'ask'
+        ) {
+          return persistOutput(
+            this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason:
+                'Tool call was not included in the restored approval batch — failing closed',
+              hookRegistry,
+              runId,
+              threadId,
+            }),
+            resolvedArgs
+          );
+        }
+
+        if (preResult.decision === 'ask' || reviewedApproval != null) {
           if (this.humanInTheLoop?.enabled !== true) {
-            // Fail-closed: no HITL UI configured, so we can't actually
-            // ask. Logged once via the existing helper.
-            const reason = this.resolveAskDecisionForDirectTool(
-              preResult.reason,
-              call.name
-            );
+            // Fail closed when there is no foreground approval channel.
+            const reason = isBackgroundDenyMode(this.humanInTheLoop)
+              ? this.backgroundApprovalReason(call.name, preResult.reason)
+              : this.resolveAskDecisionForDirectTool(
+                preResult.reason,
+                call.name
+              );
             return persistOutput(
               this.blockDirectCall({
                 call,
@@ -2037,14 +2824,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // same ask entry without dispatching the consumed hook again.
           // ToolNode disables LangSmith tracing, so the AsyncLocalStorage
           // frame must be re-established here.
+          const allowedDecisions =
+            preResult.decision === 'ask'
+              ? preResult.allowedDecisions
+              : reviewedApproval?.reviewConfig.allowed_decisions;
+          const askReason =
+            preResult.decision === 'ask'
+              ? preResult.reason
+              : reviewedApproval?.request.description;
+          if (effectiveCall === call) {
+            effectiveCall = { ...call, args: resolvedArgs };
+          }
           const askEntry: AskEntry = {
             entry: {
               call: effectiveCall,
               args: effectiveCall.args as Record<string, unknown>,
               stepId,
             },
-            reason: preResult.reason,
-            allowedDecisions: preResult.allowedDecisions,
+            reason: askReason,
+            allowedDecisions,
           };
           const payload = buildToolApprovalInterruptPayload([askEntry], runId);
           const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
@@ -2055,10 +2853,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
               >(payload)
           );
-          hookRegistry.clearPendingToolApproval(
+          hookRegistry?.clearPendingToolApproval(
             approvalReplaySessionId,
             approvalReplayKey
           );
+          const currentApproval = getReviewedToolApproval(payload, toolCallId);
+          if (
+            reviewedApproval != null &&
+            (currentApproval == null ||
+              !toolApprovalProposalMatches(currentApproval, reviewedApproval))
+          ) {
+            return persistOutput(
+              this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason:
+                  'Reviewed tool proposal changed before resume; retry approval',
+                hookRegistry,
+                runId,
+                threadId,
+              }),
+              effectiveCall.args as Record<string, unknown>
+            );
+          }
           const decisionByCallId = normalizeApprovalDecisions(
             [toolCallId],
             resumeValue
@@ -2070,9 +2887,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const declaredType = (decision as { type?: unknown }).type;
 
           if (
-            preResult.allowedDecisions != null &&
+            allowedDecisions != null &&
             (typeof declaredType !== 'string' ||
-              !preResult.allowedDecisions.includes(
+              !allowedDecisions.includes(
                 declaredType as t.ToolApprovalDecisionType
               ))
           ) {
@@ -2080,7 +2897,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               this.blockDirectCall({
                 call,
                 resolvedArgs,
-                reason: `Decision "${typeof declaredType === 'string' ? declaredType : '<missing>'}" not in allowedDecisions [${preResult.allowedDecisions.join(', ')}] — failing closed`,
+                reason: `Decision "${typeof declaredType === 'string' ? declaredType : '<missing>'}" not in allowedDecisions [${allowedDecisions.join(', ')}] — failing closed`,
                 hookRegistry,
                 runId,
                 threadId,
@@ -2094,8 +2911,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               this.blockDirectCall({
                 call,
                 resolvedArgs,
-                reason:
-                  decision.reason ?? preResult.reason ?? 'Rejected by user',
+                reason: decision.reason ?? askReason ?? 'Rejected by user',
                 hookRegistry,
                 runId,
                 threadId,
@@ -2230,6 +3046,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executionContext: this.executionContext,
           executingAgentId: this.executingAgentId,
           toolName: call.name,
           toolInput: effectiveCall.args as Record<string, unknown>,
@@ -2267,6 +3084,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executionContext: this.executionContext,
           executingAgentId: this.executingAgentId,
           toolName: call.name,
           toolInput: effectiveCall.args as Record<string, unknown>,
@@ -2344,6 +3162,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * LangGraph `interrupt()` instead — see `runDirectToolWithLifecycleHooks`.
    */
   private askDirectWarningEmitted = false;
+  private backgroundApprovalReason(toolName: string, reason?: string): string {
+    return (
+      `Approval required for "${toolName}"; unavailable in a background subagent. ` +
+      `Ask the parent to run it in the foreground.${reason == null ? '' : ` Reason: ${reason}`}`
+    );
+  }
+
   private resolveAskDecisionForDirectTool(
     reason: string | undefined,
     toolName: string
@@ -2370,12 +3195,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     call: ToolCall;
     resolvedArgs: Record<string, unknown>;
     reason: string;
-    hookRegistry: HookRegistry;
+    hookRegistry: HookRegistry | undefined;
     runId: string;
     threadId: string | undefined;
   }): ToolMessage {
     const { call, resolvedArgs, reason, hookRegistry, runId, threadId } = args;
-    if (hookRegistry.hasHookFor('PermissionDenied', runId) === true) {
+    if (hookRegistry?.hasHookFor('PermissionDenied', runId) === true) {
       executeHooks({
         registry: hookRegistry,
         input: {
@@ -2383,6 +3208,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executionContext: this.executionContext,
           executingAgentId: this.executingAgentId,
           toolName: call.name,
           toolInput: resolvedArgs,
@@ -2459,7 +3285,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return undefined;
     }
 
-    const codeSession = this.sessions.get(Constants.EXECUTE_CODE) as
+    const codeSession = this.sessions.get(this.codeSessionKey) as
       | t.CodeSessionContext
       | undefined;
     if (!codeSession) {
@@ -2514,18 +3340,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
-    requestMap: Map<string, t.ToolCallRequest>
+    requestMap: Map<string, t.ToolCallRequest>,
+    baselineByRequestId: ReadonlyMap<
+      string,
+      ReadonlyMap<string, string>
+    > = new Map(),
+    executionBaselineByRequestId: ReadonlyMap<
+      string,
+      ReadonlyMap<string, string>
+    > = baselineByRequestId
   ): void {
     if (!this.sessions) {
       return;
     }
 
+    this.retainCodeSessionInputsFromRequests(
+      requestMap.values(),
+      baselineByRequestId
+    );
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
-      if (result.status !== 'success' || result.artifact == null) {
-        continue;
-      }
-
       const request = requestMap.get(result.toolCallId);
       if (
         request?.name == null ||
@@ -2536,14 +3370,68 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
+      if (result.status !== 'success' || result.artifact == null) {
+        continue;
+      }
+
       const artifact = result.artifact as t.CodeExecutionArtifact | undefined;
       const execSessionId = artifact?.session_id;
       if (execSessionId == null || execSessionId === '') {
         continue;
       }
 
-      updateCodeSession(this.sessions, execSessionId, artifact?.files);
+      updateCodeSession(
+        this.sessions,
+        this.codeSessionKey,
+        execSessionId,
+        artifact?.files,
+        artifact?.deleted_files,
+        executionBaselineByRequestId.get(request.id)
+      );
     }
+  }
+
+  private retainCodeSessionInputsFromRequests(
+    requests: Iterable<t.ToolCallRequest>,
+    baselineByRequestId: ReadonlyMap<string, ReadonlyMap<string, string>>
+  ): void {
+    if (!this.sessions) {
+      return;
+    }
+    const refreshedByName = new Map<string, t.CodeEnvFile>();
+    let refreshedSessionId: string | undefined;
+    let fileSessionId: string | undefined;
+    for (const request of requests) {
+      if (
+        request.name === '' ||
+        (!this.participatesInCodeSession(request.name) &&
+          request.name !== Constants.SKILL_TOOL &&
+          request.name !== Constants.READ_FILE &&
+          request.retainCodeSessionInputs !== true)
+      ) {
+        continue;
+      }
+      const context = request.codeSessionContext;
+      if (context?.session_id == null || context.session_id === '') continue;
+      if (context.session_id !== request.codeSessionBaselineId) {
+        refreshedSessionId = context.session_id;
+      }
+      const baselineIdentityByName = baselineByRequestId.get(request.id);
+      for (const file of context.files ?? []) {
+        if (!file.id || !file.name || !file.storage_session_id) continue;
+        if (baselineIdentityByName?.get(file.name) === fileIdentityKey(file)) {
+          continue;
+        }
+        fileSessionId = context.session_id;
+        refreshedByName.set(file.name, file);
+      }
+    }
+    const sessionId = refreshedSessionId ?? fileSessionId;
+    if (sessionId == null) return;
+    retainCodeSessionInputs(this.sessions, this.codeSessionKey, {
+      session_id: sessionId,
+      files: [...refreshedByName.values()],
+    });
   }
 
   /**
@@ -2564,6 +3452,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     outputs: (BaseMessage | Command)[],
     config: RunnableConfig,
     resolvedArgsByCallId?: ResolvedArgsByCallId,
+    codeSessionBaselineByCallId?: ReadonlyMap<
+      string,
+      ReadonlyMap<string, string>
+    >,
     errorOwnership?: ToolErrorOwnership
   ): Promise<void> {
     const ownership = errorOwnership ?? this.looseErrorOwnership;
@@ -2599,13 +3491,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ownership.undispatched.delete(toolCallId);
       }
 
-      if (this.sessions && this.participatesInCodeSession(call.name)) {
+      if (
+        toolMessage.status !== 'error' &&
+        this.sessions &&
+        this.participatesInCodeSession(call.name)
+      ) {
         const artifact = toolMessage.artifact as
           | t.CodeExecutionArtifact
           | undefined;
         const execSessionId = artifact?.session_id;
         if (execSessionId != null && execSessionId !== '') {
-          updateCodeSession(this.sessions, execSessionId, artifact?.files);
+          updateCodeSession(
+            this.sessions,
+            this.codeSessionKey,
+            execSessionId,
+            artifact?.files,
+            artifact?.deleted_files,
+            codeSessionBaselineByCallId?.get(toolCallId)
+          );
         }
       }
 
@@ -2695,7 +3598,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const signal = config.signal;
     if (
       signal?.aborted === true &&
-      signal.reason instanceof StreamLimitExceededError
+      (signal.reason instanceof StreamLimitExceededError ||
+        signal.reason instanceof PreparedSubagentError ||
+        signal.reason instanceof ProviderTextProtectionError)
     ) {
       throw signal.reason;
     }
@@ -2746,11 +3651,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           unresolvedByCallId.set(call.id, pre.unresolved);
         }
       } else if (registry != null) {
-        const { resolved, unresolved } = registry.resolve(
-          registryRunId,
-          originalArgs,
-          { substituteIntentKey: this.toolDeclaresBusinessIntent(call.name) }
-        );
+        const options = {
+          substituteIntentKey: this.toolDeclaresBusinessIntent(call.name),
+        };
+        const { resolved, unresolved } =
+          preBatchSnapshot != null
+            ? preBatchSnapshot.resolve(originalArgs, options)
+            : registry.resolve(registryRunId, originalArgs, options);
         resolvedArgs = resolved as Record<string, unknown>;
         if (unresolved.length > 0 && call.id != null) {
           unresolvedByCallId.set(call.id, unresolved);
@@ -2759,7 +3666,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return {
         call,
         stepId: this.toolCallStepIds?.get(call.id!) ?? '',
-        args: resolvedArgs,
+        args: this.coerceEventToolArgs(call.name, resolvedArgs),
         batchIndex: batchIndices?.[i],
       };
     });
@@ -2798,6 +3705,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       config,
       runId
     );
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(
+      config,
+      getToolBatchReplayOwner(
+        config,
+        this.executingAgentId ?? this.agentId ?? ''
+      )
+    );
     const hasPendingApproval = preToolCalls.some(
       (entry) =>
         entry.call.id != null &&
@@ -2811,8 +3725,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ) != null
     );
     if (
-      hookRegistry != null &&
-      (hookRegistry.hasHookFor('PreToolUse', runId) || hasPendingApproval)
+      hookRegistry?.hasHookFor('PreToolUse', runId) === true ||
+      hasPendingApproval ||
+      approvalReviewEvidence != null
     ) {
       /**
        * Pull each call's prestarted eager record BEFORE awaiting the hooks:
@@ -2840,38 +3755,47 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
         }
       }
-      const preResults = await Promise.all(
-        preToolCalls.map((entry) => {
-          const toolUseId = entry.call.id;
-          const approvalReplayKey =
-            toolUseId == null
-              ? undefined
-              : createToolApprovalReplayKey(
-                config,
-                this.executingAgentId ?? this.agentId ?? '',
-                toolUseId
+      const preResults =
+        hookRegistry == null
+          ? preToolCalls.map(() => HOOK_FALLBACK)
+          : await Promise.all(
+            preToolCalls.map((entry) => {
+              const toolUseId = entry.call.id;
+              const approvalReplayKey =
+                  toolUseId == null
+                    ? undefined
+                    : createToolApprovalReplayKey(
+                      config,
+                      this.executingAgentId ?? this.agentId ?? '',
+                      toolUseId
+                    );
+              return executeHooks({
+                registry: hookRegistry,
+                input: {
+                  hook_event_name: 'PreToolUse',
+                  runId,
+                  threadId,
+                  agentId: this.agentId,
+                  executionContext: this.executionContext,
+                  executingAgentId: this.executingAgentId,
+                  toolName: entry.call.name,
+                  toolInput: entry.args,
+                  toolUseId: entry.call.id!,
+                  stepId: entry.stepId,
+                  turn: this.toolUsageCount.get(entry.call.name) ?? 0,
+                },
+                sessionId: runId,
+                matchQuery: entry.call.name,
+                onceReplayKey: approvalReplayKey,
+                onceReplaySessionId: approvalReplaySessionId,
+              }).catch(
+                (): AggregatedHookResult =>
+                  isBackgroundDenyMode(this.humanInTheLoop)
+                    ? { ...HOOK_FALLBACK, hasHookFailures: true }
+                    : HOOK_FALLBACK
               );
-          return executeHooks({
-            registry: hookRegistry,
-            input: {
-              hook_event_name: 'PreToolUse',
-              runId,
-              threadId,
-              agentId: this.agentId,
-              executingAgentId: this.executingAgentId,
-              toolName: entry.call.name,
-              toolInput: entry.args,
-              toolUseId: entry.call.id!,
-              stepId: entry.stepId,
-              turn: this.toolUsageCount.get(entry.call.name) ?? 0,
-            },
-            sessionId: runId,
-            matchQuery: entry.call.name,
-            onceReplayKey: approvalReplayKey,
-            onceReplaySessionId: approvalReplaySessionId,
-          }).catch((): AggregatedHookResult => HOOK_FALLBACK);
-        })
-      );
+            })
+          );
 
       type PendingEntry = (typeof preToolCalls)[number];
 
@@ -2952,7 +3876,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             item.contentString,
             config
           );
-          if (hookRegistry.hasHookFor('PermissionDenied', runId)) {
+          if (hookRegistry?.hasHookFor('PermissionDenied', runId) === true) {
             executeHooks({
               registry: hookRegistry,
               input: {
@@ -2960,6 +3884,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 runId,
                 threadId,
                 agentId: this.agentId,
+                executionContext: this.executionContext,
                 executingAgentId: this.executingAgentId,
                 toolName: item.toolName,
                 toolInput: item.args,
@@ -3003,7 +3928,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               entry.call.name
             ),
           });
-          entry.args = resolved as Record<string, unknown>;
+          entry.args = this.coerceEventToolArgs(
+            entry.call.name,
+            resolved as Record<string, unknown>
+          );
           if (entry.call.id != null) {
             if (unresolved.length > 0) {
               unresolvedByCallId.set(entry.call.id, unresolved);
@@ -3013,7 +3941,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
           return;
         }
-        entry.args = nextArgs;
+        entry.args = this.coerceEventToolArgs(entry.call.name, nextArgs);
       };
 
       const askEntries: Array<{
@@ -3030,6 +3958,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         for (const ctx of hookResult.additionalContexts) {
           batchAdditionalContexts.push(ctx);
+        }
+
+        if (
+          hookResult.hasHookFailures === true &&
+          isBackgroundDenyMode(this.humanInTheLoop)
+        ) {
+          blockEntry(
+            entry,
+            this.backgroundApprovalReason(
+              entry.call.name,
+              'Approval policy could not be evaluated'
+            )
+          );
+          continue;
         }
 
         if (hookResult.decision === 'deny') {
@@ -3049,7 +3991,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            * JSDoc for the full rationale and the migration plan.
            */
           if (this.humanInTheLoop?.enabled !== true) {
-            blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
+            blockEntry(
+              entry,
+              isBackgroundDenyMode(this.humanInTheLoop)
+                ? this.backgroundApprovalReason(
+                  entry.call.name,
+                  hookResult.reason
+                )
+                : (hookResult.reason ?? 'Blocked by hook')
+            );
             continue;
           }
           /**
@@ -3063,6 +4013,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            */
           if (hookResult.updatedInput != null) {
             applyInputOverride(entry, hookResult.updatedInput);
+          } else {
+            const reviewed = getReviewedToolApproval(
+              approvalReviewEvidence?.payload,
+              entry.call.id
+            );
+            if (reviewed != null) {
+              entry.args = this.coerceEventToolArgs(
+                entry.call.name,
+                reviewed.request.arguments
+              );
+              if (entry.call.id != null) {
+                unresolvedByCallId.delete(entry.call.id);
+              }
+            }
           }
           askEntries.push({
             entry,
@@ -3074,6 +4038,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (hookResult.updatedInput != null) {
           applyInputOverride(entry, hookResult.updatedInput);
+        }
+        const reviewedApproval = getReviewedToolApproval(
+          approvalReviewEvidence?.payload,
+          entry.call.id
+        );
+        if (reviewedApproval != null) {
+          if (hookResult.updatedInput == null) {
+            entry.args = this.coerceEventToolArgs(
+              entry.call.name,
+              reviewedApproval.request.arguments
+            );
+            if (entry.call.id != null) {
+              unresolvedByCallId.delete(entry.call.id);
+            }
+          }
+          askEntries.push({
+            entry,
+            reason: reviewedApproval.request.description,
+            allowedDecisions: reviewedApproval.reviewConfig.allowed_decisions,
+          });
+          continue;
         }
         if (entry.call.id != null) {
           const preempted = preemptedEagerRecords.get(entry.call.id);
@@ -3115,7 +4100,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
 
         for (const { entry } of askEntries) {
-          hookRegistry.clearPendingToolApproval(
+          hookRegistry?.clearPendingToolApproval(
             approvalReplaySessionId,
             createToolApprovalReplayKey(
               config,
@@ -3125,8 +4110,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }
 
+        const proposalMatches =
+          approvalReviewEvidence == null ||
+          toolApprovalPayloadMatches(payload, approvalReviewEvidence.payload);
+        if (!proposalMatches) {
+          for (const { entry } of askEntries) {
+            blockEntry(
+              entry,
+              'Reviewed tool proposal changed before resume; retry approval'
+            );
+          }
+        }
+        const decisionEntries = proposalMatches ? askEntries : [];
         const decisionByCallId = normalizeApprovalDecisions(
-          askEntries.map(({ entry }) => entry.call.id!),
+          decisionEntries.map(({ entry }) => entry.call.id!),
           resumeValue
         );
 
@@ -3134,7 +4131,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           entry,
           reason: askReason,
           allowedDecisions,
-        } of askEntries) {
+        } of decisionEntries) {
           const decision = decisionByCallId.get(entry.call.id!) ?? {
             type: 'reject' as const,
             reason: 'No decision provided for tool approval',
@@ -3370,6 +4367,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }),
         usageCount: this.toolUsageCount,
         invalidArgsBehavior: 'error-result',
+        getToolSchema: (toolName) => this.getToolParameterSchema(toolName),
         recordTurn: (toolName, reservedTurn, callId) => {
           this.recordEventToolPlanningTurn(
             toolName,
@@ -3395,6 +4393,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       const requestMap = new Map(plan.allRequests.map((r) => [r.id, r]));
+      for (const request of plan.allRequests) {
+        request.codeSessionBaselineId = request.codeSessionContext?.session_id;
+      }
+      const codeSessionBaselineByRequestId = new Map<
+        string,
+        ReadonlyMap<string, string>
+      >(
+        plan.allRequests.map((request) => [
+          request.id,
+          codeSessionIdentityByName(request.codeSessionContext),
+        ])
+      );
       const eagerExecutions: Array<{
         request: t.ToolCallRequest;
         execution: t.EagerEventToolExecution;
@@ -3405,6 +4415,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const eagerExecution = this.takeMatchingEagerEventExecution(request);
         if (eagerExecution != null) {
           eagerExecutions.push({ request, execution: eagerExecution });
+          if (eagerExecution.codeSessionBaselineByName != null) {
+            codeSessionBaselineByRequestId.set(
+              request.id,
+              eagerExecution.codeSessionBaselineByName
+            );
+          }
+          request.codeSessionBaselineId =
+            eagerExecution.request.codeSessionBaselineId;
         } else {
           dispatchRequests.push(request);
         }
@@ -3440,7 +4458,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const dispatchRequestById = new Map(
         dispatchRequests.map((request) => [request.id, request])
       );
+      const receivedAtById = new Map<string, number>();
       const onResult = (result: t.ToolExecuteResult): void => {
+        const receivedAt = Date.now();
         /** Runtime-honest widening: hosts may omit the id despite the
          * field type. */
         const resultToolCallId = result.toolCallId as string | undefined;
@@ -3455,8 +4475,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           return;
         }
         earlyCompletionDispatchedIds.add(result.toolCallId);
+        receivedAtById.set(result.toolCallId, receivedAt);
         earlyCompletionDispatches.push(
-          this.dispatchEarlyToolCompletion(result, request, config).then(
+          this.dispatchEarlyToolCompletion(
+            { ...result, received_at: receivedAt },
+            request,
+            config
+          ).then(
             (dispatched) => {
               if (!dispatched) {
                 earlyCompletionDispatchedIds.delete(result.toolCallId);
@@ -3490,6 +4515,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             };
 
             const batchRequest: t.ToolExecuteBatchRequest = {
+              executionContext: this.executionContext,
               toolCalls: dispatchRequests,
               userId: config.configurable?.user_id as string | undefined,
               // Dispatch attribution, NOT the hook subagent-scope marker:
@@ -3497,7 +4523,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               // the eager path sends `agentContext.agentId` — this must
               // match it at the top level too.
               agentId: this.executingAgentId,
-              configurable: stripRunBreakerScope(
+              callerCapabilityProjection:
+                  this.getCallerCapabilityProjectionSnapshot(),
+              configurable: stripHostExecutionConfig(
                   config.configurable as Record<string, unknown> | undefined
               ),
               metadata: config.metadata as
@@ -3505,6 +4533,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                   | undefined,
               signal: config.signal,
               resolve: (results): void => {
+                const receivedAt = Date.now();
+                for (const result of results) {
+                  if (dispatchRequestById.has(result.toolCallId)) {
+                    receivedAtById.set(
+                      result.toolCallId,
+                      result.received_at ?? receivedAt
+                    );
+                  }
+                }
                 resultSettled = true;
                 settledResults = results;
                 maybeResolve();
@@ -3513,6 +4550,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...(canEmitEarlyCompletions && { onResult }),
             };
 
+            void safeDispatchCustomEvent(
+              GraphEvents.ON_TOOL_CALLS_DISPATCHED,
+              createToolCallsDispatchedEvent(config, dispatchRequests),
+              config
+            );
             void safeDispatchCustomEvent(
               GraphEvents.ON_TOOL_EXECUTE,
               batchRequest,
@@ -3527,24 +4569,46 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       const eagerResultsPromise = Promise.all(
         eagerExecutions.map(async ({ request, execution }) => {
-          const results = await this.resolveEagerEventExecution(
-            request,
-            execution
-          );
-          return {
-            results,
-            completionDispatched:
-              execution.completionDispatched === true &&
-              execution.request.turn === request.turn,
-            toolCallId: request.id,
-          };
+          try {
+            const results = await this.resolveEagerEventExecution(
+              request,
+              execution
+            );
+            return {
+              results,
+              completionDispatched:
+                execution.completionDispatched === true &&
+                execution.request.turn === request.turn,
+              toolCallId: request.id,
+            };
+          } finally {
+            if (execution.request.codeSessionContext != null) {
+              request.codeSessionContext = execution.request.codeSessionContext;
+            }
+          }
         })
       );
 
-      const [eagerResults, dispatchedResults] = await Promise.all([
+      const [eagerOutcome, dispatchedOutcome] = await Promise.allSettled([
         eagerResultsPromise,
         dispatchPromise,
       ]);
+      if (eagerOutcome.status === 'rejected') {
+        this.retainCodeSessionInputsFromRequests(
+          requestMap.values(),
+          codeSessionBaselineByRequestId
+        );
+        throw eagerOutcome.reason;
+      }
+      if (dispatchedOutcome.status === 'rejected') {
+        this.retainCodeSessionInputsFromRequests(
+          requestMap.values(),
+          codeSessionBaselineByRequestId
+        );
+        throw dispatchedOutcome.reason;
+      }
+      const eagerResults = eagerOutcome.value;
+      const dispatchedResults = dispatchedOutcome.value;
       // Settle in-flight early completion dispatches before the batch loop
       // below decides which completions still need emitting.
       await Promise.allSettled(earlyCompletionDispatches);
@@ -3561,8 +4625,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ...flattenedEagerResults,
         ...dispatchedResults,
       ];
+      /* Hosts may lazily refresh codeSessionContext while dispatching. The
+       * pre-dispatch snapshot above remains the authority for detecting those
+       * additions, while deletion reconciliation must use the identities the
+       * execution actually received. */
+      const executionBaselineByRequestId = new Map<
+        string,
+        ReadonlyMap<string, string>
+      >(
+        plan.allRequests.map((request) => [
+          request.id,
+          codeSessionIdentityByName(request.codeSessionContext),
+        ])
+      );
 
-      this.storeCodeSessionFromResults(results, requestMap);
+      this.storeCodeSessionFromResults(
+        results,
+        requestMap,
+        codeSessionBaselineByRequestId,
+        executionBaselineByRequestId
+      );
 
       for (const result of results) {
         if (result.injectedMessages && result.injectedMessages.length > 0) {
@@ -3592,9 +4674,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         let finalToolOutput: unknown = result.content;
 
         if (result.status === 'error') {
-          contentString = truncateToolResultContent(
-            `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
-            this.maxToolResultChars
+          contentString = formatToolErrorContent(
+            result.errorMessage,
+            this.maxToolResultChars,
+            config.signal
           );
           /**
            * Error results bypass registration but stamp the
@@ -3631,6 +4714,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 runId,
                 threadId,
                 agentId: this.agentId,
+                executionContext: this.executionContext,
                 executingAgentId: this.executingAgentId,
                 toolName,
                 toolInput: request?.args ?? {},
@@ -3683,6 +4767,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 runId,
                 threadId,
                 agentId: this.agentId,
+                executionContext: this.executionContext,
                 executingAgentId: this.executingAgentId,
                 toolName,
                 toolInput: request?.args ?? {},
@@ -3755,7 +4840,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             request?.turn,
             resolveToolOutcome(request?.args, outcomeFieldsFromResult(result), {
               isError: result.status === 'error',
-            })
+            }),
+            receivedAtById.get(result.toolCallId) ?? result.received_at
           );
         }
 
@@ -3842,28 +4928,40 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       // effects) every round.
       this.eagerEventToolSuppressions?.add(request.name);
       this.eagerEventToolSuppressions?.add(execution.toolName);
+      if (
+        this.participatesInCodeSession(execution.toolName) ||
+        execution.toolName === Constants.SKILL_TOOL ||
+        execution.toolName === Constants.READ_FILE
+      ) {
+        request.retainCodeSessionInputs = true;
+      }
       // eslint-disable-next-line no-console
       console.warn(
         '[ToolNode] eager prestart args diverged from the final request for ' +
           `tool "${request.name}" (toolCallId=${request.id}); suppressing ` +
           'eager prestart for this tool for the rest of the run'
       );
+      const createMismatchOutcome = (): t.EagerEventToolExecutionOutcome => ({
+        results: [
+          {
+            toolCallId: request.id,
+            status: 'error',
+            content: '',
+            errorMessage:
+              'Tool call changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
+          },
+        ],
+      });
       return {
         toolCallId: request.id,
         toolName: request.name,
         args: request.args,
-        request,
-        promise: Promise.resolve({
-          results: [
-            {
-              toolCallId: request.id,
-              status: 'error',
-              content: '',
-              errorMessage:
-                'Tool call changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
-            },
-          ],
-        }),
+        request: execution.request,
+        codeSessionBaselineByName: execution.codeSessionBaselineByName,
+        promise: execution.promise.then(
+          createMismatchOutcome,
+          createMismatchOutcome
+        ),
       };
     }
 
@@ -3955,6 +5053,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executionContext: this.executionContext,
           executingAgentId: this.executingAgentId,
           entries: orderedBatchEntries,
         },
@@ -3980,10 +5079,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * a user message; `role` is metadata only.
        */
       injected.push(
-        new HumanMessage({
-          content: batchAdditionalContexts.join('\n\n'),
-          additional_kwargs: { role: 'system', source: 'hook' },
-        })
+        stampSyntheticProviderMessage(
+          new HumanMessage({
+            content: batchAdditionalContexts.join('\n\n'),
+            additional_kwargs: { role: 'system', source: 'hook' },
+          })
+        )
       );
     }
 
@@ -4042,7 +5143,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     output: string,
     config: RunnableConfig,
     turn?: number,
-    outcome?: string
+    outcome?: string,
+    receivedAt?: number
   ): Promise<boolean> {
     const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
     if (!stepId) {
@@ -4069,7 +5171,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             progress: 1,
             ...(outcome != null && { outcome }),
           } as t.ProcessedToolCall,
-          completed_at: Date.now(),
+          completed_at: receivedAt ?? Date.now(),
         },
       },
       config
@@ -4091,9 +5193,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   ): Promise<boolean> {
     const output =
       result.status === 'error'
-        ? truncateToolResultContent(
-          `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
-          this.maxToolResultChars
+        ? formatToolErrorContent(
+          result.errorMessage,
+          this.maxToolResultChars,
+          config.signal
         )
         : serializeToolOutputWithinLimits(
           result.content,
@@ -4108,7 +5211,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       request.turn,
       resolveToolOutcome(request.args, outcomeFieldsFromResult(result), {
         isError: result.status === 'error',
-      })
+      }),
+      result.received_at
     );
   }
 
@@ -4154,12 +5258,59 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const settledBatchResults =
       baseContext.replayBatchKey == null
         ? undefined
-        : this.settledInterruptingResults.get(baseContext.replayBatchKey);
+        : (this.settledDirectResultsByBatch.get(baseContext.replayBatchKey) ??
+          new Map<string, SettledDirectToolResult>());
+    const cacheResult = (
+      call: ToolCall,
+      position: number,
+      result: SettledDirectToolResult
+    ): void => {
+      if (baseContext.replayBatchKey == null || settledBatchResults == null) {
+        return;
+      }
+      settledBatchResults.set(
+        directReplayKey(
+          call,
+          baseContext.replayCallPositions?.get(call) ?? batchIndices[position]
+        ),
+        result
+      );
+      this.settledDirectResultsByBatch.set(
+        baseContext.replayBatchKey,
+        settledBatchResults
+      );
+    };
     const restoreResult = (
       call: ToolCall,
       result: SettledDirectToolResult
     ): SettledDirectToolResult => {
       baseContext.additionalContextsSink?.push(...result.additionalContexts);
+      const turn = result.turn;
+      if (turn != null) {
+        this.recordToolUsageTurn(call.name, turn, call.id);
+      }
+      const refMeta = isBaseMessage(result.output)
+        ? (result.output.additional_kwargs as t.ToolMessageRefMetadata)
+        : undefined;
+      if (refMeta?._refKey != null && result.referenceContent != null) {
+        this.toolOutputRegistry?.set(
+          baseContext.batchScopeId,
+          refMeta._refKey,
+          result.referenceContent
+        );
+        if (isBaseMessage(result.output)) {
+          result = {
+            ...result,
+            output: new ToolMessage({
+              ...(result.output as ToolMessage),
+              additional_kwargs: {
+                ...result.output.additional_kwargs,
+                _refScope: baseContext.batchScopeId,
+              },
+            }),
+          };
+        }
+      }
       if (
         call.id != null &&
         result.resolvedArgs != null &&
@@ -4167,17 +5318,39 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ) {
         baseContext.resolvedArgsByCallId.set(call.id, result.resolvedArgs);
       }
+      if (
+        result.codeSessionBaseline != null &&
+        baseContext.codeSessionBaselineByCallId != null
+      ) {
+        baseContext.codeSessionBaselineByCallId.set(
+          call.id ?? '',
+          new Map(result.codeSessionBaseline)
+        );
+      }
       return result;
     };
     const runOne = async (
       call: ToolCall,
       position: number
     ): Promise<SettledDirectToolResult> => {
-      const cachedResult =
-        typeof call.id === 'string'
-          ? settledBatchResults?.get(call.id)
-          : undefined;
+      const cachedResult = settledBatchResults?.get(
+        directReplayKey(
+          call,
+          baseContext.replayCallPositions?.get(call) ?? batchIndices[position]
+        )
+      );
       if (cachedResult != null) {
+        if (
+          cachedResult.proposal.name !== call.name ||
+          !recordArgsEqual(
+            cachedResult.proposal.args,
+            call.args as Record<string, unknown>
+          )
+        ) {
+          throw new Error(
+            'Cannot change an already completed tool call during approval replay'
+          );
+        }
         return restoreResult(call, cachedResult);
       }
       const additionalContexts: string[] = [];
@@ -4190,11 +5363,37 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         call.id == null
           ? undefined
           : baseContext.resolvedArgsByCallId?.get(call.id);
-      return restoreResult(call, {
+      const codeSessionBaseline = baseContext.codeSessionBaselineByCallId?.get(
+        call.id ?? ''
+      );
+      const result: SettledDirectToolResult = {
+        proposal: structuredClone({
+          name: call.name,
+          args: call.args as Record<string, unknown>,
+        }),
+        turn:
+          call.id == null
+            ? undefined
+            : (this.toolCallTurns.get(call.id) ??
+              this.directPathTurns.get(call.id)),
         output,
         additionalContexts,
         ...(resolvedArgs == null ? {} : { resolvedArgs }),
-      });
+        ...(codeSessionBaseline == null
+          ? {}
+          : { codeSessionBaseline: [...codeSessionBaseline.entries()] }),
+      };
+      const refMeta = isBaseMessage(output)
+        ? (output.additional_kwargs as t.ToolMessageRefMetadata)
+        : undefined;
+      if (refMeta?._refKey != null) {
+        result.referenceContent = this.toolOutputRegistry?.get(
+          refMeta._refScope,
+          refMeta._refKey
+        );
+      }
+      cacheResult(call, position, result);
+      return restoreResult(call, result);
     };
 
     const interrupting = this.interruptingToolNames;
@@ -4203,10 +5402,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       directCalls.some((call) => interrupting.has(call.name));
 
     if (!hasInterrupting) {
-      const results = await Promise.all(
+      const results = await Promise.allSettled(
         directCalls.map((call, i) => runOne(call, i))
       );
-      return results.map((result) => result.output);
+      this.throwIfBreakerTripped(config);
+      const failed =
+        results.find(
+          (result) =>
+            result.status === 'rejected' && !isGraphInterrupt(result.reason)
+        ) ?? results.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') {
+        throw failed.reason;
+      }
+      return results.map((result) => {
+        if (result.status === 'rejected') {
+          throw result.reason;
+        }
+        return result.value.output;
+      });
     }
 
     const outputs: (BaseMessage | Command)[] = new Array(directCalls.length);
@@ -4243,21 +5456,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       const position = interruptingPositions[i];
       outputs[position] = result.value.output;
-      const callId = directCalls[position].id;
-      if (
-        baseContext.replayBatchKey != null &&
-        typeof callId === 'string' &&
-        callId !== ''
-      ) {
-        const batchResults =
-          this.settledInterruptingResults.get(baseContext.replayBatchKey) ??
-          new Map<string, SettledDirectToolResult>();
-        batchResults.set(callId, result.value);
-        this.settledInterruptingResults.set(
-          baseContext.replayBatchKey,
-          batchResults
-        );
-      }
     }
     if (hasInterruptingError) {
       if (isGraphInterrupt(interruptingError)) {
@@ -4354,8 +5552,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  protected async run(input: any, config: RunnableConfig): Promise<T> {
+  protected async run(
+    input: T,
+    config: RunnableConfig,
+    referenceReplay: { state?: ToolOutputReferenceState } = {}
+  ): Promise<T> {
     /**
      * Breaker read once at batch entry: every downstream path (direct
      * `tool.invoke` runtimes and the ON_TOOL_EXECUTE dispatch) inherits this
@@ -4387,7 +5588,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * otherwise perform side effects on a failed run. */
     if (
       composedSignal?.aborted === true &&
-      composedSignal.reason instanceof StreamLimitExceededError
+      (composedSignal.reason instanceof StreamLimitExceededError ||
+        composedSignal.reason instanceof PreparedSubagentError ||
+        composedSignal.reason instanceof ProviderTextProtectionError)
     ) {
       throw composedSignal.reason;
     }
@@ -4398,6 +5601,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * ToolNode cannot read or wipe each other's entries.
      */
     const resolvedArgsByCallId = new Map<string, Record<string, unknown>>();
+    const codeSessionBaselineByCallId = new Map<
+      string,
+      ReadonlyMap<string, string>
+    >();
     /** Per-invocation error-completion ownership — see `ToolErrorOwnership`. */
     const errorOwnership = createToolErrorOwnership();
     /**
@@ -4412,11 +5619,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * every subsequent registry call on this batch.
      */
     const incomingRunId = config.configurable?.run_id as string | undefined;
-    const incomingThreadId = config.configurable?.thread_id as
-      | string
-      | undefined;
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
-    const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
+    const resumedReferenceState = referenceReplay.state;
+    const replayInputSnapshot =
+      resumedReferenceState == null
+        ? undefined
+        : this.toolOutputRegistry?.resumeBatch(
+          batchScopeId,
+          resumedReferenceState
+        );
+    referenceReplay.state =
+      resumedReferenceState ??
+      this.toolOutputRegistry?.snapshotState(batchScopeId);
+    const turn =
+      resumedReferenceState?.turnCounter ??
+      this.toolOutputRegistry?.nextTurn(batchScopeId) ??
+      0;
     let outputs: (BaseMessage | Command)[];
     let replayBatchKey: string | undefined;
     /** Hoisted from the messages-state branch so the Command tail can carry
@@ -4434,6 +5652,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           batchIndices: [0],
           turn,
           batchScopeId,
+          preBatchSnapshot: replayInputSnapshot,
         });
       }
       // Same per-batch sink the message-state branches use so
@@ -4451,12 +5670,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ? findAssistantBatch(sendMessages as BaseMessage[])
         : undefined;
       const sendReplayBatchKey =
-        sendAssistantBatch == null
+        sendAssistantBatch == null || getToolBatchReplayScope(config) == null
           ? undefined
           : getAssistantBatchReplayKey(
             sendAssistantBatch,
-            incomingRunId,
-            incomingThreadId
+            getToolBatchReplayScope(config)
           );
       const sendOutput = await this.runDirectToolWithLifecycleHooks(
         input.lg_tool_call,
@@ -4465,7 +5683,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           batchIndex: 0,
           turn,
           batchScopeId,
+          preBatchSnapshot: replayInputSnapshot,
           resolvedArgsByCallId,
+          codeSessionBaselineByCallId,
           errorOwnership,
           additionalContextsSink: directAdditionalContexts,
           replayBatchKey: sendReplayBatchKey,
@@ -4476,13 +5696,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         directAdditionalContexts.length > 0
           ? [
             sendOutput,
-            new HumanMessage({
-              content: directAdditionalContexts.join('\n\n'),
-              // Match the event-driven path's marker so hosts /
-              // model-side annotators treat this as system intent
-              // rather than ordinary user text. Codex P2 [46].
-              additional_kwargs: { role: 'system', source: 'hook' },
-            }),
+            stampSyntheticProviderMessage(
+              new HumanMessage({
+                content: directAdditionalContexts.join('\n\n'),
+                // Match the event-driven path's marker so hosts /
+                // model-side annotators treat this as system intent
+                // rather than ordinary user text. Codex P2 [46].
+                additional_kwargs: { role: 'system', source: 'hook' },
+              })
+            ),
           ]
           : [sendOutput];
       await this.handleRunToolCompletions(
@@ -4492,6 +5714,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         [sendOutput],
         config,
         resolvedArgsByCallId,
+        codeSessionBaselineByCallId,
         errorOwnership
       );
     } else {
@@ -4517,11 +5740,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         throw new Error('ToolNode only accepts AIMessages as input.');
       }
       const aiMessage = assistantBatch.message;
-      replayBatchKey = getAssistantBatchReplayKey(
-        assistantBatch,
-        incomingRunId,
-        incomingThreadId
-      );
+      replayBatchKey =
+        getToolBatchReplayScope(config) == null
+          ? undefined
+          : getAssistantBatchReplayKey(
+            assistantBatch,
+            getToolBatchReplayScope(config)
+          );
 
       if (this.loadRuntimeTools) {
         const { tools, toolMap } = this.loadRuntimeTools(
@@ -4530,9 +5755,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolMap =
           toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
         this.applyToolExecutionOverrides();
-        this.programmaticCache = undefined; // Invalidate cache on toolMap change
       }
 
+      const replayCallPositions = new Map(
+        (aiMessage.tool_calls ?? []).map((call, i) => [call, i])
+      );
       const filteredCalls =
         aiMessage.tool_calls?.filter((call) => {
           /**
@@ -4542,7 +5769,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            *    which are executed by the provider's API and don't require invocation
            */
           return (
-            (call.id == null || !toolMessageIds.has(call.id)) &&
+            (call.id == null ||
+              call.id === '' ||
+              !toolMessageIds.has(call.id)) &&
             !(
               call.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ??
               false
@@ -4670,6 +5899,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             batchIndices: eventEntries.map((entry) => entry.batchIndex),
             turn,
             batchScopeId,
+            preBatchSnapshot: replayInputSnapshot,
           });
         }
 
@@ -4677,6 +5907,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directIndices = directEntries.map((e) => e.batchIndex);
         const eventCalls = eventEntries.map((e) => e.call);
         const eventIndices = eventEntries.map((e) => e.batchIndex);
+        const approvalScopeCallIds = new Set(
+          filteredCalls.flatMap((call) => (call.id == null ? [] : [call.id]))
+        );
 
         /**
          * Snapshot the event calls' args against the *pre-batch*
@@ -4703,6 +5936,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
          * same-turn direct outputs.
          */
         const preBatchSnapshot =
+          replayInputSnapshot ??
           this.toolOutputRegistry?.snapshot(batchScopeId);
         if (preBatchSnapshot != null) {
           for (const entry of eventEntries) {
@@ -4738,23 +5972,58 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 turn,
                 batchScopeId,
                 resolvedArgsByCallId,
+                codeSessionBaselineByCallId,
                 errorOwnership,
                 preBatchSnapshot,
                 additionalContextsSink: directAdditionalContexts,
                 replayBatchKey,
+                replayCallPositions,
+                approvalScopeCallIds,
                 runInput: input as T,
               }
             )
             : [];
 
-        if (directCalls.length > 0 && directOutputs.length > 0) {
+        const settledDirectResults =
+          replayBatchKey == null
+            ? undefined
+            : this.settledDirectResultsByBatch.get(replayBatchKey);
+        const unhandledDirectCalls: ToolCall[] = [];
+        const unhandledDirectOutputs: (BaseMessage | Command)[] = [];
+        for (let i = 0; i < directCalls.length; i++) {
+          const settled = settledDirectResults?.get(
+            directReplayKey(
+              directCalls[i],
+              replayCallPositions.get(directCalls[i])!
+            )
+          );
+          if (settled?.completionHandled === true) {
+            continue;
+          }
+          unhandledDirectCalls.push(directCalls[i]);
+          unhandledDirectOutputs.push(directOutputs[i]);
+        }
+
+        if (unhandledDirectCalls.length > 0) {
           await this.handleRunToolCompletions(
-            directCalls,
-            directOutputs,
+            unhandledDirectCalls,
+            unhandledDirectOutputs,
             config,
             resolvedArgsByCallId,
+            codeSessionBaselineByCallId,
             errorOwnership
           );
+          for (let i = 0; i < directCalls.length; i++) {
+            const settled = settledDirectResults?.get(
+              directReplayKey(
+                directCalls[i],
+                replayCallPositions.get(directCalls[i])!
+              )
+            );
+            if (settled != null) {
+              settled.completionHandled = true;
+            }
+          }
         }
 
         const eventResult =
@@ -4774,14 +6043,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directInjected: BaseMessage[] =
           directAdditionalContexts.length > 0
             ? [
-              new HumanMessage({
-                content: directAdditionalContexts.join('\n\n'),
-                // System-role metadata to match the event-driven
-                // path so policy/recovery guidance is treated
-                // consistently regardless of whether the tool ran
-                // direct or dispatched. Codex P2 [46].
-                additional_kwargs: { role: 'system', source: 'hook' },
-              }),
+              stampSyntheticProviderMessage(
+                new HumanMessage({
+                  content: directAdditionalContexts.join('\n\n'),
+                  // System-role metadata to match the event-driven
+                  // path so policy/recovery guidance is treated
+                  // consistently regardless of whether the tool ran
+                  // direct or dispatched. Codex P2 [46].
+                  additional_kwargs: { role: 'system', source: 'hook' },
+                })
+              ),
             ]
             : [];
         outputs = [
@@ -4801,8 +6072,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // leak a sibling's just-registered output into a sister
         // call's args mid-await (Codex P1 #18).
         const preBatchSnapshot =
+          replayInputSnapshot ??
           this.toolOutputRegistry?.snapshot(batchScopeId);
         const directAdditionalContexts: string[] = [];
+        const approvalScopeCallIds = new Set(
+          filteredCalls.flatMap((call) => (call.id == null ? [] : [call.id]))
+        );
         const toolOutputs = await this.runDirectBatchInterruptSafe(
           filteredCalls,
           filteredCalls.map((_call, i) => i),
@@ -4811,10 +6086,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             turn,
             batchScopeId,
             resolvedArgsByCallId,
+            codeSessionBaselineByCallId,
             errorOwnership,
             preBatchSnapshot,
             additionalContextsSink: directAdditionalContexts,
             replayBatchKey,
+            replayCallPositions,
+            approvalScopeCallIds,
             runInput: input as T,
           }
         );
@@ -4823,6 +6101,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           toolOutputs,
           config,
           resolvedArgsByCallId,
+          codeSessionBaselineByCallId,
           errorOwnership
         );
         // Append accumulated additionalContexts as a single
@@ -4835,13 +6114,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...promotedPrefix,
               ...toolOutputs,
               ...invalidCallResults,
-              new HumanMessage({
-                content: directAdditionalContexts.join('\n\n'),
-                // Same system-role marker the event-driven path
-                // uses so direct vs dispatched is invisible to
-                // downstream consumers. Codex P2 [46].
-                additional_kwargs: { role: 'system', source: 'hook' },
-              }),
+              stampSyntheticProviderMessage(
+                new HumanMessage({
+                  content: directAdditionalContexts.join('\n\n'),
+                  // Same system-role marker the event-driven path
+                  // uses so direct vs dispatched is invisible to
+                  // downstream consumers. Codex P2 [46].
+                  additional_kwargs: { role: 'system', source: 'hook' },
+                })
+              ),
             ]
             : [...promotedPrefix, ...toolOutputs, ...invalidCallResults];
       }
@@ -4872,7 +6153,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     if (!outputs.some(isCommand)) {
       if (replayBatchKey != null) {
-        this.settledInterruptingResults.delete(replayBatchKey);
+        this.settledDirectResultsByBatch.delete(replayBatchKey);
       }
       return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
     }
@@ -5015,7 +6296,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     if (replayBatchKey != null) {
-      this.settledInterruptingResults.delete(replayBatchKey);
+      this.settledDirectResultsByBatch.delete(replayBatchKey);
+    }
+    if (!Array.isArray(input) && !this.isSendInput(input)) {
+      this.handoffRouting?.finalize(
+        combinedOutputs.filter(isCommand),
+        input as t.BaseGraphState,
+        config
+      );
     }
     return combinedOutputs as T;
   }

@@ -21,11 +21,14 @@ import {
   sanitizeOrphanToolBlocks,
   enforceOriginalContentCap,
   ORIGINAL_CONTENT_MAX_CHARS,
-  calculateMaxToolCallInputChars,
   createPruneMessages,
   projectToolCallInputs,
+  projectToolMessagesForProvider,
+  TOOL_INPUT_ELISION_NOTE,
   serializeToolCallInput,
 } from '@/messages/prune';
+import { calculateMaxToolCallInputChars } from '@/utils/truncation';
+import { projectToolStreamContentForProvider } from '@/messages/core';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { ensureThinkingBlockInMessages } from '@/messages/format';
 import { Providers, ContentTypes } from '@/common';
@@ -111,7 +114,6 @@ function getMessagesWithinTokenLimit({
 } {
   // Every reply is primed with <|start|>assistant<|message|>, so we
   // start with 3 tokens for the label after all messages have been counted.
-  let summaryIndex = -1;
   let currentTokenCount = 3;
   const instructions =
     _messages[0]?.getType() === 'system' ? _messages[0] : undefined;
@@ -167,7 +169,7 @@ function getMessagesWithinTokenLimit({
   }
 
   const prunedMemory = messages;
-  summaryIndex = prunedMemory.length - 1;
+  const summaryIndex = prunedMemory.length - 1;
   remainingContextTokens -= currentTokenCount;
 
   return {
@@ -1439,6 +1441,82 @@ describe('Prune Messages Tests', () => {
   });
 
   describe('projectToolCallInputs', () => {
+    it('matches sequential stream and tool-input projection in one pass', () => {
+      const messages: BaseMessage[] = [
+        new HumanMessage('Use the tool.'),
+        new AIMessageChunk({
+          content: [
+            { type: 'text', text: '' },
+            {
+              type: 'tool_use',
+              id: 'call-1',
+              name: 'search',
+              input: { query: 'x'.repeat(2_000) },
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'call-1',
+              name: 'search',
+              args: { query: 'x'.repeat(2_000) },
+            },
+          ],
+        }),
+      ];
+
+      const sequential = projectToolCallInputs(
+        projectToolStreamContentForProvider(messages),
+        200
+      );
+      const derived = projectToolMessagesForProvider(messages, 200);
+
+      expect(derived).toEqual(sequential);
+      expect(derived[1]).not.toBe(sequential[1]);
+      expect(derived[1]).not.toBe(messages[1]);
+    });
+
+    it('returns the original array when stream content and inputs are safe', () => {
+      const messages: BaseMessage[] = [
+        new AIMessage({
+          content: [{ type: 'text', text: 'Calling search.' }],
+          tool_calls: [
+            { id: 'call-1', name: 'search', args: { query: 'safe' } },
+          ],
+        }),
+      ];
+
+      expect(projectToolMessagesForProvider(messages, 200)).toBe(messages);
+    });
+
+    it('removes raw OpenAI calls from non-OpenAI provider projections', () => {
+      const message = new AIMessage('');
+      message.additional_kwargs.tool_calls = [
+        {
+          id: 'raw-call',
+          type: 'function',
+          function: {
+            name: 'lookup',
+            arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+          },
+        },
+      ];
+
+      const [anthropicMessage] = projectToolMessagesForProvider(
+        [message],
+        200,
+        Providers.ANTHROPIC
+      );
+      const [openAIMessage] = projectToolMessagesForProvider(
+        [message],
+        200,
+        Providers.OPENAI
+      );
+
+      expect(anthropicMessage.additional_kwargs.tool_calls).toBeUndefined();
+      expect(openAIMessage.additional_kwargs.tool_calls).toBeDefined();
+      expect(message.additional_kwargs.tool_calls).toBeDefined();
+    });
+
     it('uses the shared 15%-of-context cap with a 200K ceiling', () => {
       expect(calculateMaxToolCallInputChars()).toBe(200_000);
       expect(calculateMaxToolCallInputChars(0)).toBe(200_000);
@@ -1452,7 +1530,7 @@ describe('Prune Messages Tests', () => {
 
     it('never nulls an input when the cap is below the truncation envelope', () => {
       // Regression: a tight summarization budget can shrink the per-input cap
-      // below the `{_truncated, _originalChars}` envelope size (~38 chars).
+      // below the elision envelope size.
       // The projection used to return `null` for BOTH the inline block input
       // and the tool_calls args; the nulls were written back into graph state
       // by preFlightTruncateToolCallInputs and later replayed to Anthropic as
@@ -1557,9 +1635,10 @@ describe('Prune Messages Tests', () => {
       const inlineToolUse = (
         projectedChunk.content as Array<Record<string, unknown>>
       ).find((block) => block.type === 'tool_use');
-      expect(inlineToolUse?.input).toMatchObject({
-        _truncated: expect.stringContaining('truncated'),
+      expect(inlineToolUse?.input).toEqual({
+        _note: TOOL_INPUT_ELISION_NOTE,
         _originalChars: expect.any(Number),
+        _inputPrefix: expect.any(String),
       });
       expect(projectedChunk.tool_calls?.[0].args).toEqual({ query: 'safe' });
       expect(
@@ -2029,16 +2108,19 @@ describe('Prune Messages Tests', () => {
       ).find((b) => b.type === 'tool_use');
       expect(toolUseBlock).toBeDefined();
       const truncatedInput = toolUseBlock!.input as {
-        _truncated: string;
+        _note: string;
         _originalChars: number;
+        _inputPrefix: string;
       };
-      expect(truncatedInput._truncated).toContain('truncated');
+      /** A completed call must never read as one that was cut off. */
+      expect(truncatedInput._note).toBe(TOOL_INPUT_ELISION_NOTE);
+      expect(JSON.stringify(truncatedInput)).not.toContain('truncated');
       expect(truncatedInput._originalChars).toBeGreaterThan(600);
 
       // Verify tool_calls args were also truncated
       expect(aiMsg.tool_calls).toBeDefined();
       const tc = aiMsg.tool_calls![0];
-      expect(tc.args).toHaveProperty('_truncated');
+      expect(tc.args).toHaveProperty('_note', TOOL_INPUT_ELISION_NOTE);
     });
 
     it('truncates tool_calls-only args and preserves AI message metadata', () => {
@@ -2081,9 +2163,10 @@ describe('Prune Messages Tests', () => {
       expect(projected.name).toBe('assistant');
       expect(projected.additional_kwargs).toEqual({ trace_marker: 'keep' });
       expect(projected.response_metadata).toEqual({ model: 'test-model' });
-      expect(projected.tool_calls?.[0].args).toMatchObject({
-        _truncated: expect.stringContaining('truncated'),
+      expect(projected.tool_calls?.[0].args).toEqual({
+        _note: TOOL_INPUT_ELISION_NOTE,
         _originalChars: expect.any(Number),
+        _inputPrefix: expect.any(String),
       });
     });
 
@@ -2526,10 +2609,10 @@ describe('Prune Messages Tests', () => {
       expect(projectedAI).toBeDefined();
       expect(projectedAI?.content).toBe('');
       const projectedArgs = projectedAI?.tool_calls?.[0].args as
-        | { _truncated?: string; _originalChars?: number }
+        | { _note?: string; _inputPrefix?: string; _originalChars?: number }
         | undefined;
-      expect(projectedArgs?._truncated).toContain('truncated');
-      expect(projectedArgs?._truncated?.length).toBeLessThanOrEqual(200);
+      expect(projectedArgs?._note).toBe(TOOL_INPUT_ELISION_NOTE);
+      expect(projectedArgs?._inputPrefix?.length).toBeLessThanOrEqual(200);
       expect(projectedArgs?._originalChars).toBeGreaterThan(200);
     });
   });
@@ -2579,7 +2662,10 @@ describe('Prune Messages Tests', () => {
         new HumanMessage('Build me a solar system simulation'),
         new AIMessage({
           content: [
-            { type: 'text', text: 'I will write the code now.' },
+            {
+              type: 'text',
+              text: `I will write the code now. ${'Plan step. '.repeat(60)}`,
+            },
             {
               type: 'tool_use',
               id: 'tc_eval',
@@ -3737,5 +3823,310 @@ describe('thinking enabled — non-Anthropic reasoning_content blocks (issue #19
     // The thinking block is intentionally not located for a Bedrock run, so no
     // index is reported and nothing gets reattached.
     expect(result!.thinkingStartIndex).toBeUndefined();
+  });
+});
+
+describe('context fading of completed tool calls (issue: re-executed side effects)', () => {
+  const lookupCalls = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      id: `call_lookup_${i}`,
+      name: 'lookup',
+      args: { query: `q${i}` },
+      type: 'tool_call' as const,
+    }));
+
+  function fadingTierFor(messages: BaseMessage[]): t.FadingTier {
+    const tokenCounter = createTestTokenCounter();
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    messages.forEach((message, index) => {
+      indexTokenCountMap[index] = tokenCounter(message);
+    });
+    const pruneMessages = createPruneMessages({
+      maxTokens: 200_000,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap,
+      /** Mirrors the report: an inflated instruction estimate leaves ~35K. */
+      getInstructionTokens: () => 154_703,
+    });
+    return pruneMessages({ messages }).fadingTier;
+  }
+
+  it('does not let a reloaded turn merged into one message drive the tier down', () => {
+    const calls = lookupCalls(8);
+    const previousTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      /** Storage folds a turn's steps into one assistant message on reload. */
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const reloaded = fadingTierFor([
+      ...previousTurn,
+      new HumanMessage('Send it'),
+    ]);
+    const liveWideTurn = fadingTierFor([
+      new HumanMessage('Send it'),
+      ...previousTurn.slice(1),
+    ]);
+
+    expect(reloaded.budgetTokens).toBeGreaterThan(liveWideTurn.budgetTokens);
+  });
+
+  it('treats a role-based user message as a turn boundary', () => {
+    const calls = lookupCalls(8);
+    const priorTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const genericUserTurn = fadingTierFor([
+      ...priorTurn,
+      new ChatMessage({ role: 'user', content: 'Send it' }),
+    ]);
+    const liveWideTurn = fadingTierFor([
+      new HumanMessage('Send it'),
+      ...priorTurn.slice(1),
+    ]);
+
+    expect(genericUserTurn.budgetTokens).toBeGreaterThan(
+      liveWideTurn.budgetTokens
+    );
+  });
+
+  it('keeps the live batch width across a replayed steer', () => {
+    const calls = lookupCalls(8);
+    const liveTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const withReplayedSteer = fadingTierFor([
+      ...liveTurn,
+      new HumanMessage({
+        content: 'Also include last quarter',
+        additional_kwargs: { role: 'user', source: 'steer' },
+      }),
+    ]);
+
+    expect(withReplayedSteer.budgetTokens).toBe(
+      fadingTierFor(liveTurn).budgetTokens
+    );
+  });
+
+  it('keeps the live batch width across hook context', () => {
+    const calls = lookupCalls(8);
+    const liveTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const withHookContext = fadingTierFor([
+      ...liveTurn,
+      new HumanMessage({
+        content: 'Additional context from a PostToolUse hook',
+        additional_kwargs: { role: 'system', source: 'hook' },
+      }),
+    ]);
+
+    expect(withHookContext.budgetTokens).toBe(
+      fadingTierFor(liveTurn).budgetTokens
+    );
+  });
+
+  it('leaves a genuine input that only shares the legacy field names alone', () => {
+    const args = { _truncated: 'caller data', _originalChars: 11 };
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'call_plain', name: 'record', args, type: 'tool_call' },
+      ],
+    });
+
+    const [projected] = projectToolCallInputs([message], 50_000) as AIMessage[];
+
+    expect(projected.tool_calls?.[0].args).toEqual(args);
+  });
+
+  it('keeps the completion note and size at the minimum input cap', () => {
+    const serialized = serializeToolCallInput(
+      { body: 'x'.repeat(20_000) },
+      100
+    );
+
+    expect(serialized.length).toBeLessThanOrEqual(100);
+    expect(JSON.parse(serialized)).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: expect.any(Number),
+    });
+    expect(serializeToolCallInput(JSON.parse(serialized), 100)).toBe(
+      serialized
+    );
+  });
+
+  it('keeps the live batch width across SDK-injected context', () => {
+    const calls = lookupCalls(8);
+    const liveTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const withInjectedContext = fadingTierFor([
+      ...liveTurn,
+      new HumanMessage({
+        content: 'Hook context after the tool batch',
+        additional_kwargs: { role: 'user', injected: true },
+      }),
+    ]);
+
+    expect(withInjectedContext.budgetTokens).toBe(
+      fadingTierFor(liveTurn).budgetTokens
+    );
+  });
+
+  it('converts a legacy envelope that already fits the cap', () => {
+    const legacyArgs = {
+      _truncated: '… [truncated]\n{"subject":"Report"',
+      _originalChars: 3810,
+    };
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_send',
+          name: 'send_email',
+          args: legacyArgs,
+          type: 'tool_call',
+        },
+      ],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'call_send',
+            type: 'function',
+            function: {
+              name: 'send_email',
+              arguments: JSON.stringify(legacyArgs),
+            },
+          },
+        ],
+      },
+    });
+
+    const [projected] = projectToolCallInputs([message], 50_000) as AIMessage[];
+
+    expect(projected.tool_calls?.[0].args).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: 3810,
+      _inputPrefix: '{"subject":"Report"',
+    });
+    const serialized = (
+      projected.additional_kwargs.tool_calls as Array<{
+        function: { arguments: string };
+      }>
+    )[0].function.arguments;
+    expect(JSON.parse(serialized)).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: 3810,
+      _inputPrefix: '{"subject":"Report"',
+    });
+  });
+
+  it('converts a fitting legacy envelope in a singular function_call', () => {
+    const legacyArguments = JSON.stringify({
+      _truncated: '… [truncated]\n{"subject":"Report"',
+      _originalChars: 3810,
+    });
+    const message = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        function_call: { name: 'send_email', arguments: legacyArguments },
+      },
+    });
+
+    const [projected] = projectToolCallInputs([message], 50_000) as AIMessage[];
+    const functionCall = projected.additional_kwargs.function_call as {
+      name: string;
+      arguments: string;
+    };
+
+    expect(functionCall.name).toBe('send_email');
+    expect(JSON.parse(functionCall.arguments)).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: 3810,
+      _inputPrefix: '{"subject":"Report"',
+    });
+  });
+
+  it('re-caps a legacy truncation envelope into one that says the call completed', () => {
+    const legacyArgs = {
+      _truncated: `… [truncated]
+${'{"subject":"Report","body":"'}${'x'.repeat(400)}`,
+      _originalChars: 3810,
+    };
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_send',
+          name: 'send_email',
+          args: legacyArgs,
+          type: 'tool_call',
+        },
+      ],
+    });
+
+    const [projected] = projectToolCallInputs([message], 200) as AIMessage[];
+    const args = projected.tool_calls?.[0].args as Record<string, unknown>;
+
+    expect(Object.keys(args)).toEqual([
+      '_note',
+      '_originalChars',
+      '_inputPrefix',
+    ]);
+    expect(args._note).toBe(TOOL_INPUT_ELISION_NOTE);
+    expect(args._originalChars).toBe(3810);
+    expect(String(args._inputPrefix)).toMatch(/^\{"subject":"Report"/);
+    expect(JSON.stringify(args)).not.toContain('truncated');
+    expect(JSON.stringify(args).length).toBeLessThanOrEqual(200);
   });
 });

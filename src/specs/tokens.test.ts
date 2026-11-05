@@ -1,7 +1,10 @@
+import { Tokenizer } from 'ai-tokenizer';
+import * as claudeEncoding from 'ai-tokenizer/encoding/claude';
 import {
   AIMessage,
   ChatMessage,
   HumanMessage,
+  SystemMessage,
   ToolMessage,
 } from '@langchain/core/messages';
 import {
@@ -124,17 +127,83 @@ describe('getTokenCountForMessage', () => {
       getType: () => 'ai',
     }) as unknown as AIMessage;
 
-  test('bounds direct message strings before tokenization and charges omitted characters', () => {
-    const callbackLengths: number[] = [];
-    const content = 'x'.repeat(300_000);
+  test('counts long plain-text messages close to the real Claude tokenizer result', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const phrase = 'The quick brown fox jumps over the lazy dog. ';
+    const content = phrase
+      .repeat(Math.ceil(361_473 / phrase.length))
+      .slice(0, 361_473);
+    const exactCount = tokenizer.count(content) + 3;
 
-    const count = getTokenCountForMessage(new HumanMessage(content), (text) => {
-      callbackLengths.push(text.length);
-      return text.length;
-    });
+    const count = getTokenCountForMessage(
+      new HumanMessage(content),
+      (text) => tokenizer.count(text),
+      'claude'
+    );
 
-    expect(Math.max(...callbackLengths)).toBe(200_000);
-    expect(count).toBe(600_003);
+    expect(count).toBeGreaterThanOrEqual(exactCount);
+    expect(count / exactCount).toBeLessThan(1.005);
+  });
+
+  test('counts a high-density suffix instead of extrapolating from low-density text', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const phrase = 'The quick brown fox jumps over the lazy dog. ';
+    const prose = phrase
+      .repeat(Math.ceil(200_000 / phrase.length))
+      .slice(0, 200_000);
+    const content = `${prose}${'😀'.repeat(8_000)}`;
+    const exactCount = tokenizer.count(content) + 3;
+
+    const count = getTokenCountForMessage(
+      new HumanMessage(content),
+      (text) => tokenizer.count(text),
+      'claude'
+    );
+
+    expect(count).toBeGreaterThanOrEqual(exactCount);
+    expect(count / exactCount).toBeLessThan(1.005);
+  });
+
+  test('stays conservative when a chunk boundary changes tokenizer segmentation', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const boundaryPrefix = '\n\n \n\n ';
+    const boundarySuffix = '😀é a0é0漢,\n0.AAaA,Aééé0\n.😀.A😀,.aéa';
+    const padding = 'word '
+      .repeat(2_000)
+      .slice(0, 8_192 - boundaryPrefix.length);
+    const content = `${padding}${boundaryPrefix}${boundarySuffix}`;
+    const exactCount = tokenizer.count(content) + 3;
+
+    const count = getTokenCountForMessage(
+      new HumanMessage(content),
+      (text) => tokenizer.count(text),
+      'claude'
+    );
+
+    expect(count).toBeGreaterThanOrEqual(exactCount);
+  });
+
+  test('keeps long instruction counts stable across prompt-cache placement', () => {
+    const tokenizer = new Tokenizer(claudeEncoding);
+    const phrase = 'The quick brown fox jumps over the lazy dog. ';
+    const stable = phrase
+      .repeat(Math.ceil(118_315 / phrase.length))
+      .slice(0, 118_315);
+    const dynamic = phrase
+      .repeat(Math.ceil(361_473 / phrase.length))
+      .slice(0, 361_473);
+    const count = (message: HumanMessage | SystemMessage): number =>
+      getTokenCountForMessage(
+        message,
+        (text) => tokenizer.count(text),
+        'claude'
+      );
+
+    const splitCount =
+      count(new SystemMessage(stable)) + count(new HumanMessage(dynamic));
+    const joinedCount = count(new SystemMessage(`${stable}\n\n${dynamic}`));
+
+    expect(Math.abs(splitCount - joinedCount)).toBeLessThanOrEqual(100);
   });
 
   test.each([
@@ -153,7 +222,7 @@ describe('getTokenCountForMessage', () => {
     ).toThrow(UnsafeTokenMeasurementError);
   });
 
-  test('bounds direct string tool args before tokenization and charges omitted characters', () => {
+  test('bounds tokenizer input while fully counting direct string tool args', () => {
     const callbackLengths: number[] = [];
     const args = 'x'.repeat(300_000);
 
@@ -162,7 +231,7 @@ describe('getTokenCountForMessage', () => {
       return text.length;
     });
 
-    expect(Math.max(...callbackLengths)).toBe(200_000);
+    expect(Math.max(...callbackLengths)).toBe(8_192);
     expect(count).toBeGreaterThan(args.length);
   });
 
@@ -181,6 +250,229 @@ describe('getTokenCountForMessage', () => {
 
     expect(message.tool_calls).toHaveLength(0);
     expect(count).toBeGreaterThan(5_000);
+  });
+
+  test('counts raw OpenAI tool calls when parsed tool_calls are absent', () => {
+    const message = new AIMessage('');
+    message.additional_kwargs.tool_calls = [
+      {
+        id: 'raw-call',
+        type: 'function',
+        function: {
+          name: 'raw_lookup',
+          arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+        },
+      },
+    ];
+
+    const count = getTokenCountForMessage(message, (text) => text.length);
+
+    expect(message.tool_calls).toHaveLength(0);
+    expect(count).toBeGreaterThan(5_000);
+  });
+
+  test('does not double-count raw OpenAI calls mirrored in parsed tool_calls', () => {
+    const parsed = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'mirrored-call', name: 'lookup', args: { query: 'value' } },
+      ],
+    });
+    const mirrored = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'mirrored-call', name: 'lookup', args: { query: 'value' } },
+      ],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'mirrored-call',
+            type: 'function',
+            function: {
+              name: 'lookup',
+              arguments: '{"query":"value"}',
+            },
+          },
+        ],
+      },
+    });
+
+    expect(getTokenCountForMessage(mirrored, (text) => text.length)).toBe(
+      getTokenCountForMessage(parsed, (text) => text.length)
+    );
+  });
+
+  test('ignores stale raw OpenAI calls when parsed calls drive serialization', () => {
+    const parsed = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'parsed-call', name: 'lookup', args: {} }],
+    });
+    const stale = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'parsed-call', name: 'lookup', args: {} }],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'stale-call',
+            type: 'function',
+            function: {
+              name: 'lookup',
+              arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+            },
+          },
+        ],
+      },
+    });
+
+    expect(getTokenCountForMessage(stale, (text) => text.length)).toBe(
+      getTokenCountForMessage(parsed, (text) => text.length)
+    );
+  });
+
+  test('counts duplicate ids within the raw OpenAI representation', () => {
+    const single = new AIMessage('');
+    const duplicate = new AIMessage('');
+    const rawCall = {
+      id: 'reused-call',
+      type: 'function' as const,
+      function: {
+        name: 'lookup',
+        arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+      },
+    };
+    single.additional_kwargs.tool_calls = [rawCall];
+    duplicate.additional_kwargs.tool_calls = [rawCall, rawCall];
+
+    const singleCount = getTokenCountForMessage(single, (text) => text.length);
+    const duplicateCount = getTokenCountForMessage(
+      duplicate,
+      (text) => text.length
+    );
+
+    expect(duplicateCount).toBeGreaterThan(singleCount + 5_000);
+  });
+
+  test('counts non-enumerable raw OpenAI function arguments', () => {
+    const message = new AIMessage('');
+    const rawFunction = { name: 'lookup', arguments: '' };
+    Object.defineProperty(rawFunction, 'arguments', {
+      value: `{"query":"${'x'.repeat(5_000)}"}`,
+    });
+    message.additional_kwargs.tool_calls = [
+      {
+        id: 'non-enumerable-call',
+        type: 'function',
+        function: rawFunction,
+      },
+    ];
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toBeGreaterThan(5_000);
+  });
+
+  test('counts raw OpenAI custom tool inputs', () => {
+    const message = new AIMessage('');
+    Reflect.set(message.additional_kwargs, 'tool_calls', [
+      {
+        id: 'custom-call',
+        type: 'custom',
+        custom: {
+          name: 'shell',
+          input: 'x'.repeat(5_000),
+        },
+      },
+    ]);
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toBeGreaterThan(5_000);
+  });
+
+  test('rejects raw tool-call arrays beyond the traversal limit', () => {
+    const message = new AIMessage('');
+    message.additional_kwargs.tool_calls = new Array(10_001);
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+  });
+
+  test('counts inherited raw OpenAI tool calls', () => {
+    const message = new AIMessage('');
+    Object.setPrototypeOf(message.additional_kwargs, {
+      tool_calls: [
+        {
+          id: 'inherited-call',
+          type: 'function',
+          function: {
+            name: 'lookup',
+            arguments: `{"query":"${'x'.repeat(5_000)}"}`,
+          },
+        },
+      ],
+    });
+
+    expect(
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toBeGreaterThan(5_000);
+  });
+
+  test('rejects a revoked raw tool-call proxy with the typed error', () => {
+    const message = new AIMessage('');
+    const { proxy, revoke } = Proxy.revocable([], {});
+    message.additional_kwargs.tool_calls = proxy;
+    revoke();
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+  });
+
+  test('rejects raw tool-call array accessors without invoking them', () => {
+    const message = new AIMessage('');
+    const rawCalls: Array<{
+      id: string;
+      type: 'function';
+      function: { name: string; arguments: string };
+    }> = [];
+    let getterCalls = 0;
+    Object.defineProperty(rawCalls, '0', {
+      configurable: true,
+      get: () => {
+        getterCalls += 1;
+        throw new Error('must not run');
+      },
+    });
+    rawCalls.length = 1;
+    message.additional_kwargs.tool_calls = rawCalls;
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+    expect(getterCalls).toBe(0);
+  });
+
+  test('rejects nested raw tool-call accessors without invoking them', () => {
+    const message = new AIMessage('');
+    const rawCall = {
+      id: 'raw-call',
+      type: 'function' as const,
+      function: { name: 'lookup', arguments: '{}' },
+    };
+    let getterCalls = 0;
+    Object.defineProperty(rawCall, 'function', {
+      get: () => {
+        getterCalls += 1;
+        throw new Error('must not run');
+      },
+    });
+    message.additional_kwargs.tool_calls = [rawCall];
+
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
+    expect(getterCalls).toBe(0);
   });
 
   test('keeps nested dense strings on the bounded structured path', () => {
@@ -317,9 +609,9 @@ describe('getTokenCountForMessage', () => {
       getType: () => 'tool',
     } as unknown as ToolMessage;
 
-    expect(() => getTokenCountForMessage(message, (text) => text.length)).toThrow(
-      UnsafeTokenMeasurementError
-    );
+    expect(() =>
+      getTokenCountForMessage(message, (text) => text.length)
+    ).toThrow(UnsafeTokenMeasurementError);
     try {
       getTokenCountForMessage(message, (text) => text.length);
     } catch (error) {
