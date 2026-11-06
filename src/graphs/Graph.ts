@@ -3602,7 +3602,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         initializeModel({
           tools: toolsForBinding,
           provider: agentContext.provider,
-          clientOptions: agentContext.clientOptions,
+          /* The OpenAI-like models strip images for a text-only model only when told so
+           * (`vision` defaults to true there); tool artifacts otherwise reach it and the
+           * provider rejects the whole request ("is not a multimodal model"). */
+          clientOptions:
+            agentContext.vision === undefined
+              ? agentContext.clientOptions
+              : (Object.assign({}, agentContext.clientOptions, {
+                vision: agentContext.vision,
+              }) as t.ClientOptions),
         });
 
       if (agentContext.systemRunnable) {
